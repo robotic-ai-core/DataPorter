@@ -214,9 +214,16 @@ dataloader = ResumableDataLoader(
 # Or use converter instance for more control
 from dataporter.converters import KeyBasedDtypeConverter
 
+# New list format (recommended for YAML configs)
+converter = KeyBasedDtypeConverter([
+    {"path": "image", "dtype": "float16"},
+    {"path": "metadata.weight", "dtype": "float32"}  # Nested paths supported
+])
+
+# Or dict format (still supported)
 converter = KeyBasedDtypeConverter({
     "image": "float16",
-    "metadata.weight": "float32"  # Nested paths supported
+    "metadata.weight": "float32"
 })
 
 dataloader = ResumableDataLoader(
@@ -356,9 +363,59 @@ ResumableDataLoader(
 DtypeConverter(dtype: Union[str, torch.dtype])
 # Converts all tensors to specified dtype
 
-KeyBasedDtypeConverter(conversions: Dict[str, Union[str, torch.dtype]])
+KeyBasedDtypeConverter(conversions: Union[Dict[str, str], List[Dict[str, str]]])
 # Converts specific keys to specified dtypes
+# Supports both dict and list formats (list recommended for YAML)
 ```
+
+#### Dtype Conversion Formats
+
+DataPorter supports two formats for dtype conversions:
+
+**List Format (Recommended for YAML):**
+```yaml
+# In YAML configuration files
+dtype_conversions:
+  - path: observation.image
+    dtype: float16
+  - path: action
+    dtype: float32
+  - path: metadata.timestamp
+    dtype: float32
+```
+
+```python
+# In Python code
+converter = KeyBasedDtypeConverter([
+    {"path": "observation.image", "dtype": "float16"},
+    {"path": "action", "dtype": "float32"},
+    {"path": "metadata.timestamp", "dtype": "float32"}
+])
+```
+
+**Dict Format (Legacy, still supported):**
+```yaml
+# Requires quotes in YAML due to dots
+dtype_conversions:
+  "observation.image": "float16"
+  "action": "float32"
+  "metadata.timestamp": "float32"
+```
+
+```python
+# In Python code
+converter = KeyBasedDtypeConverter({
+    "observation.image": "float16",
+    "action": "float32",
+    "metadata.timestamp": "float32"
+})
+```
+
+**Why List Format?**
+- Consistent with YAML best practices (no quoted keys needed)
+- Cleaner and more readable in configuration files
+- Extensible for future features without breaking changes
+- Follows standard patterns used in popular frameworks
 
 ### Memory Savings Reference
 
