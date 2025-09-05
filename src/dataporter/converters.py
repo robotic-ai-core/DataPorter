@@ -12,16 +12,29 @@ logger = logging.getLogger(__name__)
 class KeyBasedDtypeConverter:
     """Simple dtype converter using exact key paths."""
     
-    def __init__(self, dtype_map: Optional[Dict[str, str]] = None):
+    def __init__(self, dtype_map: Optional[Union[Dict[str, str], list]] = None):
         """
         Initialize the dtype converter.
         
         Args:
-            dtype_map: Dict mapping key paths to target dtypes
-                      e.g. {"inputs.image": "float16", "conditions.class_labels": "int64"}
+            dtype_map: Either:
+                      - Dict mapping key paths to target dtypes (legacy format)
+                        e.g. {"inputs.image": "float16", "conditions.class_labels": "int64"}
+                      - List of dicts with 'path' and 'dtype' keys (new format)
+                        e.g. [{"path": "inputs.image", "dtype": "float16"}]
                       If None, no conversions will be performed.
         """
-        self.dtype_map = dtype_map or {}
+        # Convert list format to dict format internally
+        if isinstance(dtype_map, list):
+            self.dtype_map = {}
+            for item in dtype_map:
+                if not isinstance(item, dict) or 'path' not in item or 'dtype' not in item:
+                    raise ValueError(
+                        f"List format requires dicts with 'path' and 'dtype' keys. Got: {item}"
+                    )
+                self.dtype_map[item['path']] = item['dtype']
+        else:
+            self.dtype_map = dtype_map or {}
         self.torch_dtypes = {
             "float16": torch.float16,
             "bfloat16": torch.bfloat16, 
