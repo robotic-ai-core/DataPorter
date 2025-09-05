@@ -36,14 +36,16 @@ class KeyBasedDtypeConverter:
             "bool": torch.bool,
         }
         
+        # Store conversion history for debugging (only activated on errors)
+        self.conversion_history = []
+        self.enable_debug_history = False  # Only enabled when debugging
+        
         # Validate dtype mappings
         self._validate_dtype_map()
         
         # Log configuration
         if self.dtype_map:
             logger.info(f"KeyBasedDtypeConverter initialized with {len(self.dtype_map)} conversion rules")
-            for path, dtype in self.dtype_map.items():
-                logger.debug(f"  {path} -> {dtype}")
         else:
             logger.info("KeyBasedDtypeConverter initialized with no conversion rules")
     
@@ -127,12 +129,45 @@ class KeyBasedDtypeConverter:
         if tensor.dtype == target_dtype:
             return tensor
         
+        # Store debug info ONLY if debug mode is enabled
+        conversion_info = None
+        if self.enable_debug_history:
+            conversion_info = {
+                'path': path,
+                'from_dtype': str(tensor.dtype),
+                'to_dtype': str(target_dtype),
+                'shape': tensor.shape,
+                'device': str(tensor.device)
+            }
+        
         try:
             converted_tensor = tensor.to(target_dtype)
-            logger.debug(f"Converted tensor at '{path}' from {tensor.dtype} to {target_dtype}")
+            
+            # Only store successful conversions in debug mode
+            if self.enable_debug_history and conversion_info:
+                conversion_info['status'] = 'success'
+                self.conversion_history.append(conversion_info)
+                # Limit history size to prevent memory issues
+                if len(self.conversion_history) > 1000:
+                    self.conversion_history = self.conversion_history[-500:]
+            
             return converted_tensor
         except Exception as e:
-            logger.warning(f"Failed to convert tensor at '{path}' from {tensor.dtype} to {target_dtype}: {e}")
+            # On error, log comprehensive debug info
+            logger.error(f"Failed to convert tensor at '{path}':")
+            logger.error(f"  From dtype: {tensor.dtype}")
+            logger.error(f"  To dtype: {target_dtype}")
+            logger.error(f"  Shape: {tensor.shape}")
+            logger.error(f"  Device: {tensor.device}")
+            logger.error(f"  Tensor stats: min={tensor.min():.6f}, max={tensor.max():.6f}, mean={tensor.mean():.6f}")
+            logger.error(f"  Error: {e}")
+            
+            # Store failure in debug history
+            if self.enable_debug_history and conversion_info:
+                conversion_info['status'] = 'failed'
+                conversion_info['error'] = str(e)
+                self.conversion_history.append(conversion_info)
+            
             return tensor
     
     def get_conversion_summary(self) -> Dict[str, str]:
@@ -177,3 +212,56 @@ class KeyBasedDtypeConverter:
             logger.info(f"Removed conversion rule for path: {path}")
             return True
         return False
+    
+    def enable_debug_mode(self, enabled: bool = True):
+        """
+        Enable or disable debug mode for conversion tracking.
+        
+        Args:
+            enabled: Whether to enable debug mode
+        """
+        self.enable_debug_history = enabled
+        if enabled:
+            logger.info("Debug mode ENABLED for dtype converter - will track conversion history")
+        else:
+            logger.info("Debug mode DISABLED for dtype converter")
+            self.conversion_history.clear()  # Clear history when disabling
+    
+    def get_debug_info(self) -> Dict[str, Any]:
+        """
+        Get debug information about recent conversions.
+        
+        Returns:
+            Dictionary with debug information
+        """
+        if not self.enable_debug_history:
+            return {
+                'debug_enabled': False,
+                'message': 'Debug mode is disabled. Enable with enable_debug_mode(True)'
+            }
+        
+        # Analyze conversion history
+        total_conversions = len(self.conversion_history)
+        failed_conversions = [c for c in self.conversion_history if c.get('status') == 'failed']
+        successful_conversions = [c for c in self.conversion_history if c.get('status') == 'success']
+        
+        # Group by path to find patterns
+        conversions_by_path = {}
+        for conv in self.conversion_history:
+            path = conv['path']
+            if path not in conversions_by_path:
+                conversions_by_path[path] = {'success': 0, 'failed': 0}
+            if conv.get('status') == 'success':
+                conversions_by_path[path]['success'] += 1
+            else:
+                conversions_by_path[path]['failed'] += 1
+        
+        return {
+            'debug_enabled': True,
+            'total_conversions': total_conversions,
+            'successful': len(successful_conversions),
+            'failed': len(failed_conversions),
+            'conversions_by_path': conversions_by_path,
+            'recent_failures': failed_conversions[-10:],  # Last 10 failures
+            'configured_rules': self.dtype_map
+        }

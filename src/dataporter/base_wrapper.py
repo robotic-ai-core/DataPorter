@@ -69,8 +69,7 @@ class BaseDatasetWrapper(Dataset, ABC):
                 f"{wrapper_name} initialized with {len(self.dtype_conversions)} "
                 f"dtype conversion rules"
             )
-            for path, dtype in self.dtype_conversions.items():
-                logger.debug(f"  {path} -> {dtype}")
+            # Details logged at converter level if needed
         else:
             logger.info(f"{wrapper_name} initialized without dtype conversions")
     
@@ -136,7 +135,7 @@ class BaseDatasetWrapper(Dataset, ABC):
             """Recursively search for and call set_epoch on nested datasets."""
             if hasattr(dataset, 'set_epoch'):
                 dataset.set_epoch(epoch)
-                logger.debug(f"Set epoch {epoch} for dataset {type(dataset).__name__}")
+                # Successfully set epoch
                 return True
             elif hasattr(dataset, 'dataset'):
                 # Handle PyTorch Subset and similar wrappers
