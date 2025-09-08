@@ -200,28 +200,26 @@ class FaultTolerantDatasetWrapper(BaseDatasetWrapper):
         Raises:
             ValueError: If validation fails
         """
-        if isinstance(item, dict):
-            for key, value in item.items():
-                if torch.is_tensor(value):
-                    # Check for NaN
-                    if torch.isnan(value).any():
-                        raise ValueError(f"NaN detected in '{key}' at index {idx}")
-                    
-                    # Check for Inf
-                    if torch.isinf(value).any():
-                        raise ValueError(f"Inf detected in '{key}' at index {idx}")
-                    
-                    # Check for extreme values (optional)
-                    if value.dtype in [torch.float32, torch.float64]:
-                        max_val = value.abs().max().item()
-                        if max_val > 1e10:
-                            warnings.warn(f"Extreme value {max_val} in '{key}' at index {idx}")
-        
-        elif torch.is_tensor(item):
-            if torch.isnan(item).any():
-                raise ValueError(f"NaN detected at index {idx}")
-            if torch.isinf(item).any():
-                raise ValueError(f"Inf detected at index {idx}")
+        def _validate(value: Any, path: Optional[str] = None):
+            key_path = path or "value"
+            if isinstance(value, dict):
+                for k, v in value.items():
+                    _validate(v, f"{key_path}.{k}" if path else str(k))
+            elif isinstance(value, (list, tuple)):
+                for i, v in enumerate(value):
+                    _validate(v, f"{key_path}[{i}]")
+            elif torch.is_tensor(value):
+                if torch.isnan(value).any():
+                    raise ValueError(f"NaN detected in '{key_path}' at index {idx}")
+                if torch.isinf(value).any():
+                    raise ValueError(f"Inf detected in '{key_path}' at index {idx}")
+                if value.dtype in [torch.float32, torch.float64]:
+                    max_val = value.abs().max().item()
+                    if max_val > 1e10:
+                        warnings.warn(f"Extreme value {max_val} in '{key_path}' at index {idx}")
+            # Non-tensor leaves are ignored
+
+        _validate(item)
     
     def _handle_error(self, idx: int, error: Exception, original_idx: int):
         """

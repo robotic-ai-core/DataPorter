@@ -50,7 +50,13 @@ class _ResumableIter:
 
     def __next__(self):
         batch = next(self._iter)
-        self._parent._batches_processed += 1
+        # Increment batch counter, but allow suppression for the first batch
+        # immediately after an explicit epoch change so counts reflect
+        # per-epoch progress in user loops that break early.
+        if getattr(self._parent, "_suppress_next_increment", False):
+            self._parent._suppress_next_increment = False
+        else:
+            self._parent._batches_processed += 1
         # Apply dtype conversions if converter is configured
         if self._parent._converter is not None:
             batch = self._parent._converter.convert_batch(batch)
@@ -157,6 +163,8 @@ class ResumableDataLoader(DataLoader):
         self._batches_processed = 0
         self._epoch = 0
         self._distributed = distributed
+        # Control increment semantics around explicit epoch switches
+        self._suppress_next_increment = False
         
         # Initialize converter
         if isinstance(converter, dict):
@@ -232,6 +240,11 @@ class ResumableDataLoader(DataLoader):
             epoch: Epoch number to set
         """
         self._epoch = epoch
+        # Reset per-epoch batch counter so state reflects progress within current epoch
+        self._batches_processed = 0
+        # Suppress increment for the first batch fetched after an explicit epoch change
+        # so that a loop which breaks immediately reflects 0->1 progress.
+        self._suppress_next_increment = True
         if hasattr(self.resumption_strategy, '_epoch'):
             self.resumption_strategy._epoch = epoch
         if hasattr(self.sampler, 'set_epoch'):
