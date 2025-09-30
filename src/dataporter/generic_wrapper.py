@@ -58,17 +58,33 @@ class GenericDatasetWrapper(BaseDatasetWrapper):
     def __getitem__(self, idx: int) -> Any:
         """
         Get an item from the dataset and apply dtype conversions.
-        
+
         Args:
             idx: Index of the item to retrieve
-            
+
         Returns:
             The item with dtype conversions applied
         """
-        
+
+        # Fast path when validation is disabled and debug mode is off
+        if self.skip_validation and not _DEBUG_MODE:
+            try:
+                # Get item from base dataset
+                item = self.base_dataset[idx]
+
+                # Apply custom path mapping if needed
+                if self.custom_path_mapping:
+                    item = self._apply_path_mapping(item)
+
+                # Apply dtype conversions
+                return self._apply_dtype_conversions(item)
+            except Exception:
+                # Fall back to the detailed error handling path
+                pass
+
         # Collect debug info for potential error reporting
         debug_context = {'index': idx}
-        
+
         try:
             # Get item from base dataset
             item = self.base_dataset[idx]
