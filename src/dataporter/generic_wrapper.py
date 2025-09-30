@@ -68,15 +68,20 @@ class GenericDatasetWrapper(BaseDatasetWrapper):
 
         # Fast path when validation is disabled and debug mode is off
         if self.skip_validation and not _DEBUG_MODE:
-            # Get item from base dataset
-            item = self.base_dataset[idx]
+            try:
+                # Get item from base dataset
+                item = self.base_dataset[idx]
 
-            # Apply custom path mapping if needed
-            if self.custom_path_mapping:
-                item = self._apply_path_mapping(item)
+                # Apply custom path mapping if needed
+                if self.custom_path_mapping:
+                    item = self._apply_path_mapping(item)
 
-            # Apply dtype conversions
-            return self._apply_dtype_conversions(item)
+                # Apply dtype conversions
+                return self._apply_dtype_conversions(item)
+            except Exception:
+                # Re-raise exception - don't silently fall back to slow path
+                # If there's an error, we want to know about it
+                raise
 
         # Collect debug info for potential error reporting
         debug_context = {'index': idx}
