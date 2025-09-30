@@ -22,12 +22,12 @@ logger = logging.getLogger(__name__)
 class GenericDatasetWrapper(BaseDatasetWrapper):
     """
     A generic wrapper that applies dtype conversions to any PyTorch dataset.
-    
+
     This is particularly useful for:
     - Reducing VRAM usage by converting to lower precision dtypes
     - Working with existing datasets without modifying their code
     - Applying conversions based on configurable paths
-    
+
     Example:
         ```python
         # Wrap any existing dataset
@@ -41,16 +41,19 @@ class GenericDatasetWrapper(BaseDatasetWrapper):
         )
         ```
     """
-    
-    def _post_init(self, custom_path_mapping: Optional[Dict[str, str]] = None, **kwargs):
+
+    def _post_init(self, custom_path_mapping: Optional[Dict[str, str]] = None,
+                   skip_validation: bool = False, **kwargs):
         """
         Additional initialization for GenericDatasetWrapper.
-        
+
         Args:
             custom_path_mapping: Optional dict to remap paths before conversion
                                e.g. {"images": "observation.image"} to handle different naming
+            skip_validation: If True, skip NaN/Inf validation for better performance
         """
         self.custom_path_mapping = custom_path_mapping or {}
+        self.skip_validation = skip_validation
     
     def __getitem__(self, idx: int) -> Any:
         """
@@ -101,10 +104,11 @@ class GenericDatasetWrapper(BaseDatasetWrapper):
         try:
             # Apply dtype conversions (handled by base class)
             converted_item = self._apply_dtype_conversions(processed_item)
-            
-            # Validate converted item for NaN/Inf values
-            self._validate_converted_item(converted_item, processed_item, idx)
-            
+
+            # Validate converted item for NaN/Inf values (skip if disabled for performance)
+            if not self.skip_validation:
+                self._validate_converted_item(converted_item, processed_item, idx)
+
             return converted_item
             
         except ValueError:
