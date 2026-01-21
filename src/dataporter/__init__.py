@@ -12,6 +12,7 @@ from .wrappers import UnifiedHFDatasetWrapper
 from .samplers import ResumableSampler, ResumableDistributedSampler
 from .resumable import ResumableDataLoader, create_resumable_dataloader
 from .strategies import ResumptionStrategy, UnifiedResumptionStrategy
+from .cached import CachedDataset, get_cache_root
 
 __all__ = [
     'KeyBasedDtypeConverter',
@@ -26,5 +27,8 @@ __all__ = [
     'create_resumable_dataloader',
     # Strategy classes
     'ResumptionStrategy',
-    'UnifiedResumptionStrategy'
+    'UnifiedResumptionStrategy',
+    # Caching
+    'CachedDataset',
+    'get_cache_root',
 ]
