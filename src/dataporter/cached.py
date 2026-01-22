@@ -49,6 +49,34 @@ from tqdm import tqdm
 logger = logging.getLogger(__name__)
 
 
+class _IndexedTransformDataset(Dataset):
+    """Helper dataset that applies transforms and returns (idx, sample) pairs.
+
+    Used internally by CachedDataset for parallel cache population.
+    """
+
+    def __init__(self, source: Dataset, transforms: Optional[Callable] = None):
+        self.source = source
+        self.transforms = transforms
+
+    def __len__(self) -> int:
+        return len(self.source)
+
+    def __getitem__(self, idx: int) -> Tuple[int, Any]:
+        sample = self.source[idx]
+        if self.transforms is not None:
+            sample = self.transforms(sample)
+        return idx, sample
+
+
+def _identity_collate(batch: List) -> List:
+    """Identity collate function that preserves batch as-is.
+
+    Used by CachedDataset for parallel cache population.
+    """
+    return batch
+
+
 def get_cache_root() -> Path:
     """Get the root cache directory, respecting HF_HOME environment variable.
 
@@ -302,17 +330,22 @@ class CachedDataset(Dataset):
         self._sample_metadata = []
 
     def _populate_cache(self):
-        """Populate the entire cache eagerly."""
+        """Populate the entire cache eagerly using parallel data loading."""
+        from torch.utils.data import DataLoader
+
         n_samples = len(self.source_dataset)
 
         if n_samples == 0:
             logger.warning("Source dataset is empty, nothing to cache")
             return
 
-        logger.info(f"Populating cache with {n_samples} samples...")
+        logger.info(f"Populating cache with {n_samples} samples using {self.num_workers} workers...")
 
-        # Get first sample to determine structure
-        first_sample = self._get_transformed_sample(0)
+        # Create a wrapper dataset that applies transforms and returns (idx, sample)
+        indexed_dataset = _IndexedTransformDataset(self.source_dataset, self.transforms)
+
+        # Get first sample to determine structure (single-threaded for safety)
+        _, first_sample = indexed_dataset[0]
 
         # Analyze sample structure
         tensor_info = self._analyze_sample_structure(first_sample)
@@ -334,21 +367,29 @@ class CachedDataset(Dataset):
             )
             arrays[field] = arr
 
-        # Store first sample's non-tensor data
-        sample_metadata = [self._extract_non_tensor_data(first_sample)]
+        # Initialize metadata storage
+        sample_metadata = [None] * n_samples
 
-        # Write first sample
-        for field in self._tensor_fields:
-            value = self._get_nested_value(first_sample, field)
-            arrays[field][0] = _tensor_to_numpy(value)
+        # Create DataLoader for parallel loading
+        # Use spawn to avoid CUDA context issues
+        mp_context = 'spawn' if self.num_workers > 0 else None
+        loader = DataLoader(
+            indexed_dataset,
+            batch_size=1,
+            shuffle=False,
+            num_workers=self.num_workers,
+            collate_fn=_identity_collate,
+            multiprocessing_context=mp_context,
+            prefetch_factor=4 if self.num_workers > 0 else None,
+        )
 
-        # Process remaining samples
-        iterator = range(1, n_samples)
+        # Process samples (DataLoader handles parallelism, writing is sequential)
+        iterator = loader
         if self.show_progress:
-            iterator = tqdm(iterator, desc="Caching samples", initial=1, total=n_samples)
+            iterator = tqdm(iterator, desc="Caching samples", total=n_samples)
 
-        for idx in iterator:
-            sample = self._get_transformed_sample(idx)
+        for batch in iterator:
+            idx, sample = batch[0]  # batch_size=1, so unpack single item
 
             # Store tensor data
             for field in self._tensor_fields:
@@ -356,7 +397,7 @@ class CachedDataset(Dataset):
                 arrays[field][idx] = _tensor_to_numpy(value)
 
             # Store non-tensor metadata
-            sample_metadata.append(self._extract_non_tensor_data(sample))
+            sample_metadata[idx] = self._extract_non_tensor_data(sample)
 
         # Flush all arrays
         for arr in arrays.values():
