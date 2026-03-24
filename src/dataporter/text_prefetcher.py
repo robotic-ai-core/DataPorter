@@ -3,8 +3,8 @@
 Writes raw text strings to Parquet (no tokenization). DataLoader workers
 handle tokenization in parallel via TransformableDataset.
 
-Each offset runs in its own thread for parallel I/O and better shuffle
-quality (shards contain docs from different regions of the dataset).
+Runs in a **separate process** by default (inherits from BasePrefetcher).
+Each offset runs in its own thread within that process for parallel I/O.
 """
 
 from __future__ import annotations
@@ -18,17 +18,17 @@ from typing import Any, Callable
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from .prefetcher import BasePrefetcher
+from .prefetcher import BasePrefetcher, atomic_write
 
 logger = logging.getLogger(__name__)
 
 
 class TextPrefetcher(BasePrefetcher):
-    """Background threads that stream HF docs to Parquet text shards.
+    """Background process that streams HF docs to Parquet text shards.
 
-    Each offset gets its own thread — parallel I/O improves throughput
-    and ensures shards contain docs from different dataset regions
-    for better shuffle quality.
+    Each offset gets its own thread within the child process — parallel
+    I/O improves throughput and ensures shards contain docs from different
+    dataset regions for better shuffle quality.
 
     Args:
         dataset: HuggingFace dataset ID.
@@ -42,12 +42,12 @@ class TextPrefetcher(BasePrefetcher):
         offsets: List of stream offsets for data diversity.
         seed: Random seed for eviction and shuffling.
         _dataset_factory: Override dataset loading (for testing).
-            Signature: (offset: int) -> iterable of dicts.
+            Forces thread mode (lambdas aren't picklable).
     """
 
     def __init__(
         self,
-        dataset: str,
+        dataset: str = "",
         data_dir: str | None = None,
         text_field: str = "text",
         output_dir: str | Path = "/tmp/text_prefetch",
@@ -59,12 +59,14 @@ class TextPrefetcher(BasePrefetcher):
         seed: int = 42,
         _dataset_factory: Callable | None = None,
     ):
+        # _dataset_factory isn't picklable — force thread mode for tests
         super().__init__(
             output_dir=output_dir,
             min_shards=min_shards,
             max_shards=max_shards,
             eviction="stochastic_oldest",
             seed=seed,
+            _use_thread=(_dataset_factory is not None),
         )
         self._dataset = dataset
         self._data_dir = data_dir
@@ -74,11 +76,23 @@ class TextPrefetcher(BasePrefetcher):
         self._offsets = offsets or [0, 2_000_000]
         self._dataset_factory = _dataset_factory
 
-    def _load_dataset(self, offset: int) -> Any:
-        """Load an HF streaming dataset at the given offset.
+    def _get_init_kwargs(self) -> dict[str, Any]:
+        """Return picklable kwargs for reconstructing in child process."""
+        return dict(
+            dataset=self._dataset,
+            data_dir=self._data_dir,
+            text_field=self._text_field,
+            output_dir=str(self._output_dir),
+            min_shards=self._min_shards,
+            max_shards=self._max_shards,
+            max_rows_per_shard=self._max_rows_per_shard,
+            stream_shuffle_buffer=self._shuffle_buffer,
+            offsets=self._offsets,
+            seed=self._seed,
+        )
 
-        Uses the shared rate limiter from hf_client for 429 protection.
-        """
+    def _load_dataset(self, offset: int) -> Any:
+        """Load an HF streaming dataset at the given offset."""
         if self._dataset_factory is not None:
             return self._dataset_factory(offset)
 
@@ -97,6 +111,9 @@ class TextPrefetcher(BasePrefetcher):
 
     def _run_inner(self) -> None:
         """Spawn one thread per offset, wait for all to finish."""
+        # Re-init shard counter from disk (we may be in a fresh child process)
+        self._shard_counter = self.shard_count
+
         if len(self._offsets) == 1:
             self._stream_offset(self._offsets[0])
             return
@@ -155,9 +172,11 @@ class TextPrefetcher(BasePrefetcher):
             self._maybe_evict(rng)
 
     def _write_shard(self, texts: list[str], schema: pa.Schema) -> None:
-        shard_path = self._next_shard_path()
+        """Write shard atomically: .tmp → rename to .parquet."""
+        tmp_path, final_path = self._next_shard_tmp_path()
         table = pa.table({"text": texts}, schema=schema)
-        pq.write_table(table, str(shard_path), compression="zstd")
+        pq.write_table(table, str(tmp_path), compression="zstd")
+        atomic_write(tmp_path, final_path)
 
-        logger.info(f"Wrote shard: {len(texts)} docs -> {shard_path.name}")
+        logger.info(f"Wrote shard: {len(texts)} docs -> {final_path.name}")
         self._check_min_ready()

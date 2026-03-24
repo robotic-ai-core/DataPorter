@@ -1,17 +1,24 @@
 """Base prefetcher and shared utilities for streaming data to local storage.
 
 Provides:
-  - ``BasePrefetcher``: Shared lifecycle (start/stop/wait_for_min), threading,
-    error propagation, shard counting, and eviction.
+  - ``BasePrefetcher``: Shared lifecycle (start/stop/wait_for_min), process
+    isolation, error propagation, shard counting, and eviction.
   - ``CompanionPool``: Thread pool for co-downloading companion files.
   - ``CompanionRef``: Dataclass for companion file references.
   - Eviction and manifest utilities.
+
+The prefetcher runs in a **separate process** by default to avoid GIL
+contention with CUDA training. Falls back to a thread when a custom
+``_dataset_factory`` is provided (testing — lambdas aren't picklable).
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import multiprocessing
+import os
+import queue
 import random
 import threading
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -152,6 +159,20 @@ def _read_manifest(shard_path: Path) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
+# Atomic shard write
+# ---------------------------------------------------------------------------
+
+
+def atomic_write(src_path: Path, dst_path: Path) -> None:
+    """Atomically move a file from src to dst via os.rename.
+
+    On POSIX, rename is atomic — readers never see a partial file.
+    Use this for shard finalization: write to .tmp, then rename to .parquet.
+    """
+    os.rename(src_path, dst_path)
+
+
+# ---------------------------------------------------------------------------
 # Eviction
 # ---------------------------------------------------------------------------
 
@@ -206,11 +227,43 @@ def evict_shard(
 # ---------------------------------------------------------------------------
 
 
+def _process_entry(prefetcher_cls, init_kwargs, stop_event, min_ready, error_queue):
+    """Entry point for the prefetcher child process.
+
+    Reconstructs the prefetcher from kwargs and runs it. This is a
+    module-level function so it's picklable for multiprocessing.spawn.
+    """
+    prefetcher = prefetcher_cls(**init_kwargs)
+    prefetcher._stop_event = stop_event
+    prefetcher._min_ready = min_ready
+    try:
+        prefetcher._on_start()
+        prefetcher._run_inner()
+    except BaseException as e:
+        try:
+            error_queue.put(str(e))
+        except Exception:
+            pass
+        logger.error(f"{prefetcher_cls.__name__} error: {e}", exc_info=True)
+    finally:
+        min_ready.set()
+        try:
+            prefetcher._on_stop()
+        except Exception:
+            pass
+
+
 class BasePrefetcher:
     """Base class for background prefetchers.
 
-    Owns lifecycle (start/stop/wait_for_min), threading, error propagation,
-    shard counting, and eviction. Subclasses implement ``_run_inner()``.
+    Runs in a **separate process** by default to avoid GIL contention
+    with CUDA training. Falls back to a thread when ``_use_thread=True``
+    (set automatically when ``_dataset_factory`` is provided for tests).
+
+    Communication with the child:
+      - Filesystem: Parquet shards in output_dir (the primary interface)
+      - ``multiprocessing.Event``: stop signal and min-ready signal
+      - ``multiprocessing.Queue``: error propagation from child to parent
 
     Args:
         output_dir: Local directory for shard files.
@@ -221,6 +274,10 @@ class BasePrefetcher:
         shard_glob: Glob pattern to count shards (default "shard_*.parquet").
     """
 
+    # Subclasses set this to provide the kwargs needed to reconstruct
+    # the prefetcher in the child process.
+    _init_kwargs: dict[str, Any] | None = None
+
     def __init__(
         self,
         output_dir: str | Path,
@@ -229,6 +286,7 @@ class BasePrefetcher:
         eviction: str = "stochastic_oldest",
         seed: int = 42,
         shard_glob: str = "shard_*.parquet",
+        _use_thread: bool = False,
     ):
         if min_shards < 1:
             raise ValueError("min_shards must be >= 1")
@@ -243,13 +301,18 @@ class BasePrefetcher:
         self._eviction = eviction
         self._seed = seed
         self._shard_glob = shard_glob
+        self._use_thread = _use_thread
 
-        self._thread: threading.Thread | None = None
-        self._stop_event = threading.Event()
-        self._min_ready = threading.Event()
+        # These are set in start() — process mode uses mp versions
+        self._worker = None
+        self._stop_event = None
+        self._min_ready = None
+        self._error_queue = None
+        self._error: BaseException | None = None
+
+        # Only used inside the child (thread or process)
         self._lock = threading.Lock()
         self._shard_counter = 0
-        self._error: BaseException | None = None
 
     @property
     def shard_count(self) -> int:
@@ -257,63 +320,133 @@ class BasePrefetcher:
 
     @property
     def is_alive(self) -> bool:
-        return self._thread is not None and self._thread.is_alive()
+        return self._worker is not None and self._worker.is_alive()
 
     @property
     def error(self) -> BaseException | None:
+        self._drain_error_queue()
         return self._error
+
+    def _drain_error_queue(self) -> None:
+        """Pull errors from the child process queue."""
+        if self._error_queue is None:
+            return
+        try:
+            while True:
+                msg = self._error_queue.get_nowait()
+                self._error = RuntimeError(msg)
+        except (queue.Empty, EOFError):
+            pass
 
     def _next_shard_path(self) -> Path:
         with self._lock:
             idx = self._shard_counter
             self._shard_counter += 1
+        # Write to .tmp first — caller should rename to .parquet after write
         return self._output_dir / f"shard_{idx:06d}.parquet"
 
+    def _next_shard_tmp_path(self) -> tuple[Path, Path]:
+        """Return (tmp_path, final_path) for atomic shard writing."""
+        with self._lock:
+            idx = self._shard_counter
+            self._shard_counter += 1
+        final = self._output_dir / f"shard_{idx:06d}.parquet"
+        tmp = self._output_dir / f"shard_{idx:06d}.parquet.tmp"
+        return tmp, final
+
     def start(self) -> None:
-        """Start background download thread."""
-        if self._thread is not None and self._thread.is_alive():
+        """Start background download in a separate process (or thread for tests)."""
+        if self._worker is not None and self._worker.is_alive():
             raise RuntimeError(f"{type(self).__name__} already running")
 
         self._output_dir.mkdir(parents=True, exist_ok=True)
-
-        # Resume from existing shards
-        self._shard_counter = self.shard_count
-        if self._shard_counter >= self._min_shards:
-            self._min_ready.set()
-
-        self._stop_event.clear()
         self._error = None
-        self._on_start()
 
-        self._thread = threading.Thread(
-            target=self._run, daemon=True, name=type(self).__name__
+        if self._use_thread:
+            self._stop_event = threading.Event()
+            self._min_ready = threading.Event()
+            self._error_queue = None
+
+            # Resume from existing shards
+            self._shard_counter = self.shard_count
+            if self._shard_counter >= self._min_shards:
+                self._min_ready.set()
+
+            self._on_start()
+            self._worker = threading.Thread(
+                target=self._run_thread, daemon=True, name=type(self).__name__
+            )
+            self._worker.start()
+        else:
+            self._stop_event = multiprocessing.Event()
+            self._min_ready = multiprocessing.Event()
+            self._error_queue = multiprocessing.Queue()
+
+            # Check if min already met
+            if self.shard_count >= self._min_shards:
+                self._min_ready.set()
+
+            init_kwargs = self._get_init_kwargs()
+            self._worker = multiprocessing.Process(
+                target=_process_entry,
+                args=(
+                    type(self),
+                    init_kwargs,
+                    self._stop_event,
+                    self._min_ready,
+                    self._error_queue,
+                ),
+                daemon=True,
+                name=type(self).__name__,
+            )
+            self._worker.start()
+
+    def _get_init_kwargs(self) -> dict[str, Any]:
+        """Return kwargs to reconstruct this prefetcher in the child process.
+
+        Subclasses must override this for process mode.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} must implement _get_init_kwargs() "
+            "for process mode, or use _use_thread=True"
         )
-        self._thread.start()
 
     def _on_start(self) -> None:
-        """Hook for subclasses to initialize resources before the thread starts."""
+        """Hook for subclasses to initialize resources (thread mode only)."""
 
     def wait_for_min(self, timeout: float = 300.0) -> None:
         """Block until min_shards are ready."""
         if not self._min_ready.wait(timeout=timeout):
+            self._drain_error_queue()
             if self._error:
                 raise RuntimeError(f"Prefetcher failed: {self._error}") from self._error
             raise TimeoutError(
                 f"Didn't produce {self._min_shards} shards in {timeout}s"
             )
+        self._drain_error_queue()
         if self._error:
             raise RuntimeError(f"Prefetcher failed: {self._error}") from self._error
 
     def stop(self) -> None:
         """Stop background production."""
-        self._stop_event.set()
-        if self._thread is not None:
-            self._thread.join(timeout=30)
-            self._thread = None
+        if self._stop_event is not None:
+            self._stop_event.set()
+        if self._worker is not None:
+            self._worker.join(timeout=30)
+            if isinstance(self._worker, multiprocessing.Process) and self._worker.is_alive():
+                self._worker.terminate()
+            self._worker = None
         self._on_stop()
+        if self._error_queue is not None:
+            self._drain_error_queue()
+            try:
+                self._error_queue.close()
+            except Exception:
+                pass
+            self._error_queue = None
 
     def _on_stop(self) -> None:
-        """Hook for subclasses to clean up resources after the thread stops."""
+        """Hook for subclasses to clean up resources."""
 
     def _check_min_ready(self) -> None:
         if not self._min_ready.is_set() and self.shard_count >= self._min_shards:
@@ -331,7 +464,8 @@ class BasePrefetcher:
                 glob_pattern=self._shard_glob,
             )
 
-    def _run(self) -> None:
+    def _run_thread(self) -> None:
+        """Thread-mode entry point (used for tests)."""
         try:
             self._run_inner()
         except BaseException as e:

@@ -18,7 +18,7 @@ from __future__ import annotations
 import logging
 import random
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 
 from .prefetcher import (
     BasePrefetcher,
@@ -65,6 +65,8 @@ class LeRobotPrefetcher(BasePrefetcher):
         _download_fn: Callable[[str, Path], None] | None = None,
         _meta_loader: Callable[[str, Path], dict] | None = None,
     ):
+        # Test hooks aren't picklable — force thread mode
+        use_thread = _download_fn is not None or _meta_loader is not None
         super().__init__(
             output_dir=output_dir,
             min_shards=min_shards,
@@ -72,6 +74,7 @@ class LeRobotPrefetcher(BasePrefetcher):
             eviction=eviction,
             seed=seed,
             shard_glob="**/episode_*.parquet",
+            _use_thread=use_thread,
         )
         self._repo_id = repo_id
         self._revision = revision or "v2.1"
@@ -88,6 +91,19 @@ class LeRobotPrefetcher(BasePrefetcher):
             from .hf_client import make_hf_download_fn
 
             self._download_fn = make_hf_download_fn(repo_id, revision=self._revision)
+
+    def _get_init_kwargs(self) -> dict[str, Any]:
+        return dict(
+            repo_id=self._repo_id,
+            output_dir=str(self._output_dir),
+            revision=self._revision,
+            episode_indices=self._episode_indices,
+            min_shards=self._min_shards,
+            max_shards=self._max_shards,
+            eviction=self._eviction,
+            companion_workers=self._companion_workers,
+            seed=self._seed,
+        )
 
     def _on_start(self) -> None:
         self._companion_pool = CompanionPool(
