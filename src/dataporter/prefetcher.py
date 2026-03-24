@@ -378,16 +378,16 @@ class BasePrefetcher:
             )
             self._worker.start()
         else:
-            self._stop_event = multiprocessing.Event()
-            self._min_ready = multiprocessing.Event()
-            self._error_queue = multiprocessing.Queue()
-
-            # Check if min already met
+            init_kwargs = self._get_init_kwargs()
+            # Use forkserver to avoid inheriting CUDA state from parent.
+            # Plain fork silently dies when CUDA is initialized before start().
+            ctx = multiprocessing.get_context("forkserver")
+            self._stop_event = ctx.Event()
+            self._min_ready = ctx.Event()
+            self._error_queue = ctx.Queue()
             if self.shard_count >= self._min_shards:
                 self._min_ready.set()
-
-            init_kwargs = self._get_init_kwargs()
-            self._worker = multiprocessing.Process(
+            self._worker = ctx.Process(
                 target=_process_entry,
                 args=(
                     type(self),
