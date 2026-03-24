@@ -137,7 +137,9 @@ class TextPrefetcher(BasePrefetcher):
         offsets: List of initial stream offsets for data diversity.
         seed: Random seed for eviction and shuffling.
         high_water: Producers pause when buffer reaches this size.
+            Default: 3 × max_rows_per_shard (writer always has full shards).
         low_water: Producers resume when buffer drains to this size.
+            Default: 1 × max_rows_per_shard (at least one full shard buffered).
         max_restarts: Max times a stream restarts after exhaustion.
             None = unlimited (stream until stop/max_shards).
         _dataset_factory: Override dataset loading (for testing).
@@ -156,8 +158,8 @@ class TextPrefetcher(BasePrefetcher):
         stream_shuffle_buffer: int = 10_000,
         offsets: list[int] | None = None,
         seed: int = 42,
-        high_water: int = 8_000,
-        low_water: int = 3_000,
+        high_water: int | None = None,
+        low_water: int | None = None,
         max_restarts: int | None = None,
         _dataset_factory: Callable | None = None,
     ):
@@ -176,8 +178,8 @@ class TextPrefetcher(BasePrefetcher):
         self._shuffle_buffer = stream_shuffle_buffer
         self._offsets = offsets or [0, 2_000_000]
         self._dataset_factory = _dataset_factory
-        self._high_water = high_water
-        self._low_water = low_water
+        self._high_water = high_water if high_water is not None else max_rows_per_shard * 3
+        self._low_water = low_water if low_water is not None else max_rows_per_shard
         self._max_restarts = max_restarts
 
     def _get_init_kwargs(self) -> dict[str, Any]:
