@@ -77,37 +77,23 @@ class TextPrefetcher(BasePrefetcher):
     def _load_dataset(self, offset: int) -> Any:
         """Load an HF streaming dataset at the given offset.
 
-        Retries with exponential backoff on rate limit (429) errors.
+        Uses the shared rate limiter from hf_client for 429 protection.
         """
         if self._dataset_factory is not None:
             return self._dataset_factory(offset)
 
-        import time
+        from .hf_client import hf_load_dataset
 
-        from datasets import load_dataset
+        ds = hf_load_dataset(
+            self._dataset,
+            data_dir=self._data_dir,
+            split="train",
+            streaming=True,
+        ).shuffle(seed=self._seed, buffer_size=self._shuffle_buffer)
 
-        for attempt in range(4):
-            try:
-                ds = load_dataset(
-                    self._dataset,
-                    data_dir=self._data_dir,
-                    split="train",
-                    streaming=True,
-                ).shuffle(seed=self._seed, buffer_size=self._shuffle_buffer)
-
-                if offset > 0:
-                    ds = ds.skip(offset)
-                return ds
-            except Exception as e:
-                if "429" in str(e) and attempt < 3:
-                    wait = 60 * (2 ** attempt)  # 60s, 120s, 240s
-                    logger.warning(
-                        f"HF rate limit (attempt {attempt + 1}/4), "
-                        f"retrying in {wait}s..."
-                    )
-                    time.sleep(wait)
-                else:
-                    raise
+        if offset > 0:
+            ds = ds.skip(offset)
+        return ds
 
     def _run_inner(self) -> None:
         """Spawn one thread per offset, wait for all to finish."""
