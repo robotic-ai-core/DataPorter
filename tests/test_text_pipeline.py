@@ -6,6 +6,7 @@ All tests use mocked HF datasets — no network access needed.
 from __future__ import annotations
 
 import random
+import threading
 import time
 from pathlib import Path
 
@@ -522,7 +523,7 @@ class TestParallelOffsets:
             max_rows_per_shard=30,
             offsets=[0, 200],
             stream_shuffle_buffer=0,
-            queue_size=30,  # small queue forces producers to alternate
+            high_water=30, low_water=10,  # small buffer forces producers to alternate
             max_restarts=0,
             _dataset_factory=factory,
         )
@@ -623,7 +624,7 @@ class TestRandomnessValidation:
             max_shards=15,
             max_rows_per_shard=20,
             offsets=offsets,
-            queue_size=20,  # small queue to interleave regions
+            high_water=20, low_water=5,  # small buffer to interleave regions
             max_restarts=0,
             _dataset_factory=factory,
         )
@@ -716,7 +717,7 @@ class TestContinuousStreaming:
             min_shards=2,
             max_rows_per_shard=20,
             offsets=[0],
-            queue_size=50,
+            high_water=50, low_water=10,
             max_restarts=0,
             _dataset_factory=_make_factory(docs),
         )
@@ -726,3 +727,96 @@ class TestContinuousStreaming:
         prefetcher.stop()
 
         assert prefetcher.shard_count >= 2
+
+
+# ---------------------------------------------------------------------------
+# 10. DualThresholdBuffer Tests
+# ---------------------------------------------------------------------------
+
+class TestDualThresholdBuffer:
+
+    def test_put_and_get(self):
+        from dataporter.text_prefetcher import DualThresholdBuffer
+        buf = DualThresholdBuffer(high_water=10, low_water=3)
+        for i in range(5):
+            buf.put(f"item_{i}")
+        assert buf.size == 5
+
+        items = buf.get_batch(3)
+        assert len(items) == 3
+        assert items == ["item_0", "item_1", "item_2"]
+        assert buf.size == 2
+
+    def test_high_water_pauses_producer(self):
+        """Producer blocks when buffer reaches high_water."""
+        from dataporter.text_prefetcher import DualThresholdBuffer
+        buf = DualThresholdBuffer(high_water=5, low_water=2)
+
+        for i in range(5):
+            buf.put(f"item_{i}")
+
+        blocked = threading.Event()
+        stop = threading.Event()
+
+        def producer():
+            blocked.set()
+            buf.put("overflow", stop_event=stop)
+
+        t = threading.Thread(target=producer, daemon=True)
+        t.start()
+        blocked.wait(timeout=1)
+        time.sleep(0.1)
+        assert t.is_alive()  # blocked at high_water
+        assert buf.size == 5
+
+        # Drain below low_water to unblock
+        buf.get_batch(4)
+        t.join(timeout=2)
+        assert not t.is_alive()
+        assert buf.size == 2  # 1 remaining + "overflow"
+
+    def test_hysteresis_prevents_oscillation(self):
+        """Producer stays blocked until low_water, not just below high_water."""
+        from dataporter.text_prefetcher import DualThresholdBuffer
+        buf = DualThresholdBuffer(high_water=5, low_water=2)
+
+        # Fill to high_water
+        for i in range(5):
+            buf.put(f"item_{i}")
+
+        # Start a producer that will block
+        unblocked = threading.Event()
+        stop = threading.Event()
+
+        def producer():
+            buf.put("extra", stop_event=stop)
+            unblocked.set()
+
+        t = threading.Thread(target=producer, daemon=True)
+        t.start()
+        time.sleep(0.1)
+        assert t.is_alive()  # blocked
+
+        # Drain to 3 (below high=5 but above low=2) — should still be blocked
+        buf.get_batch(2)  # 5 → 3
+        time.sleep(0.2)
+        assert t.is_alive(), "Producer should stay blocked above low_water"
+
+        # Drain to low_water — should unblock
+        buf.get_batch(2)  # 3 → 1, which is <= low_water=2
+        t.join(timeout=2)
+        assert not t.is_alive()
+        assert unblocked.is_set()
+
+    def test_sentinel_bypasses_high_water(self):
+        from dataporter.text_prefetcher import DualThresholdBuffer, _SENTINEL
+        buf = DualThresholdBuffer(high_water=3, low_water=1)
+        for i in range(3):
+            buf.put(f"item_{i}")
+        buf.put_sentinel()
+        assert buf.size == 4
+
+    def test_invalid_thresholds(self):
+        from dataporter.text_prefetcher import DualThresholdBuffer
+        with pytest.raises(ValueError, match="low_water must be < high_water"):
+            DualThresholdBuffer(high_water=5, low_water=5)
