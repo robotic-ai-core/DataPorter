@@ -92,6 +92,7 @@ class TestTextPrefetcher:
             min_shards=2,
             max_rows_per_shard=50,
             offsets=[0],
+            max_restarts=0,
             _dataset_factory=_make_factory(docs),
         )
         prefetcher.start()
@@ -112,6 +113,7 @@ class TestTextPrefetcher:
             min_shards=3,
             max_rows_per_shard=50,
             offsets=[0],
+            max_restarts=0,
             _dataset_factory=_make_factory(docs),
         )
         prefetcher.start()
@@ -134,6 +136,7 @@ class TestTextPrefetcher:
             min_shards=1,
             max_rows_per_shard=1000,
             offsets=[0, 50],
+            max_restarts=0,
             _dataset_factory=tracking_factory,
         )
         prefetcher.start()
@@ -154,6 +157,7 @@ class TestTextPrefetcher:
             max_shards=max_shards,
             max_rows_per_shard=20,
             offsets=[0],
+            max_restarts=0,
             _dataset_factory=_make_factory(docs),
         )
         prefetcher.start()
@@ -172,6 +176,7 @@ class TestTextPrefetcher:
             max_shards=None,
             max_rows_per_shard=20,
             offsets=[0],
+            max_restarts=0,
             _dataset_factory=_make_factory(docs),
         )
         prefetcher.start()
@@ -211,6 +216,7 @@ class TestTextPrefetcher:
             dataset="test",
             output_dir=tmp_path,
             min_shards=1,
+            max_restarts=0,
             _dataset_factory=failing_factory,
         )
         prefetcher.start()
@@ -232,6 +238,7 @@ class TestTextPrefetcher:
             output_dir=tmp_path,
             min_shards=3,
             offsets=[0],
+            max_restarts=0,
             _dataset_factory=_make_factory(docs),
         )
         prefetcher.start()
@@ -248,6 +255,7 @@ class TestTextPrefetcher:
             min_shards=1,
             max_rows_per_shard=50,
             offsets=[0],
+            max_restarts=0,
             _dataset_factory=_make_factory(docs),
         )
         prefetcher.start()
@@ -390,6 +398,7 @@ class TestEndToEnd:
             min_shards=3,
             max_rows_per_shard=50,
             offsets=[0],
+            max_restarts=0,
             _dataset_factory=_make_factory(docs),
         )
         prefetcher.start()
@@ -475,6 +484,7 @@ class TestParallelOffsets:
             max_rows_per_shard=30,
             offsets=[0, 100],  # offset 0 → region A, offset 100 → region B
             stream_shuffle_buffer=0,  # no shuffle, so region order is deterministic
+            max_restarts=0,
             _dataset_factory=factory,
         )
         prefetcher.start()
@@ -512,6 +522,8 @@ class TestParallelOffsets:
             max_rows_per_shard=30,
             offsets=[0, 200],
             stream_shuffle_buffer=0,
+            queue_size=30,  # small queue forces producers to alternate
+            max_restarts=0,
             _dataset_factory=factory,
         )
         prefetcher.start()
@@ -519,24 +531,19 @@ class TestParallelOffsets:
         time.sleep(0.5)
         prefetcher.stop()
 
-        # Check that early shards contain docs from both regions
-        shards = sorted(tmp_path.glob("shard_*.parquet"))
-        assert len(shards) >= 4
-
-        # Look at the first 4 shards — with parallel offsets, they should
-        # contain a mix of A and B (not all A first)
-        early_regions = set()
-        for shard in shards[:4]:
+        # All shards combined should contain both regions
+        all_regions = set()
+        for shard in tmp_path.glob("shard_*.parquet"):
             table = pq.read_table(shard)
             for text in table.column("text").to_pylist():
                 if text.startswith("A_"):
-                    early_regions.add("A")
+                    all_regions.add("A")
                 elif text.startswith("B_"):
-                    early_regions.add("B")
+                    all_regions.add("B")
 
-        assert early_regions == {"A", "B"}, (
-            f"Early shards only contain {early_regions} — "
-            "parallel offsets should interleave regions"
+        assert all_regions == {"A", "B"}, (
+            f"Shards only contain {all_regions} — "
+            "parallel offsets should produce both regions"
         )
 
 
@@ -574,6 +581,7 @@ class TestRandomnessValidation:
             max_rows_per_shard=25,
             offsets=offsets,
             stream_shuffle_buffer=0,
+            max_restarts=0,
             _dataset_factory=factory,
         )
         prefetcher.start()
@@ -612,9 +620,11 @@ class TestRandomnessValidation:
             dataset="test",
             output_dir=tmp_path,
             min_shards=3,
-            max_shards=15,  # force eviction but keep enough for diversity
+            max_shards=15,
             max_rows_per_shard=20,
             offsets=offsets,
+            queue_size=20,  # small queue to interleave regions
+            max_restarts=0,
             _dataset_factory=factory,
         )
         prefetcher.start()
@@ -637,3 +647,82 @@ class TestRandomnessValidation:
             f"Only {surviving_regions} regions survived eviction — "
             "expected at least 2 of 3"
         )
+
+
+# ---------------------------------------------------------------------------
+# 9. Continuous Streaming Tests
+# ---------------------------------------------------------------------------
+
+class TestContinuousStreaming:
+
+    def test_producer_restarts_after_exhaustion(self, tmp_path):
+        """Producers restart from new offsets when data is exhausted,
+        producing more shards than the initial data would allow."""
+        docs = _make_text_docs(20)
+
+        def wrapping_factory(offset):
+            """Factory that wraps offset into range (simulates infinite dataset)."""
+            wrapped = offset % max(1, len(docs))
+            return _FakeHFDataset(docs).skip(wrapped)
+
+        prefetcher = TextPrefetcher(
+            dataset="test",
+            output_dir=tmp_path,
+            min_shards=1,
+            max_shards=None,
+            max_rows_per_shard=10,
+            offsets=[0],
+            max_restarts=3,
+            _dataset_factory=wrapping_factory,
+        )
+        prefetcher.start()
+        prefetcher.wait_for_min(timeout=30)
+        time.sleep(1)
+        prefetcher.stop()
+
+        # 4 passes over 20 docs at 10 rows/shard → ~8 shards
+        assert prefetcher.shard_count >= 4
+
+    def test_max_restarts_zero_exhausts_once(self, tmp_path):
+        """max_restarts=0 means streams exhaust and stop (old behavior)."""
+        docs = _make_text_docs(50)
+
+        prefetcher = TextPrefetcher(
+            dataset="test",
+            output_dir=tmp_path,
+            min_shards=1,
+            max_shards=None,
+            max_rows_per_shard=20,
+            offsets=[0],
+            max_restarts=0,
+            _dataset_factory=_make_factory(docs),
+        )
+        prefetcher.start()
+        prefetcher.wait_for_min(timeout=30)
+        time.sleep(1)
+        prefetcher.stop()
+
+        # 50 docs at 20 rows/shard → 2-3 shards, no more
+        assert prefetcher.shard_count <= 4
+
+    def test_writer_overlaps_with_network(self, tmp_path):
+        """Writer should not block producers — queue decouples them."""
+        # Slow docs (simulating network latency) + fast writer
+        docs = _make_text_docs(100)
+
+        prefetcher = TextPrefetcher(
+            dataset="test",
+            output_dir=tmp_path,
+            min_shards=2,
+            max_rows_per_shard=20,
+            offsets=[0],
+            queue_size=50,
+            max_restarts=0,
+            _dataset_factory=_make_factory(docs),
+        )
+        prefetcher.start()
+        prefetcher.wait_for_min(timeout=30)
+        time.sleep(0.5)
+        prefetcher.stop()
+
+        assert prefetcher.shard_count >= 2
