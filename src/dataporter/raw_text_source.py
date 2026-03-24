@@ -8,6 +8,7 @@ Rescans for new shards periodically.
 from __future__ import annotations
 
 import logging
+from bisect import bisect_right
 from pathlib import Path
 from time import monotonic
 
@@ -90,11 +91,11 @@ class RawTextSource:
 
     def _locate(self, idx: int) -> tuple[int, int]:
         """Map global idx to (shard_idx, local_row)."""
-        for s, cum in enumerate(self._cumulative_rows):
-            if idx < cum:
-                local = idx - (self._cumulative_rows[s - 1] if s > 0 else 0)
-                return s, local
-        raise IndexError(f"Index {idx} out of range ({self._total_rows})")
+        if idx < 0 or idx >= self._total_rows:
+            raise IndexError(f"Index {idx} out of range ({self._total_rows})")
+        shard_idx = bisect_right(self._cumulative_rows, idx)
+        local = idx - (self._cumulative_rows[shard_idx - 1] if shard_idx > 0 else 0)
+        return shard_idx, local
 
     def _get_table(self, shard_idx: int) -> pq.ParquetFile:
         if shard_idx not in self._tables:

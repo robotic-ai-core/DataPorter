@@ -14,9 +14,8 @@ from .resumable import ResumableDataLoader, create_resumable_dataloader
 from .strategies import ResumptionStrategy, UnifiedResumptionStrategy
 from .cached import CachedDataset, get_cache_root
 from .prefetcher import ParquetPrefetcher, CompanionPool, CompanionRef
-from .growable_dataset import GrowableParquetDataset
 from .lerobot_prefetcher import LeRobotPrefetcher
-from .transforms import compose, tokenize_and_chunk, tokenize_transform, chunk_transform
+from .transforms import compose, get_tokenizer
 from .text_prefetcher import TextPrefetcher
 from .raw_text_source import RawTextSource
 from .transformable_dataset import TransformableDataset
@@ -38,18 +37,16 @@ __all__ = [
     # Caching
     'CachedDataset',
     'get_cache_root',
-    # Streaming prefetcher
+    # Companion prefetcher (LeRobot video, multimodal)
     'ParquetPrefetcher',
     'CompanionPool',
     'CompanionRef',
-    'GrowableParquetDataset',
     'LeRobotPrefetcher',
-    'compose',
-    'tokenize_and_chunk',
-    'tokenize_transform',
-    'chunk_transform',
     # Text streaming (raw text prefetch + worker-side transform)
     'TextPrefetcher',
     'RawTextSource',
     'TransformableDataset',
+    # Utilities
+    'compose',
+    'get_tokenizer',
 ]
