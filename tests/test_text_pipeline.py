@@ -148,33 +148,13 @@ class TestTextPrefetcher:
         assert 0 in seen_offsets
         assert 50 in seen_offsets
 
-    def test_eviction_enforced(self, tmp_path):
-        docs = _make_text_docs(2000)
-        max_shards = 5
-        prefetcher = TextPrefetcher(
-            dataset="test",
-            output_dir=tmp_path,
-            min_shards=2,
-            max_shards=max_shards,
-            max_rows_per_shard=20,
-            offsets=[0],
-            max_restarts=0,
-            _dataset_factory=_make_factory(docs),
-        )
-        prefetcher.start()
-        prefetcher.wait_for_min(timeout=30)
-        time.sleep(1)
-        prefetcher.stop()
-
-        assert prefetcher.shard_count <= max_shards + 1
-
-    def test_no_eviction_when_none(self, tmp_path):
+    def test_prefetcher_never_evicts(self, tmp_path):
+        """Prefetcher only writes — eviction is the reader's job."""
         docs = _make_text_docs(200)
         prefetcher = TextPrefetcher(
-            dataset="test",
             output_dir=tmp_path,
+            dataset="test",
             min_shards=1,
-            max_shards=None,
             max_rows_per_shard=20,
             offsets=[0],
             max_restarts=0,
@@ -554,7 +534,7 @@ class TestParallelOffsets:
 
 def _run_prefetcher_and_read(
     tmp_path, n_regions, docs_per_region, max_rows_per_shard=25,
-    max_shards=None, high_water=None, low_water=None,
+    max_shards_reader=None, high_water=None, low_water=None,
 ):
     """Helper: run prefetcher with N regions, return (region_counts, shard_region_sets)."""
     all_docs = []
@@ -571,7 +551,6 @@ def _run_prefetcher_and_read(
         output_dir=tmp_path,
         dataset="test",
         min_shards=max(2, n_regions),
-        max_shards=max_shards,
         max_rows_per_shard=max_rows_per_shard,
         offsets=offsets,
         max_restarts=0,
@@ -588,7 +567,12 @@ def _run_prefetcher_and_read(
     time.sleep(1)
     prefetcher.stop()
 
-    src = RawTextSource(tmp_path, refresh_interval_seconds=60)
+    src = RawTextSource(
+        tmp_path, refresh_interval_seconds=0.01,
+        max_shards=max_shards_reader,
+    )
+    # Trigger eviction via refresh if max_shards_reader is set
+    _ = len(src)
     region_counts = {r: 0 for r in range(n_regions)}
     shard_region_sets = {}  # shard_name -> set of regions in that shard
 
@@ -694,7 +678,7 @@ class TestRandomnessValidation:
         (stochastic oldest eviction doesn't wipe out entire regions)."""
         region_counts, _ = _run_prefetcher_and_read(
             tmp_path, n_regions=3, docs_per_region=300,
-            max_rows_per_shard=20, max_shards=20,
+            max_rows_per_shard=20, max_shards_reader=20,
             high_water=20, low_water=5,
         )
         total = sum(region_counts.values())
@@ -729,8 +713,7 @@ class TestContinuousStreaming:
             dataset="test",
             output_dir=tmp_path,
             min_shards=1,
-            max_shards=None,
-            max_rows_per_shard=10,
+                        max_rows_per_shard=10,
             offsets=[0],
             max_restarts=3,
             _dataset_factory=wrapping_factory,
@@ -751,8 +734,7 @@ class TestContinuousStreaming:
             dataset="test",
             output_dir=tmp_path,
             min_shards=1,
-            max_shards=None,
-            max_rows_per_shard=20,
+                        max_rows_per_shard=20,
             offsets=[0],
             max_restarts=0,
             _dataset_factory=_make_factory(docs),
@@ -879,3 +861,172 @@ class TestDualThresholdBuffer:
         from dataporter.text_prefetcher import DualThresholdBuffer
         with pytest.raises(ValueError, match="low_water must be < high_water"):
             DualThresholdBuffer(high_water=5, low_water=5)
+
+
+# ---------------------------------------------------------------------------
+# 11. Deferred Eviction Tests
+# ---------------------------------------------------------------------------
+
+class TestDeferredEviction:
+
+    def _write_shards(self, tmp_path, n=5, docs_per_shard=20):
+        for i in range(n):
+            _write_text_shard(
+                tmp_path / f"shard_{i:06d}.parquet",
+                [f"shard{i}_doc{j}" for j in range(docs_per_shard)],
+            )
+
+    def test_schedule_then_refresh_deletes(self, tmp_path):
+        """Scheduled shard is deleted on next refresh, not immediately."""
+        self._write_shards(tmp_path, n=3)
+        src = RawTextSource(tmp_path, refresh_interval_seconds=0.01)
+        assert src.shard_count == 3
+
+        target = tmp_path / "shard_000000.parquet"
+        src.schedule_eviction(target)
+
+        # Not deleted yet — shard is still readable
+        assert target.exists()
+        assert src.pending_eviction_count == 1
+
+        # Trigger refresh — now it's deleted
+        time.sleep(0.02)
+        _ = len(src)
+        assert not target.exists()
+        assert src.shard_count == 2
+        assert src.pending_eviction_count == 0
+
+    def test_read_before_eviction_succeeds(self, tmp_path):
+        """Can still read a shard that's scheduled for eviction."""
+        self._write_shards(tmp_path, n=2, docs_per_shard=10)
+        src = RawTextSource(tmp_path, refresh_interval_seconds=60)
+        assert len(src) == 20
+
+        # Read from shard 0
+        item = src[0]
+        assert "shard0" in item["text"]
+
+        # Schedule it for eviction
+        src.schedule_eviction(tmp_path / "shard_000000.parquet")
+
+        # Can still read it (refresh hasn't happened)
+        item = src[0]
+        assert "shard0" in item["text"]
+
+    def test_eviction_of_nonexistent_shard(self, tmp_path):
+        """Scheduling eviction of a missing file doesn't crash."""
+        self._write_shards(tmp_path, n=1)
+        src = RawTextSource(tmp_path, refresh_interval_seconds=0.01)
+
+        src.schedule_eviction(tmp_path / "nonexistent.parquet")
+        time.sleep(0.02)
+        _ = len(src)  # refresh executes eviction — no crash
+        assert src.shard_count == 1
+
+    def test_double_schedule(self, tmp_path):
+        """Scheduling the same shard twice doesn't double-delete."""
+        self._write_shards(tmp_path, n=2)
+        src = RawTextSource(tmp_path, refresh_interval_seconds=0.01)
+
+        target = tmp_path / "shard_000000.parquet"
+        src.schedule_eviction(target)
+        src.schedule_eviction(target)  # duplicate
+        assert src.pending_eviction_count == 1  # set deduplicates
+
+        time.sleep(0.02)
+        _ = len(src)
+        assert not target.exists()
+        assert src.shard_count == 1
+
+    def test_evict_all_shards(self, tmp_path):
+        """Evicting all shards leaves an empty dataset."""
+        self._write_shards(tmp_path, n=3)
+        src = RawTextSource(tmp_path, refresh_interval_seconds=0.01)
+        assert len(src) == 60
+
+        for i in range(3):
+            src.schedule_eviction(tmp_path / f"shard_{i:06d}.parquet")
+
+        time.sleep(0.02)
+        assert len(src) == 0
+        assert src.shard_count == 0
+
+    def test_auto_eviction_via_max_shards(self, tmp_path):
+        """max_shards triggers automatic eviction of oldest shards."""
+        self._write_shards(tmp_path, n=10, docs_per_shard=5)
+        src = RawTextSource(
+            tmp_path, refresh_interval_seconds=0.01, max_shards=5,
+        )
+
+        # Initial refresh should evict 5 oldest
+        assert src.shard_count == 5
+        # Oldest shards should be gone
+        assert not (tmp_path / "shard_000000.parquet").exists()
+        assert not (tmp_path / "shard_000004.parquet").exists()
+        # Newest should survive
+        assert (tmp_path / "shard_000009.parquet").exists()
+
+    def test_auto_eviction_as_new_shards_arrive(self, tmp_path):
+        """Auto-eviction triggers when new shards push count over max."""
+        self._write_shards(tmp_path, n=3, docs_per_shard=10)
+        src = RawTextSource(
+            tmp_path, refresh_interval_seconds=0.01, max_shards=3,
+        )
+        assert src.shard_count == 3
+
+        # Write 2 more shards
+        _write_text_shard(tmp_path / "shard_000003.parquet", ["new1"] * 10)
+        _write_text_shard(tmp_path / "shard_000004.parquet", ["new2"] * 10)
+
+        time.sleep(0.02)
+        _ = len(src)  # refresh triggers auto-eviction
+        assert src.shard_count == 3  # oldest 2 evicted
+
+    def test_getitem_after_external_deletion(self, tmp_path):
+        """__getitem__ recovers gracefully if a shard was deleted externally."""
+        self._write_shards(tmp_path, n=3, docs_per_shard=10)
+        src = RawTextSource(tmp_path, refresh_interval_seconds=0.01)
+        assert len(src) == 30
+
+        # External deletion (simulating another process)
+        (tmp_path / "shard_000001.parquet").unlink()
+
+        # Read from the deleted shard's range — should retry and recover
+        # Index 10-19 was in shard_000001, retry wraps to remaining shards
+        item = src[10]
+        assert "text" in item
+
+    def test_schedule_and_immediate_refresh(self, tmp_path):
+        """Force-refreshing right after schedule executes eviction."""
+        self._write_shards(tmp_path, n=3)
+        src = RawTextSource(tmp_path, refresh_interval_seconds=60)
+
+        src.schedule_eviction(tmp_path / "shard_000000.parquet")
+
+        # Force refresh by resetting the timer
+        src._last_refresh = 0.0
+        _ = len(src)
+
+        assert not (tmp_path / "shard_000000.parquet").exists()
+        assert src.shard_count == 2
+
+    def test_handles_closed_before_eviction(self, tmp_path):
+        """File handles are closed before eviction — no 'file in use' errors."""
+        self._write_shards(tmp_path, n=2, docs_per_shard=10)
+        src = RawTextSource(tmp_path, refresh_interval_seconds=0.01)
+
+        # Force-open handles by reading
+        _ = src[0]   # opens shard_000000
+        _ = src[10]  # opens shard_000001
+
+        # Schedule and evict
+        src.schedule_eviction(tmp_path / "shard_000000.parquet")
+        time.sleep(0.02)
+        _ = len(src)
+
+        # Should succeed without "file in use" errors
+        assert not (tmp_path / "shard_000000.parquet").exists()
+        assert src.shard_count == 1
+        # Can still read remaining shard
+        item = src[0]
+        assert "shard1" in item["text"]

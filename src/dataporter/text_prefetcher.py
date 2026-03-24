@@ -131,19 +131,22 @@ class TextPrefetcher(BasePrefetcher):
         data_dir: Subdirectory within the dataset.
         text_field: Column name for text.
         min_shards: Block until this many shards are available.
-        max_shards: Evict oldest shards when exceeded (None = no limit).
         max_rows_per_shard: Rows per shard file.
         stream_shuffle_buffer: HF stream shuffle buffer size.
         offsets: List of initial stream offsets for data diversity.
-        seed: Random seed for eviction and shuffling.
+        seed: Random seed for shuffling.
         high_water: Producers pause when buffer reaches this size.
             Default: 3 × max_rows_per_shard (writer always has full shards).
         low_water: Producers resume when buffer drains to this size.
             Default: 1 × max_rows_per_shard (at least one full shard buffered).
         max_restarts: Max times a stream restarts after exhaustion.
-            None = unlimited (stream until stop/max_shards).
+            None = unlimited (stream until stop).
         _dataset_factory: Override dataset loading (for testing).
             Forces thread mode (lambdas aren't picklable).
+
+    Note:
+        The prefetcher only writes shards — it never deletes them.
+        Eviction is the reader's responsibility (RawTextSource.max_shards).
     """
 
     def __init__(
@@ -153,7 +156,6 @@ class TextPrefetcher(BasePrefetcher):
         data_dir: str | None = None,
         text_field: str = "text",
         min_shards: int = 5,
-        max_shards: int | None = 100,
         max_rows_per_shard: int = 10_000,
         stream_shuffle_buffer: int = 10_000,
         offsets: list[int] | None = None,
@@ -166,8 +168,7 @@ class TextPrefetcher(BasePrefetcher):
         super().__init__(
             output_dir=output_dir,
             min_shards=min_shards,
-            max_shards=max_shards,
-            eviction="stochastic_oldest",
+            max_shards=None,  # prefetcher never evicts — reader handles it
             seed=seed,
         )
         self._use_thread = _dataset_factory is not None
@@ -189,7 +190,6 @@ class TextPrefetcher(BasePrefetcher):
             data_dir=self._data_dir,
             text_field=self._text_field,
             min_shards=self._min_shards,
-            max_shards=self._max_shards,
             max_rows_per_shard=self._max_rows_per_shard,
             stream_shuffle_buffer=self._shuffle_buffer,
             offsets=self._offsets,
@@ -328,7 +328,6 @@ class TextPrefetcher(BasePrefetcher):
             if len(shard_buf) >= self._max_rows_per_shard:
                 self._write_shard(shard_buf, schema)
                 shard_buf.clear()
-                self._maybe_evict(rng)
 
         # Flush remaining
         if shard_buf and not self._stop_event.is_set():
