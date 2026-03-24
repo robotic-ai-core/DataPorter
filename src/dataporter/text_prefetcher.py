@@ -59,15 +59,15 @@ class TextPrefetcher(BasePrefetcher):
         seed: int = 42,
         _dataset_factory: Callable | None = None,
     ):
-        # _dataset_factory isn't picklable — force thread mode for tests
         super().__init__(
             output_dir=output_dir,
             min_shards=min_shards,
             max_shards=max_shards,
             eviction="stochastic_oldest",
             seed=seed,
-            _use_thread=(_dataset_factory is not None),
         )
+        # _dataset_factory isn't picklable — force thread mode for tests
+        self._use_thread = _dataset_factory is not None
         self._dataset = dataset
         self._data_dir = data_dir
         self._text_field = text_field

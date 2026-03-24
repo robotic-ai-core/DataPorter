@@ -257,8 +257,8 @@ class BasePrefetcher:
     """Base class for background prefetchers.
 
     Runs in a **separate process** by default to avoid GIL contention
-    with CUDA training. Falls back to a thread when ``_use_thread=True``
-    (set automatically when ``_dataset_factory`` is provided for tests).
+    with CUDA training. Subclasses fall back to a thread internally when
+    unpicklable test hooks are provided (e.g. ``_dataset_factory``).
 
     Communication with the child:
       - Filesystem: Parquet shards in output_dir (the primary interface)
@@ -286,7 +286,6 @@ class BasePrefetcher:
         eviction: str = "stochastic_oldest",
         seed: int = 42,
         shard_glob: str = "shard_*.parquet",
-        _use_thread: bool = False,
     ):
         if min_shards < 1:
             raise ValueError("min_shards must be >= 1")
@@ -301,7 +300,8 @@ class BasePrefetcher:
         self._eviction = eviction
         self._seed = seed
         self._shard_glob = shard_glob
-        self._use_thread = _use_thread
+        # Subclasses set _use_thread internally (e.g. when _dataset_factory is set)
+        self._use_thread = False
 
         # These are set in start() — process mode uses mp versions
         self._worker = None
@@ -408,7 +408,7 @@ class BasePrefetcher:
         """
         raise NotImplementedError(
             f"{type(self).__name__} must implement _get_init_kwargs() "
-            "for process mode, or use _use_thread=True"
+            "for process mode"
         )
 
     def _on_start(self) -> None:

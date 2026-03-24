@@ -65,8 +65,6 @@ class LeRobotPrefetcher(BasePrefetcher):
         _download_fn: Callable[[str, Path], None] | None = None,
         _meta_loader: Callable[[str, Path], dict] | None = None,
     ):
-        # Test hooks aren't picklable — force thread mode
-        use_thread = _download_fn is not None or _meta_loader is not None
         super().__init__(
             output_dir=output_dir,
             min_shards=min_shards,
@@ -74,8 +72,9 @@ class LeRobotPrefetcher(BasePrefetcher):
             eviction=eviction,
             seed=seed,
             shard_glob="**/episode_*.parquet",
-            _use_thread=use_thread,
         )
+        # Test hooks aren't picklable — force thread mode
+        self._use_thread = _download_fn is not None or _meta_loader is not None
         self._repo_id = repo_id
         self._revision = revision or "v2.1"
         self._episode_indices = episode_indices
