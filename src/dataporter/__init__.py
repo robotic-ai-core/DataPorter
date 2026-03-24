@@ -21,6 +21,17 @@ from .text_prefetcher import TextPrefetcher
 from .raw_text_source import RawTextSource
 from .transformable_dataset import TransformableDataset
 from .timed_loader import TimedDataLoader
+from .dataset_wrappers import KeyFilterDataset, AugmentedDataset
+
+# Lazy imports for optional dependencies (lerobot, lightning)
+def __getattr__(name):
+    if name == "FastLeRobotDataset":
+        from .fast_lerobot_dataset import FastLeRobotDataset
+        return FastLeRobotDataset
+    if name == "BlendedLeRobotDataModule":
+        from .blended_lerobot_datamodule import BlendedLeRobotDataModule
+        return BlendedLeRobotDataModule
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 __all__ = [
     'KeyBasedDtypeConverter',
@@ -52,6 +63,12 @@ __all__ = [
     'hf_download',
     'hf_snapshot',
     'hf_load_dataset',
+    # Dataset wrappers
+    'KeyFilterDataset',
+    'AugmentedDataset',
+    # LeRobot integration (lazy — requires lerobot)
+    'FastLeRobotDataset',
+    'BlendedLeRobotDataModule',
     # Instrumentation
     'TimedDataLoader',
     # Utilities
