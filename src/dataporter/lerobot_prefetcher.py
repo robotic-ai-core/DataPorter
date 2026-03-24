@@ -30,10 +30,14 @@ logger = logging.getLogger(__name__)
 
 
 def _hf_hub_download_file(remote: str, local_path: Path) -> None:
-    """Download a single file from HuggingFace Hub.
+    """Download a single file from HuggingFace Hub with rate limit retry.
 
     ``remote`` is formatted as ``repo_id::file_path[::revision]``.
+    Retries up to 3 times on 429 rate limit with 310s backoff
+    (HF rate limit window is 5 minutes).
     """
+    import time
+
     parts = remote.split("::")
     repo_id = parts[0]
     file_path = parts[1]
@@ -41,13 +45,25 @@ def _hf_hub_download_file(remote: str, local_path: Path) -> None:
 
     from huggingface_hub import hf_hub_download
 
-    hf_hub_download(
-        repo_id=repo_id,
-        filename=file_path,
-        repo_type="dataset",
-        revision=revision,
-        local_dir=local_path.parent.parent,
-    )
+    for attempt in range(3):
+        try:
+            hf_hub_download(
+                repo_id=repo_id,
+                filename=file_path,
+                repo_type="dataset",
+                revision=revision,
+                local_dir=local_path.parent.parent,
+            )
+            return
+        except Exception as e:
+            if "429" in str(e) and attempt < 2:
+                logger.warning(
+                    f"HF rate limited downloading {file_path}, "
+                    f"waiting 310s (attempt {attempt + 1}/3)"
+                )
+                time.sleep(310)
+            else:
+                raise
 
 
 class LeRobotPrefetcher(BasePrefetcher):
