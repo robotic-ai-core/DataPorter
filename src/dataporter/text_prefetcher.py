@@ -66,10 +66,10 @@ class TextPrefetcher(BasePrefetcher):
 
     def __init__(
         self,
+        output_dir: str | Path,
         dataset: str = "",
         data_dir: str | None = None,
         text_field: str = "text",
-        output_dir: str | Path = "/tmp/text_prefetch",
         min_shards: int = 5,
         max_shards: int | None = 100,
         max_rows_per_shard: int = 10_000,
