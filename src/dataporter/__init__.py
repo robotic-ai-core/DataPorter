@@ -20,6 +20,7 @@ from .hf_client import hf_download, hf_snapshot, hf_load_dataset
 from .text_prefetcher import TextPrefetcher
 from .raw_text_source import RawTextSource
 from .transformable_dataset import TransformableDataset
+from .timed_loader import TimedDataLoader
 
 __all__ = [
     'KeyBasedDtypeConverter',
@@ -51,6 +52,8 @@ __all__ = [
     'hf_download',
     'hf_snapshot',
     'hf_load_dataset',
+    # Instrumentation
+    'TimedDataLoader',
     # Utilities
     'compose',
     'get_tokenizer',
