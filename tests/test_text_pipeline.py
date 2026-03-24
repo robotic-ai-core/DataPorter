@@ -17,7 +17,8 @@ import torch
 from torch.utils.data import DataLoader
 
 from dataporter.raw_text_source import RawTextSource
-from dataporter.text_prefetcher import TextPrefetcher, _evict_oldest_shard
+from dataporter.text_prefetcher import TextPrefetcher
+from dataporter.prefetcher import evict_shard
 from dataporter.transformable_dataset import TransformableDataset
 from dataporter.transforms import compose
 
@@ -434,7 +435,7 @@ class TestCompose:
 # 6. Eviction helper
 # ---------------------------------------------------------------------------
 
-class TestEvictOldestShard:
+class TestEvictShard:
 
     def test_evicts_from_oldest_half(self, tmp_path):
         for i in range(10):
@@ -442,10 +443,197 @@ class TestEvictOldestShard:
         shards = sorted(tmp_path.glob("shard_*.parquet"))
         oldest_half = {p.name for p in shards[:5]}
 
-        victim = _evict_oldest_shard(tmp_path, random.Random(42))
+        victim = evict_shard(tmp_path, "stochastic_oldest", random.Random(42))
         assert victim is not None
         assert victim.name in oldest_half
         assert not victim.exists()
 
     def test_empty_dir(self, tmp_path):
-        assert _evict_oldest_shard(tmp_path, random.Random(42)) is None
+        assert evict_shard(tmp_path, "fifo", random.Random(42)) is None
+
+
+# ---------------------------------------------------------------------------
+# 7. Parallel Offset Tests
+# ---------------------------------------------------------------------------
+
+class TestParallelOffsets:
+
+    def test_parallel_offsets_produce_diverse_shards(self, tmp_path):
+        """Multiple offsets write shards in parallel with docs from different regions."""
+        # Region A: docs 0-99, Region B: docs 100-199
+        region_a = [{"text": f"region_A doc_{i}"} for i in range(100)]
+        region_b = [{"text": f"region_B doc_{i}"} for i in range(100)]
+        all_docs = region_a + region_b
+
+        def factory(offset):
+            return _FakeHFDataset(all_docs).skip(offset)
+
+        prefetcher = TextPrefetcher(
+            dataset="test",
+            output_dir=tmp_path,
+            min_shards=2,
+            max_rows_per_shard=30,
+            offsets=[0, 100],  # offset 0 → region A, offset 100 → region B
+            stream_shuffle_buffer=0,  # no shuffle, so region order is deterministic
+            _dataset_factory=factory,
+        )
+        prefetcher.start()
+        prefetcher.wait_for_min(timeout=30)
+        time.sleep(0.5)
+        prefetcher.stop()
+
+        # Read all shards back and collect unique regions
+        regions_seen = set()
+        for shard in tmp_path.glob("shard_*.parquet"):
+            table = pq.read_table(shard)
+            for text in table.column("text").to_pylist():
+                if "region_A" in text:
+                    regions_seen.add("A")
+                elif "region_B" in text:
+                    regions_seen.add("B")
+
+        # Both regions should appear (parallel offsets contributed)
+        assert regions_seen == {"A", "B"}
+
+    def test_parallel_offsets_interleave_shards(self, tmp_path):
+        """With parallel offsets, shards should interleave across regions,
+        not all-A-then-all-B."""
+        region_a = [{"text": f"A_{i}"} for i in range(200)]
+        region_b = [{"text": f"B_{i}"} for i in range(200)]
+        all_docs = region_a + region_b
+
+        def factory(offset):
+            return _FakeHFDataset(all_docs).skip(offset)
+
+        prefetcher = TextPrefetcher(
+            dataset="test",
+            output_dir=tmp_path,
+            min_shards=4,
+            max_rows_per_shard=30,
+            offsets=[0, 200],
+            stream_shuffle_buffer=0,
+            _dataset_factory=factory,
+        )
+        prefetcher.start()
+        prefetcher.wait_for_min(timeout=30)
+        time.sleep(0.5)
+        prefetcher.stop()
+
+        # Check that early shards contain docs from both regions
+        shards = sorted(tmp_path.glob("shard_*.parquet"))
+        assert len(shards) >= 4
+
+        # Look at the first 4 shards — with parallel offsets, they should
+        # contain a mix of A and B (not all A first)
+        early_regions = set()
+        for shard in shards[:4]:
+            table = pq.read_table(shard)
+            for text in table.column("text").to_pylist():
+                if text.startswith("A_"):
+                    early_regions.add("A")
+                elif text.startswith("B_"):
+                    early_regions.add("B")
+
+        assert early_regions == {"A", "B"}, (
+            f"Early shards only contain {early_regions} — "
+            "parallel offsets should interleave regions"
+        )
+
+
+# ---------------------------------------------------------------------------
+# 8. Randomness Validation (procedurally generated data)
+# ---------------------------------------------------------------------------
+
+class TestRandomnessValidation:
+    """Validate that parallel offsets + shard eviction produce well-distributed samples."""
+
+    def test_sample_distribution_across_regions(self, tmp_path):
+        """Procedurally generate data from N regions, verify all regions
+        are represented in the dataset after prefetching."""
+        n_regions = 4
+        docs_per_region = 100
+        regions = {}
+        all_docs = []
+        for r in range(n_regions):
+            start = r * docs_per_region
+            for i in range(docs_per_region):
+                doc = {"text": f"r{r}_d{i}"}
+                all_docs.append(doc)
+            regions[r] = (start, start + docs_per_region)
+
+        offsets = [regions[r][0] for r in range(n_regions)]
+
+        def factory(offset):
+            return _FakeHFDataset(all_docs).skip(offset)
+
+        prefetcher = TextPrefetcher(
+            dataset="test",
+            output_dir=tmp_path,
+            min_shards=4,
+            max_shards=None,
+            max_rows_per_shard=25,
+            offsets=offsets,
+            stream_shuffle_buffer=0,
+            _dataset_factory=factory,
+        )
+        prefetcher.start()
+        prefetcher.wait_for_min(timeout=30)
+        time.sleep(1)
+        prefetcher.stop()
+
+        # Read all data back
+        src = RawTextSource(tmp_path, refresh_interval_seconds=60)
+        region_counts = {r: 0 for r in range(n_regions)}
+        for i in range(len(src)):
+            text = src[i]["text"]
+            region = int(text.split("_")[0][1:])
+            region_counts[region] += 1
+
+        # All regions should be represented
+        for r in range(n_regions):
+            assert region_counts[r] > 0, f"Region {r} has no samples"
+
+    def test_eviction_preserves_diversity(self, tmp_path):
+        """With eviction enabled, surviving shards should still cover
+        multiple regions (not just the latest)."""
+        n_regions = 3
+        docs_per_region = 200
+        all_docs = []
+        for r in range(n_regions):
+            for i in range(docs_per_region):
+                all_docs.append({"text": f"r{r}_d{i}"})
+
+        offsets = [r * docs_per_region for r in range(n_regions)]
+
+        def factory(offset):
+            return _FakeHFDataset(all_docs).skip(offset)
+
+        prefetcher = TextPrefetcher(
+            dataset="test",
+            output_dir=tmp_path,
+            min_shards=3,
+            max_shards=15,  # force eviction but keep enough for diversity
+            max_rows_per_shard=20,
+            offsets=offsets,
+            _dataset_factory=factory,
+        )
+        prefetcher.start()
+        prefetcher.wait_for_min(timeout=30)
+        time.sleep(1)
+        prefetcher.stop()
+
+        # Read surviving shards
+        src = RawTextSource(tmp_path, refresh_interval_seconds=60)
+        surviving_regions = set()
+        for i in range(len(src)):
+            text = src[i]["text"]
+            region = int(text.split("_")[0][1:])
+            surviving_regions.add(region)
+
+        # Stochastic oldest eviction should preserve diversity:
+        # with 3 parallel streams writing interleaved shards,
+        # surviving shards should cover at least 2 of 3 regions
+        assert len(surviving_regions) >= 2, (
+            f"Only {surviving_regions} regions survived eviction — "
+            "expected at least 2 of 3"
+        )

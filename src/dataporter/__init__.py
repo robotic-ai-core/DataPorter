@@ -13,7 +13,7 @@ from .samplers import ResumableSampler, ResumableDistributedSampler
 from .resumable import ResumableDataLoader, create_resumable_dataloader
 from .strategies import ResumptionStrategy, UnifiedResumptionStrategy
 from .cached import CachedDataset, get_cache_root
-from .prefetcher import ParquetPrefetcher, CompanionPool, CompanionRef
+from .prefetcher import BasePrefetcher, CompanionPool, CompanionRef
 from .lerobot_prefetcher import LeRobotPrefetcher
 from .transforms import compose, get_tokenizer
 from .text_prefetcher import TextPrefetcher
@@ -37,8 +37,8 @@ __all__ = [
     # Caching
     'CachedDataset',
     'get_cache_root',
-    # Companion prefetcher (LeRobot video, multimodal)
-    'ParquetPrefetcher',
+    # Prefetcher base + companions
+    'BasePrefetcher',
     'CompanionPool',
     'CompanionRef',
     'LeRobotPrefetcher',
