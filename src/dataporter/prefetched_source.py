@@ -4,78 +4,89 @@ Wraps any ``Storage`` backend and adds optional background producers
 that fill the storage ahead of consumption. Implements the ``DataSource``
 protocol so it works directly with ``TransformableDataset``.
 
-Usage — text (Parquet shards on disk):
+Two access modes:
+
+- **Direct mode** (``shuffle_available=False``, default for ShardStorage):
+  ``__getitem__(idx)`` passes idx directly to storage. For ShardStorage,
+  idx is a global row index. Cache misses use the fallback.
+
+- **Shuffle-from-available mode** (``shuffle_available=True``, default for
+  MemoryStorage): ``__len__`` returns the number of items currently in
+  storage. ``__getitem__(idx)`` maps to an available key — zero cache
+  misses by construction. The DataLoader's sampler shuffles within the
+  available pool, which grows as producers fill the buffer.
+
+Usage — text (shards on disk, direct mode):
 
     storage = ShardStorage("/data/shards", max_shards=100)
     source = PrefetchedSource(storage)
     dataset = TransformableDataset(source, tokenize_transform)
 
-Usage — video (in-memory frame buffer):
+Usage — video (in-memory, shuffle-from-available):
 
     storage = MemoryStorage(capacity=200)
-    source = PrefetchedSource(storage, producers=[decode_episodes])
+    source = PrefetchedSource(storage, producers=[decode_episodes],
+                              shuffle_available=True)
     dataset = TransformableDataset(source, augment_transform)
-
-Usage — video with remote download + decode:
-
-    # LeRobotPrefetcher downloads episodes to disk (separate process)
-    # Then PrefetchedSource decodes frames into memory
-    storage = MemoryStorage(capacity=200)
-    source = PrefetchedSource(storage, producers=[decode_local_episodes])
 """
 
 from __future__ import annotations
 
 import logging
 import threading
+import time
 from typing import Any, Callable, Iterator
 
 from .storage import Storage
-from .text_prefetcher import DualThresholdBuffer
 
 logger = logging.getLogger(__name__)
 
 # A producer yields (index, value) pairs
 Producer = Callable[[], Iterator[tuple[int, Any]]]
 
-_SENTINEL = object()
-
 
 class PrefetchedSource:
     """Data source backed by Storage with optional background fill.
 
     Implements ``DataSource`` protocol (``__len__``, ``__getitem__``).
-    If producers are provided, background threads fill the storage
-    via a dual-threshold buffer. If no producers, reads directly
-    from storage (for pre-populated or externally-filled stores).
 
     Args:
         storage: The storage backend (ShardStorage, MemoryStorage, etc.).
         producers: List of callables, each returning an iterator of
             (index, value) pairs. One thread per producer.
-        high_water: Producers pause when this many items are buffered.
-        low_water: Producers resume when buffer drains to this level.
-        fallback: Called on cache miss if storage returns None.
-            Signature: (idx: int) -> value. If None, misses return None.
+        shuffle_available: If True, __getitem__ only serves items currently
+            in storage (zero cache misses). __len__ returns available count.
+            If False, passes idx directly to storage (may cache-miss).
+        fallback: Called on cache miss in direct mode (shuffle_available=False).
+            Signature: (idx: int) -> value. Ignored in shuffle-available mode.
+        min_available: In shuffle-available mode, wait_for_min() blocks
+            until this many items are loaded. Default: 1.
     """
 
     def __init__(
         self,
         storage: Storage,
         producers: list[Producer] | None = None,
-        high_water: int = 500,
-        low_water: int = 100,
+        shuffle_available: bool = False,
         fallback: Callable[[int], Any] | None = None,
+        min_available: int = 1,
     ):
         self._storage = storage
         self._producers = producers or []
+        self._shuffle_available = shuffle_available
         self._fallback = fallback
-        self._high_water = high_water
-        self._low_water = low_water
+        self._min_available = min_available
 
         self._threads: list[threading.Thread] = []
         self._stop_event = threading.Event()
         self._started = False
+
+        # Shuffle-available mode: index mapping (DataLoader idx → storage key)
+        self._available_keys: list[int] = []
+        self._keys_lock = threading.Lock()
+        self._min_ready = threading.Event()
+        if not shuffle_available or len(self._storage) >= min_available:
+            self._min_ready.set()
 
     @property
     def storage(self) -> Storage:
@@ -98,6 +109,14 @@ class PrefetchedSource:
             self._threads.append(t)
             t.start()
 
+    def wait_for_min(self, timeout: float = 300.0) -> None:
+        """Block until min_available items are loaded."""
+        if not self._min_ready.wait(timeout=timeout):
+            raise TimeoutError(
+                f"Didn't load {self._min_available} items in {timeout}s "
+                f"(have {len(self._storage)})"
+            )
+
     def stop(self) -> None:
         """Stop all background producers."""
         self._stop_event.set()
@@ -106,40 +125,82 @@ class PrefetchedSource:
         self._threads.clear()
         self._started = False
 
+    def _refresh_available_keys(self) -> None:
+        """Update the key list from storage (for shuffle-available mode)."""
+        if not self._shuffle_available:
+            return
+        if hasattr(self._storage, "keys"):
+            with self._keys_lock:
+                self._available_keys = list(self._storage.keys())
+
     def __len__(self) -> int:
+        if self._shuffle_available:
+            self._refresh_available_keys()
+            return len(self._available_keys)
         return len(self._storage)
 
     def __getitem__(self, idx: int) -> Any:
+        if self._shuffle_available:
+            return self._getitem_available(idx)
+        return self._getitem_direct(idx)
+
+    def _getitem_available(self, idx: int) -> Any:
+        """Shuffle-available mode: map idx to an available storage key."""
+        self._refresh_available_keys()
+        with self._keys_lock:
+            keys = self._available_keys
+        if not keys:
+            raise IndexError("No data available in buffer")
+        key = keys[idx % len(keys)]
+        item = self._storage.get(key)
+        if item is not None:
+            return item
+        # Key was evicted between keys() and get() — refresh and retry
+        self._refresh_available_keys()
+        with self._keys_lock:
+            keys = self._available_keys
+        if not keys:
+            raise IndexError("No data available after refresh")
+        key = keys[idx % len(keys)]
+        item = self._storage.get(key)
+        if item is None:
+            raise IndexError(f"Key {key} not available after retry")
+        return item
+
+    def _getitem_direct(self, idx: int) -> Any:
+        """Direct mode: pass idx to storage, fallback on miss."""
         item = self._storage.get(idx)
         if item is not None:
             return item
-        # Cache miss — use fallback if available
         if self._fallback is not None:
             value = self._fallback(idx)
-            # Store for next access
             if hasattr(self._storage, "put"):
                 self._storage.put(idx, value)
             return value
         raise IndexError(f"Index {idx} not available in storage")
 
-    def _run_producer(self, producer_fn: Producer, idx: int) -> None:
+    def _run_producer(self, producer_fn: Producer, producer_idx: int) -> None:
         """Background thread: produce items and store them."""
         try:
             for key, value in producer_fn():
                 if self._stop_event.is_set():
                     break
-                # Wait if storage is at capacity
+                # Evict if at capacity
                 if self._storage.capacity is not None:
                     while (
                         len(self._storage) >= self._storage.capacity
                         and not self._stop_event.is_set()
                     ):
-                        # Evict oldest to make room
                         self._storage.evict(1)
                 if hasattr(self._storage, "put"):
                     self._storage.put(key, value)
+
+                # Check min_available
+                if not self._min_ready.is_set():
+                    if len(self._storage) >= self._min_available:
+                        self._min_ready.set()
         except Exception as e:
-            logger.error(f"Producer {idx} error: {e}", exc_info=True)
+            logger.error(f"Producer {producer_idx} error: {e}", exc_info=True)
 
     def __del__(self):
         if self._started:

@@ -348,3 +348,219 @@ class TestIntegration:
         batches = list(loader)
         assert len(batches) > 0
         source.stop()
+
+
+# ---------------------------------------------------------------------------
+# Shuffle-from-available mode
+# ---------------------------------------------------------------------------
+
+class TestShuffleFromAvailable:
+
+    def test_len_reflects_available_items(self):
+        """__len__ returns count of items in storage, not total dataset."""
+        storage = MemoryStorage(capacity=100)
+        for i in range(10):
+            storage.put(i * 100, {"value": i})  # sparse keys
+
+        source = PrefetchedSource(storage, shuffle_available=True)
+        assert len(source) == 10
+
+    def test_zero_cache_misses(self):
+        """Every __getitem__ call hits — no misses possible."""
+        storage = MemoryStorage(capacity=50)
+        for i in range(50):
+            storage.put(i, {"frame": torch.randn(3, 8, 8)})
+
+        source = PrefetchedSource(storage, shuffle_available=True)
+        # Access every index in shuffled order
+        for idx in range(len(source)):
+            item = source[idx]
+            assert "frame" in item  # always hits
+
+    def test_maps_sequential_idx_to_storage_keys(self):
+        """DataLoader idx 0,1,2 maps to actual storage keys."""
+        storage = MemoryStorage()
+        storage.put(100, {"ep": 100})
+        storage.put(200, {"ep": 200})
+        storage.put(300, {"ep": 300})
+
+        source = PrefetchedSource(storage, shuffle_available=True)
+        assert len(source) == 3
+        # Each access returns a valid item from the storage
+        for i in range(3):
+            item = source[i]
+            assert item["ep"] in {100, 200, 300}
+
+    def test_grows_as_producer_fills(self):
+        """__len__ increases as background producer adds items."""
+        storage = MemoryStorage(capacity=100)
+
+        def producer():
+            for i in range(20):
+                yield i, {"value": i}
+                time.sleep(0.02)
+
+        source = PrefetchedSource(
+            storage, producers=[producer], shuffle_available=True,
+            min_available=5,
+        )
+        source.start()
+        source.wait_for_min(timeout=10)
+
+        # Should have at least min_available items
+        assert len(source) >= 5
+
+        time.sleep(0.5)
+        assert len(source) >= 15  # more filled over time
+        source.stop()
+
+    def test_wraps_index_modulo(self):
+        """Indices beyond len() wrap around (DataLoader may overshoot)."""
+        storage = MemoryStorage()
+        storage.put(0, {"v": "a"})
+        storage.put(1, {"v": "b"})
+
+        source = PrefetchedSource(storage, shuffle_available=True)
+        # With 2 items, idx=2 wraps to same position as idx=0
+        item_0 = source[0]
+        item_2 = source[2]
+        # Both should be valid items (not errors)
+        assert "v" in item_0
+        assert "v" in item_2
+
+    def test_survives_eviction_during_read(self):
+        """If a key is evicted between __len__ and __getitem__, retry works."""
+        storage = MemoryStorage(capacity=5)
+        for i in range(5):
+            storage.put(i, {"value": i})
+
+        source = PrefetchedSource(storage, shuffle_available=True)
+        assert len(source) == 5
+
+        # Evict one item externally
+        storage.evict(1)
+
+        # Should still work — retry refreshes key list
+        items = [source[i] for i in range(len(source))]
+        assert len(items) == 4
+
+    def test_with_dataloader(self):
+        """Full integration: MemoryStorage + shuffle + DataLoader."""
+        storage = MemoryStorage(capacity=100)
+        for i in range(50):
+            storage.put(i, {"frames": torch.randn(3, 8, 8)})
+
+        source = PrefetchedSource(storage, shuffle_available=True)
+
+        def transform(src, idx):
+            return {"frames": src[idx]["frames"]}
+
+        ds = TransformableDataset(source, transform)
+        loader = DataLoader(ds, batch_size=10, shuffle=True, num_workers=0)
+
+        total = sum(b["frames"].shape[0] for b in loader)
+        assert total == 50
+
+    def test_empty_buffer_raises(self):
+        """Accessing empty buffer raises IndexError."""
+        storage = MemoryStorage()
+        source = PrefetchedSource(storage, shuffle_available=True)
+        with pytest.raises(IndexError, match="No data available"):
+            source[0]
+
+    def test_wait_for_min(self):
+        """wait_for_min blocks until enough items are loaded."""
+        storage = MemoryStorage(capacity=100)
+
+        def slow_producer():
+            for i in range(20):
+                yield i, {"value": i}
+                time.sleep(0.05)
+
+        source = PrefetchedSource(
+            storage, producers=[slow_producer],
+            shuffle_available=True, min_available=10,
+        )
+        source.start()
+        source.wait_for_min(timeout=10)
+        assert len(source) >= 10
+        source.stop()
+
+
+# ---------------------------------------------------------------------------
+# Coverage: all items eventually seen
+# ---------------------------------------------------------------------------
+
+class TestCoverage:
+
+    def test_all_items_seen_over_time(self):
+        """With a cycling producer, all items eventually enter the buffer."""
+        n_items = 50
+        buffer_size = 15
+
+        storage = MemoryStorage(capacity=buffer_size)
+        seen_items = set()
+
+        def cycling_producer():
+            """Yield all items in random order, restart forever."""
+            import random
+            rng = random.Random(42)
+            while True:
+                order = list(range(n_items))
+                rng.shuffle(order)
+                for key in order:
+                    yield key, {"value": key}
+                    time.sleep(0.001)
+
+        source = PrefetchedSource(
+            storage, producers=[cycling_producer],
+            shuffle_available=True, min_available=buffer_size,
+        )
+        source.start()
+        source.wait_for_min(timeout=10)
+
+        # Simulate DataLoader consuming for a while
+        for _ in range(200):
+            n = len(source)
+            if n == 0:
+                continue
+            for idx in range(n):
+                item = source[idx]
+                seen_items.add(item["value"])
+            time.sleep(0.01)
+
+        source.stop()
+
+        # Should have seen most items (not all guaranteed in limited time,
+        # but with 50 items and 200 rounds, coverage should be high)
+        coverage = len(seen_items) / n_items
+        assert coverage >= 0.6, (
+            f"Only {coverage:.0%} coverage — expected >= 60%. "
+            f"Seen {len(seen_items)}/{n_items}"
+        )
+
+    def test_random_fill_order(self):
+        """Producer yields items in random order, not sequential."""
+        storage = MemoryStorage(capacity=100)
+        insertion_order = []
+
+        def tracking_producer():
+            import random
+            rng = random.Random(42)
+            order = list(range(50))
+            rng.shuffle(order)
+            for key in order:
+                insertion_order.append(key)
+                yield key, {"value": key}
+
+        source = PrefetchedSource(
+            storage, producers=[tracking_producer], shuffle_available=True,
+        )
+        source.start()
+        time.sleep(0.5)
+        source.stop()
+
+        # Insertion order should not be sequential
+        assert insertion_order != list(range(50)), (
+            "Producer filled sequentially — should be random"
+        )
