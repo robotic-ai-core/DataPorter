@@ -19,6 +19,8 @@ from .transforms import compose, get_tokenizer
 from .hf_client import hf_download, hf_snapshot, hf_load_dataset
 from .text_prefetcher import TextPrefetcher
 from .raw_text_source import RawTextSource
+from .storage import ShardStorage, MemoryStorage
+from .prefetched_source import PrefetchedSource
 from .transformable_dataset import TransformableDataset
 from .timed_loader import TimedDataLoader
 from .dataset_wrappers import KeyFilterDataset, AugmentedDataset
@@ -55,7 +57,11 @@ __all__ = [
     'CompanionPool',
     'CompanionRef',
     'LeRobotPrefetcher',
-    # Text streaming (raw text prefetch + worker-side transform)
+    # Storage + unified source
+    'ShardStorage',
+    'MemoryStorage',
+    'PrefetchedSource',
+    # Text streaming
     'TextPrefetcher',
     'RawTextSource',
     'TransformableDataset',

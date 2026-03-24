@@ -1002,10 +1002,7 @@ class TestDeferredEviction:
         src = RawTextSource(tmp_path, refresh_interval_seconds=60)
 
         src.schedule_eviction(tmp_path / "shard_000000.parquet")
-
-        # Force refresh by resetting the timer
-        src._last_refresh = 0.0
-        _ = len(src)
+        src.refresh()  # force refresh — executes pending eviction
 
         assert not (tmp_path / "shard_000000.parquet").exists()
         assert src.shard_count == 2
