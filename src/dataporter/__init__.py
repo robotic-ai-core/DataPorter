@@ -17,6 +17,9 @@ from .prefetcher import ParquetPrefetcher, CompanionPool, CompanionRef
 from .growable_dataset import GrowableParquetDataset
 from .lerobot_prefetcher import LeRobotPrefetcher
 from .transforms import compose, tokenize_and_chunk, tokenize_transform, chunk_transform
+from .text_prefetcher import TextPrefetcher
+from .raw_text_source import RawTextSource
+from .transformable_dataset import TransformableDataset
 
 __all__ = [
     'KeyBasedDtypeConverter',
@@ -45,4 +48,8 @@ __all__ = [
     'tokenize_and_chunk',
     'tokenize_transform',
     'chunk_transform',
+    # Text streaming (raw text prefetch + worker-side transform)
+    'TextPrefetcher',
+    'RawTextSource',
+    'TransformableDataset',
 ]
