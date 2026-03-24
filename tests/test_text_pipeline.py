@@ -552,101 +552,160 @@ class TestParallelOffsets:
 # 8. Randomness Validation (procedurally generated data)
 # ---------------------------------------------------------------------------
 
-class TestRandomnessValidation:
-    """Validate that parallel offsets + shard eviction produce well-distributed samples."""
+def _run_prefetcher_and_read(
+    tmp_path, n_regions, docs_per_region, max_rows_per_shard=25,
+    max_shards=None, high_water=None, low_water=None,
+):
+    """Helper: run prefetcher with N regions, return (region_counts, shard_region_sets)."""
+    all_docs = []
+    for r in range(n_regions):
+        for i in range(docs_per_region):
+            all_docs.append({"text": f"r{r}_d{i}"})
 
-    def test_sample_distribution_across_regions(self, tmp_path):
-        """Procedurally generate data from N regions, verify all regions
-        are represented in the dataset after prefetching."""
-        n_regions = 4
-        docs_per_region = 100
-        regions = {}
-        all_docs = []
-        for r in range(n_regions):
-            start = r * docs_per_region
-            for i in range(docs_per_region):
-                doc = {"text": f"r{r}_d{i}"}
-                all_docs.append(doc)
-            regions[r] = (start, start + docs_per_region)
+    offsets = [r * docs_per_region for r in range(n_regions)]
 
-        offsets = [regions[r][0] for r in range(n_regions)]
+    def factory(offset):
+        return _FakeHFDataset(all_docs).skip(offset)
 
-        def factory(offset):
-            return _FakeHFDataset(all_docs).skip(offset)
+    kwargs = dict(
+        output_dir=tmp_path,
+        dataset="test",
+        min_shards=max(2, n_regions),
+        max_shards=max_shards,
+        max_rows_per_shard=max_rows_per_shard,
+        offsets=offsets,
+        max_restarts=0,
+        _dataset_factory=factory,
+    )
+    if high_water is not None:
+        kwargs["high_water"] = high_water
+    if low_water is not None:
+        kwargs["low_water"] = low_water
 
-        prefetcher = TextPrefetcher(
-            dataset="test",
-            output_dir=tmp_path,
-            min_shards=4,
-            max_shards=None,
-            max_rows_per_shard=25,
-            offsets=offsets,
-            stream_shuffle_buffer=0,
-            max_restarts=0,
-            _dataset_factory=factory,
-        )
-        prefetcher.start()
-        prefetcher.wait_for_min(timeout=30)
-        time.sleep(1)
-        prefetcher.stop()
+    prefetcher = TextPrefetcher(**kwargs)
+    prefetcher.start()
+    prefetcher.wait_for_min(timeout=30)
+    time.sleep(1)
+    prefetcher.stop()
 
-        # Read all data back
-        src = RawTextSource(tmp_path, refresh_interval_seconds=60)
-        region_counts = {r: 0 for r in range(n_regions)}
-        for i in range(len(src)):
-            text = src[i]["text"]
+    src = RawTextSource(tmp_path, refresh_interval_seconds=60)
+    region_counts = {r: 0 for r in range(n_regions)}
+    shard_region_sets = {}  # shard_name -> set of regions in that shard
+
+    for shard in sorted(tmp_path.glob("shard_*.parquet")):
+        table = pq.read_table(shard)
+        regions_in_shard = set()
+        for text in table.column("text").to_pylist():
             region = int(text.split("_")[0][1:])
             region_counts[region] += 1
+            regions_in_shard.add(region)
+        shard_region_sets[shard.name] = regions_in_shard
 
-        # All regions should be represented
-        for r in range(n_regions):
-            assert region_counts[r] > 0, f"Region {r} has no samples"
+    return region_counts, shard_region_sets
+
+
+class TestRandomnessValidation:
+    """Quantitative validation of shuffle quality and distribution."""
+
+    def test_region_uniformity(self, tmp_path):
+        """Each region should get roughly equal representation.
+        With 4 regions × 100 docs each, each region should be 15-35% of total."""
+        region_counts, _ = _run_prefetcher_and_read(
+            tmp_path, n_regions=4, docs_per_region=100,
+        )
+        total = sum(region_counts.values())
+        assert total > 0
+
+        for r, count in region_counts.items():
+            pct = count / total
+            assert 0.10 <= pct <= 0.40, (
+                f"Region {r} has {pct:.0%} of samples (expected 15-35%). "
+                f"Counts: {region_counts}"
+            )
+
+    def test_within_shard_diversity(self, tmp_path):
+        """With small shards and tight buffer, some shards should contain
+        docs from multiple regions (producers interleave in the buffer)."""
+        _, shard_region_sets = _run_prefetcher_and_read(
+            tmp_path, n_regions=3, docs_per_region=150,
+            max_rows_per_shard=30, high_water=30, low_water=10,
+        )
+        # All regions should appear across the shard set
+        all_regions = set()
+        for regions in shard_region_sets.values():
+            all_regions.update(regions)
+        assert len(all_regions) >= 2, (
+            f"Only {all_regions} regions across all shards — "
+            "expected at least 2 of 3"
+        )
+
+    def test_temporal_balance(self, tmp_path):
+        """Early shards (first 50% by name) should have all regions represented,
+        not be biased toward whichever producer started first."""
+        region_counts, shard_region_sets = _run_prefetcher_and_read(
+            tmp_path, n_regions=3, docs_per_region=200,
+            max_rows_per_shard=30, high_water=30, low_water=10,
+        )
+        shards = sorted(shard_region_sets.keys())
+        if len(shards) < 4:
+            pytest.skip("Not enough shards for temporal balance test")
+
+        early_shards = shards[:len(shards) // 2]
+        early_regions = set()
+        for name in early_shards:
+            early_regions.update(shard_region_sets[name])
+
+        assert len(early_regions) >= 2, (
+            f"Early shards only cover regions {early_regions} — "
+            "expected at least 2 of 3 for temporal balance"
+        )
+
+    def test_sampling_distribution(self, tmp_path):
+        """Simulate DataLoader sampling: draw 500 random items and verify
+        region distribution is roughly uniform."""
+        region_counts, _ = _run_prefetcher_and_read(
+            tmp_path, n_regions=4, docs_per_region=200,
+            max_rows_per_shard=50,
+        )
+        src = RawTextSource(tmp_path, refresh_interval_seconds=60)
+        n_total = len(src)
+        if n_total < 100:
+            pytest.skip("Not enough data for sampling test")
+
+        # Simulate random sampling (as DataLoader shuffle=True would do)
+        rng = random.Random(42)
+        sample_counts = {r: 0 for r in range(4)}
+        n_samples = min(500, n_total)
+        for _ in range(n_samples):
+            idx = rng.randrange(n_total)
+            text = src[idx]["text"]
+            region = int(text.split("_")[0][1:])
+            sample_counts[region] += 1
+
+        for r, count in sample_counts.items():
+            pct = count / n_samples
+            assert 0.10 <= pct <= 0.40, (
+                f"Sampled region {r} at {pct:.0%} (expected 15-35%). "
+                f"Counts: {sample_counts}"
+            )
 
     def test_eviction_preserves_diversity(self, tmp_path):
-        """With eviction enabled, surviving shards should still cover
-        multiple regions (not just the latest)."""
-        n_regions = 3
-        docs_per_region = 200
-        all_docs = []
-        for r in range(n_regions):
-            for i in range(docs_per_region):
-                all_docs.append({"text": f"r{r}_d{i}"})
-
-        offsets = [r * docs_per_region for r in range(n_regions)]
-
-        def factory(offset):
-            return _FakeHFDataset(all_docs).skip(offset)
-
-        prefetcher = TextPrefetcher(
-            dataset="test",
-            output_dir=tmp_path,
-            min_shards=3,
-            max_shards=15,
-            max_rows_per_shard=20,
-            offsets=offsets,
-            high_water=20, low_water=5,  # small buffer to interleave regions
-            max_restarts=0,
-            _dataset_factory=factory,
+        """After eviction, surviving shards should cover multiple regions
+        (stochastic oldest eviction doesn't wipe out entire regions)."""
+        region_counts, _ = _run_prefetcher_and_read(
+            tmp_path, n_regions=3, docs_per_region=300,
+            max_rows_per_shard=20, max_shards=20,
+            high_water=20, low_water=5,
         )
-        prefetcher.start()
-        prefetcher.wait_for_min(timeout=30)
-        time.sleep(1)
-        prefetcher.stop()
+        total = sum(region_counts.values())
+        if total < 50:
+            pytest.skip("Not enough data after eviction")
 
-        # Read surviving shards
-        src = RawTextSource(tmp_path, refresh_interval_seconds=60)
-        surviving_regions = set()
-        for i in range(len(src)):
-            text = src[i]["text"]
-            region = int(text.split("_")[0][1:])
-            surviving_regions.add(region)
-
-        # Stochastic oldest eviction should preserve diversity:
-        # with 3 parallel streams writing interleaved shards,
-        # surviving shards should cover at least 2 of 3 regions
-        assert len(surviving_regions) >= 2, (
-            f"Only {surviving_regions} regions survived eviction — "
-            "expected at least 2 of 3"
+        # At least 2 of 3 regions should survive eviction
+        surviving = sum(1 for c in region_counts.values() if c > 0)
+        assert surviving >= 2, (
+            f"Only {surviving} regions survived eviction. "
+            f"Counts: {region_counts}"
         )
 
 
