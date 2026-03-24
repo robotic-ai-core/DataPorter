@@ -111,10 +111,23 @@ class RawTextSource:
 
         # Cache the text column per shard — avoids re-reading Parquet
         # on every __getitem__. Each shard is ~10k strings, ~5MB in RAM.
-        if shard_idx not in self._shard_texts:
-            pf = self._get_table(shard_idx)
-            col = pf.read().column(self._text_column)
-            self._shard_texts[shard_idx] = col.to_pylist()
+        try:
+            if shard_idx not in self._shard_texts:
+                pf = self._get_table(shard_idx)
+                col = pf.read().column(self._text_column)
+                self._shard_texts[shard_idx] = col.to_pylist()
+            text = self._shard_texts[shard_idx][local_row]
+        except (FileNotFoundError, KeyError, IndexError):
+            # Shard was evicted by prefetcher — force refresh and retry
+            # with a wrapped index into the remaining shards.
+            self._last_refresh = 0.0  # Force rescan
+            self._refresh()
+            idx = idx % self._total_rows
+            shard_idx, local_row = self._locate(idx)
+            if shard_idx not in self._shard_texts:
+                pf = self._get_table(shard_idx)
+                col = pf.read().column(self._text_column)
+                self._shard_texts[shard_idx] = col.to_pylist()
+            text = self._shard_texts[shard_idx][local_row]
 
-        text = self._shard_texts[shard_idx][local_row]
         return {"text": text}
