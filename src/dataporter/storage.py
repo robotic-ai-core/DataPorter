@@ -1,12 +1,14 @@
 """Storage backends for PrefetchedSource.
 
-Two implementations:
+Three implementations:
   - ``ShardStorage``: reads from a directory of Parquet shard files (text).
     Grows as new shards appear, handles deferred eviction.
   - ``MemoryStorage``: in-memory dict with LRU eviction (video frames).
-    Fixed capacity, instant access.
+    Fixed capacity, instant access. Single-process only.
+  - ``SharedMemoryStorage``: pre-allocated shared memory tensor buffer.
+    Works across forked DataLoader workers (num_workers > 0). Fixed shape.
 
-Both implement the ``Storage`` protocol so ``PrefetchedSource`` can
+All implement the ``Storage`` protocol so ``PrefetchedSource`` can
 use them interchangeably.
 """
 
@@ -274,3 +276,165 @@ class MemoryStorage:
 
     def clear(self) -> None:
         self._data.clear()
+
+
+# ---------------------------------------------------------------------------
+# SharedMemoryStorage — shared tensor buffer for multi-worker DataLoader
+# ---------------------------------------------------------------------------
+
+
+class SharedMemoryStorage:
+    """Storage backed by pre-allocated shared memory tensors.
+
+    Designed for multi-worker DataLoader: the producer fills the buffer
+    in the main process, and forked workers read from the same shared
+    memory — zero-copy, no IPC overhead.
+
+    All tensors use ``share_memory_()`` so they survive ``fork()``.
+    Variable-length episodes are supported via a lengths array.
+
+    Args:
+        capacity: Max number of items (episodes) in the buffer.
+        max_frames: Max frames per episode (padded with zeros).
+        channels: Number of image channels.
+        height: Frame height.
+        width: Frame width.
+        max_keys: Max number of unique keys (episode indices) to track.
+            Defaults to capacity * 10 (sparse key space).
+    """
+
+    def __init__(
+        self,
+        capacity: int,
+        max_frames: int,
+        channels: int = 3,
+        height: int = 96,
+        width: int = 96,
+        max_keys: int | None = None,
+    ):
+        import torch
+
+        self._capacity = capacity
+        self._max_frames = max_frames
+        max_keys = max_keys or capacity * 10
+
+        # Shared memory tensors — survive fork()
+        self._buffer = torch.zeros(
+            capacity, max_frames, channels, height, width, dtype=torch.uint8
+        ).share_memory_()
+        self._lengths = torch.zeros(capacity, dtype=torch.int32).share_memory_()
+
+        # Slot management: index_map[ep_idx] = slot (-1 = not present)
+        self._index_map = torch.full(
+            (max_keys,), -1, dtype=torch.int32
+        ).share_memory_()
+
+        # Ring buffer for slot allocation (FIFO eviction)
+        self._slot_keys = torch.full(
+            (capacity,), -1, dtype=torch.int32
+        ).share_memory_()  # slot → ep_idx that occupies it
+        self._next_slot = torch.zeros(1, dtype=torch.int32).share_memory_()
+        self._count = torch.zeros(1, dtype=torch.int32).share_memory_()
+
+    def put(self, idx: int, value: Any) -> None:
+        """Store frames for an episode.
+
+        Args:
+            idx: Episode index (key).
+            value: Tensor of shape [num_frames, C, H, W] (uint8), or a dict
+                with a "frames" key containing such a tensor.
+        """
+        import torch
+
+        if isinstance(value, dict):
+            frames = value["frames"]
+        else:
+            frames = value
+
+        n_frames = min(frames.shape[0], self._max_frames)
+
+        # Check if already stored
+        if idx < len(self._index_map) and self._index_map[idx] >= 0:
+            slot = self._index_map[idx].item()
+            self._buffer[slot, :n_frames] = frames[:n_frames]
+            self._lengths[slot] = n_frames
+            return
+
+        # Allocate a slot (ring buffer — evicts oldest on wrap)
+        slot = self._next_slot.item() % self._capacity
+        self._next_slot[0] = slot + 1
+
+        # Evict previous occupant if any
+        old_key = self._slot_keys[slot].item()
+        if old_key >= 0 and old_key < len(self._index_map):
+            self._index_map[old_key] = -1
+
+        # Write
+        self._buffer[slot, :n_frames] = frames[:n_frames]
+        if n_frames < self._max_frames:
+            self._buffer[slot, n_frames:] = 0
+        self._lengths[slot] = n_frames
+        self._slot_keys[slot] = idx
+        if idx < len(self._index_map):
+            self._index_map[idx] = slot
+        self._count[0] = min(self._count[0] + 1, self._capacity)
+
+    def get(self, idx: int) -> dict[str, Any] | None:
+        """Get frames for an episode. Returns dict with 'frames' tensor."""
+        if idx >= len(self._index_map) or self._index_map[idx] < 0:
+            return None
+        slot = self._index_map[idx].item()
+        n_frames = self._lengths[slot].item()
+        if n_frames == 0:
+            return None
+        return {"frames": self._buffer[slot, :n_frames]}
+
+    def __len__(self) -> int:
+        return self._count.item()
+
+    def __contains__(self, idx: int) -> bool:
+        return (
+            idx < len(self._index_map)
+            and self._index_map[idx].item() >= 0
+        )
+
+    @property
+    def capacity(self) -> int:
+        return self._capacity
+
+    def evict(self, n: int = 1) -> int:
+        """Evict n oldest items (by slot order)."""
+        evicted = 0
+        current = len(self)
+        # Find the oldest occupied slots
+        oldest_slot = (self._next_slot.item() - current) % self._capacity
+        for i in range(min(n, current)):
+            slot = (oldest_slot + i) % self._capacity
+            key = self._slot_keys[slot].item()
+            if key >= 0 and key < len(self._index_map):
+                self._index_map[key] = -1
+            self._slot_keys[slot] = -1
+            self._lengths[slot] = 0
+            self._count[0] = max(0, self._count[0] - 1)
+            evicted += 1
+        return evicted
+
+    def refresh(self) -> None:
+        pass  # No-op
+
+    def keys(self) -> list[int]:
+        """Return list of episode indices currently in the buffer."""
+        result = []
+        for slot in range(self._capacity):
+            key = self._slot_keys[slot].item()
+            if key >= 0 and self._lengths[slot].item() > 0:
+                result.append(key)
+        return result
+
+    def clear(self) -> None:
+        self._index_map.fill_(-1)
+        self._slot_keys.fill_(-1)
+        self._lengths.fill_(0)
+        self._buffer.fill_(0)
+        self._next_slot.fill_(0)
+        self._count.fill_(0)

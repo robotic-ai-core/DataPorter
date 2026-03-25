@@ -19,7 +19,7 @@ from .transforms import compose, get_tokenizer
 from .hf_client import hf_download, hf_snapshot, hf_load_dataset
 from .text_prefetcher import TextPrefetcher
 from .raw_text_source import RawTextSource
-from .storage import ShardStorage, MemoryStorage
+from .storage import ShardStorage, MemoryStorage, SharedMemoryStorage
 from .prefetched_source import PrefetchedSource
 from .transformable_dataset import TransformableDataset
 from .timed_loader import TimedDataLoader
@@ -60,6 +60,7 @@ __all__ = [
     # Storage + unified source
     'ShardStorage',
     'MemoryStorage',
+    'SharedMemoryStorage',
     'PrefetchedSource',
     # Text streaming
     'TextPrefetcher',
