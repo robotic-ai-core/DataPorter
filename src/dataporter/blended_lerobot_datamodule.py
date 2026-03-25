@@ -78,7 +78,7 @@ class BlendedLeRobotDataModule(L.LightningDataModule):
         dtype_conversions: list[dict] | dict | None = None,
         cache_frames: bool = False,
         cache_budget_gb: float = 2.0,
-        frame_buffer_capacity: int | None = 400,
+        frame_buffer_capacity: int | None = None,
         train_split_ratio: float = 0.9,
     ):
         super().__init__()
