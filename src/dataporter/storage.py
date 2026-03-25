@@ -72,8 +72,13 @@ class ShardStorage:
     Each shard is a Parquet file with a text column. Items are
     addressed by global row index across all shards.
 
-    Supports deferred eviction: ``schedule_eviction()`` marks shards
-    for deletion, executed on next ``refresh()``.
+    Supports:
+      - Deferred eviction: ``schedule_eviction()`` marks shards for
+        deletion, executed on next ``refresh()``.
+      - Epoch-aware eviction: ``freeze()`` / ``unfreeze()`` defer eviction
+        during an epoch so the shard list stays stable for resumption.
+      - State dict: ``state_dict()`` / ``load_state_dict()`` save and
+        restore the exact shard list for deterministic resume.
 
     Args:
         data_dir: Directory containing shard_*.parquet files.
@@ -100,6 +105,11 @@ class ShardStorage:
         self._total_rows = 0
         self._shard_texts: dict[int, list[str]] = {}
         self._pending_evictions: set[Path] = set()
+
+        # Epoch-aware eviction: when frozen, eviction is deferred
+        self._frozen = False
+        # Pinned shard list from state_dict (for resume)
+        self._pinned_shards: list[str] | None = None
 
         self.refresh()
 
@@ -159,6 +169,40 @@ class ShardStorage:
             evicted += 1
         return evicted
 
+    def freeze(self) -> None:
+        """Freeze the shard list — defer all eviction until ``unfreeze()``.
+
+        Use during an epoch to keep the index stable for resumption.
+        New shards from the prefetcher are still picked up on refresh.
+        """
+        self._frozen = True
+
+    def unfreeze(self) -> None:
+        """Unfreeze — execute any pending evictions on next refresh."""
+        self._frozen = False
+        self._pinned_shards = None
+
+    def state_dict(self) -> dict:
+        """Save shard list and row counts for deterministic resume."""
+        return {
+            "shard_names": [p.name for p, _ in self._shards],
+            "shard_rows": [n for _, n in self._shards],
+            "total_rows": self._total_rows,
+        }
+
+    def load_state_dict(self, state: dict) -> None:
+        """Restore pinned shard list from checkpoint.
+
+        On next ``refresh()``, only shards in this list are used
+        (others are ignored, not evicted). Call ``unfreeze()`` after
+        the epoch completes to allow eviction and new shards.
+        """
+        self._pinned_shards = state.get("shard_names")
+        self._frozen = True
+        # Force a refresh to apply the pinned list
+        self._last_refresh = 0.0
+        self.refresh()
+
     def refresh(self) -> None:
         now = monotonic()
         self._last_refresh = now
@@ -166,28 +210,34 @@ class ShardStorage:
         # Close caches before evicting
         self._shard_texts.clear()
 
-        # Execute pending evictions
-        for path in list(self._pending_evictions):
-            try:
-                if path.exists():
-                    manifest = path.with_suffix(".companions.json")
-                    if manifest.exists():
-                        manifest.unlink()
-                    path.unlink()
-            except (FileNotFoundError, OSError):
-                pass
-        self._pending_evictions.clear()
+        # Execute pending evictions (only if not frozen)
+        if not self._frozen:
+            for path in list(self._pending_evictions):
+                try:
+                    if path.exists():
+                        manifest = path.with_suffix(".companions.json")
+                        if manifest.exists():
+                            manifest.unlink()
+                        path.unlink()
+                except (FileNotFoundError, OSError):
+                    pass
+            self._pending_evictions.clear()
 
         paths = sorted(self._dir.glob("*.parquet"))
 
-        # Auto-evict if over max_shards
-        if self._max_shards is not None and len(paths) > self._max_shards:
+        # Auto-evict if over max_shards (only if not frozen)
+        if not self._frozen and self._max_shards is not None and len(paths) > self._max_shards:
             for p in paths[: len(paths) - self._max_shards]:
                 try:
                     p.unlink()
                 except (FileNotFoundError, OSError):
                     pass
             paths = sorted(self._dir.glob("*.parquet"))
+
+        # If pinned, filter to only the pinned shard names
+        if self._pinned_shards is not None:
+            pinned_set = set(self._pinned_shards)
+            paths = [p for p in paths if p.name in pinned_set]
 
         shards = []
         cumulative = []
