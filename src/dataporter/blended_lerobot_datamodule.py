@@ -261,28 +261,40 @@ class BlendedLeRobotDataModule(L.LightningDataModule):
 
     @staticmethod
     def _patch_hf_rate_limiter():
-        """Monkey-patch huggingface_hub to use our rate limiter globally.
+        """Monkey-patch huggingface_hub to add 429 retry with backoff.
 
-        LeRobot's LeRobotDatasetMetadata calls snapshot_download internally,
-        bypassing our hf_client. This patches hf_hub_download at the module
-        level so ALL HF requests go through the shared token bucket.
+        LeRobot's LeRobotDatasetMetadata calls snapshot_download internally.
+        We wrap hf_hub_download to retry on 429 with exponential backoff,
+        without rate-limiting individual requests (snapshot_download handles
+        its own parallelism and connection pooling).
         """
         try:
             import huggingface_hub
             import huggingface_hub.file_download
-            from .hf_client import get_limiter, _retry_with_backoff
 
             if not getattr(huggingface_hub, '_rate_limit_patched', False):
                 _original = huggingface_hub.hf_hub_download
 
-                def _rate_limited_hf_hub_download(*args, **kwargs):
-                    return _retry_with_backoff(_original, *args, **kwargs)
+                def _retry_on_429(*args, **kwargs):
+                    import time as _time
+                    for attempt in range(4):
+                        try:
+                            return _original(*args, **kwargs)
+                        except Exception as e:
+                            if "429" in str(e) and attempt < 3:
+                                wait = 60 * (2 ** attempt)  # 60, 120, 240s
+                                logger.warning(
+                                    f"HF 429 (attempt {attempt + 1}/4), "
+                                    f"retrying in {wait}s..."
+                                )
+                                _time.sleep(wait)
+                            else:
+                                raise
 
-                huggingface_hub.hf_hub_download = _rate_limited_hf_hub_download
-                # Also patch the internal module reference used by snapshot_download
-                huggingface_hub.file_download.hf_hub_download = _rate_limited_hf_hub_download
+                huggingface_hub.hf_hub_download = _retry_on_429
+                huggingface_hub.file_download.hf_hub_download = _retry_on_429
                 huggingface_hub._rate_limit_patched = True
-                logger.info("Patched huggingface_hub.hf_hub_download with rate limiter")
+                logger.info("Patched huggingface_hub.hf_hub_download with 429 retry")
         except Exception as e:
             logger.warning(f"Failed to patch HF rate limiter: {e}")
 
