@@ -431,10 +431,13 @@ class SharedMemoryStorage:
 
     def get(self, idx: int) -> dict[str, Any] | None:
         """Get frames for an episode. Returns dict with 'frames' tensor."""
-        if idx >= len(self._index_map) or self._index_map[idx] < 0:
+        if idx >= len(self._index_map):
             return None
-        slot = self._index_map[idx].item()
-        n_frames = self._lengths[slot].item()
+        slot_val = self._index_map[idx]
+        if slot_val < 0:
+            return None
+        slot = int(slot_val)
+        n_frames = int(self._lengths[slot])
         if n_frames == 0:
             return None
         return {"frames": self._buffer[slot, :n_frames]}

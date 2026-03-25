@@ -402,7 +402,7 @@ class TestShuffleFromAvailable:
 
         source = PrefetchedSource(
             storage, producers=[producer], shuffle_available=True,
-            min_available=5,
+            min_available=5, keys_refresh_interval=0.01,
         )
         source.start()
         source.wait_for_min(timeout=10)
@@ -434,11 +434,12 @@ class TestShuffleFromAvailable:
         for i in range(5):
             storage.put(i, {"value": i})
 
-        source = PrefetchedSource(storage, shuffle_available=True)
+        source = PrefetchedSource(storage, shuffle_available=True, keys_refresh_interval=0.01)
         assert len(source) == 5
 
         # Evict one item externally
         storage.evict(1)
+        time.sleep(0.02)  # let interval-based refresh pick up the change
 
         # Should still work — retry refreshes key list
         items = [source[i] for i in range(len(source))]
@@ -480,6 +481,7 @@ class TestShuffleFromAvailable:
         source = PrefetchedSource(
             storage, producers=[slow_producer],
             shuffle_available=True, min_available=10,
+            keys_refresh_interval=0.01,
         )
         source.start()
         source.wait_for_min(timeout=10)

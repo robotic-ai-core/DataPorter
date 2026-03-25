@@ -101,6 +101,7 @@ class PrefetchedSource:
         shuffle_available: bool = False,
         fallback: Callable[[int], Any] | None = None,
         min_available: int = 1,
+        keys_refresh_interval: float = 1.0,
     ):
         self._storage = storage
         self._producers = producers or []
@@ -115,6 +116,8 @@ class PrefetchedSource:
         # Shuffle-available mode: index mapping (DataLoader idx → storage key)
         self._available_keys: list[int] = []
         self._keys_lock = threading.Lock()
+        self._keys_refresh_interval = keys_refresh_interval
+        self._keys_last_refresh = 0.0
         self._min_ready = threading.Event()
         if not shuffle_available or len(self._storage) >= min_available:
             self._min_ready.set()
@@ -169,13 +172,17 @@ class PrefetchedSource:
         self._threads.clear()
         self._started = False
 
-    def _refresh_available_keys(self) -> None:
-        """Update the key list from storage (for shuffle-available mode)."""
+    def _refresh_available_keys(self, force: bool = False) -> None:
+        """Update the key list from storage (interval-based to avoid overhead)."""
         if not self._shuffle_available:
             return
+        now = time.monotonic()
+        if not force and now - self._keys_last_refresh < self._keys_refresh_interval:
+            return  # use cached key list
         if hasattr(self._storage, "keys"):
             with self._keys_lock:
                 self._available_keys = list(self._storage.keys())
+            self._keys_last_refresh = now
 
     def __len__(self) -> int:
         if self._shuffle_available:
@@ -199,8 +206,8 @@ class PrefetchedSource:
         item = self._storage.get(key)
         if item is not None:
             return item
-        # Key was evicted between keys() and get() — refresh and retry
-        self._refresh_available_keys()
+        # Key was evicted between keys() and get() — force refresh and retry
+        self._refresh_available_keys(force=True)
         with self._keys_lock:
             keys = self._available_keys
         if not keys:
