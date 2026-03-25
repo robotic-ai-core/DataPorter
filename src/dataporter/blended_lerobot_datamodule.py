@@ -259,7 +259,37 @@ class BlendedLeRobotDataModule(L.LightningDataModule):
             p.stop()
         self._prefetchers.clear()
 
+    @staticmethod
+    def _patch_hf_rate_limiter():
+        """Monkey-patch huggingface_hub to use our rate limiter globally.
+
+        LeRobot's LeRobotDatasetMetadata calls snapshot_download internally,
+        bypassing our hf_client. This patches hf_hub_download at the module
+        level so ALL HF requests go through the shared token bucket.
+        """
+        try:
+            import huggingface_hub
+            import huggingface_hub.file_download
+            from .hf_client import get_limiter, _retry_with_backoff
+
+            if not getattr(huggingface_hub, '_rate_limit_patched', False):
+                _original = huggingface_hub.hf_hub_download
+
+                def _rate_limited_hf_hub_download(*args, **kwargs):
+                    return _retry_with_backoff(_original, *args, **kwargs)
+
+                huggingface_hub.hf_hub_download = _rate_limited_hf_hub_download
+                # Also patch the internal module reference used by snapshot_download
+                huggingface_hub.file_download.hf_hub_download = _rate_limited_hf_hub_download
+                huggingface_hub._rate_limit_patched = True
+                logger.info("Patched huggingface_hub.hf_hub_download with rate limiter")
+        except Exception as e:
+            logger.warning(f"Failed to patch HF rate limiter: {e}")
+
     def setup(self, stage: str | None = None):
+        # Patch HF rate limiter before any HF calls
+        self._patch_hf_rate_limiter()
+
         # Start background prefetchers for remote sources
         for source in self._sources:
             if "root" not in source and source.get("prefetch", True):
