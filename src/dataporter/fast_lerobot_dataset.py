@@ -87,9 +87,11 @@ class FastLeRobotDataset(LeRobotDataset):
     def __init__(self, *args, cache_frames: bool = False,
                  cache_budget_gb: float = 2.0,
                  frame_buffer_capacity: int | None = None,
+                 return_uint8: bool = False,
                  **kwargs):
         super().__init__(*args, **kwargs)
         self._cache_frames = cache_frames
+        self._return_uint8 = return_uint8
         self._frame_source = None
 
         # Shared memory buffer mode (overrides LRU cache)
@@ -255,7 +257,8 @@ class FastLeRobotDataset(LeRobotDataset):
                     min(round(ts * self.fps), len(frames_uint8) - 1)
                     for ts in query_ts
                 ]
-                item[vid_key] = frames_uint8[frame_indices].to(torch.float32) / 255.0
+                frames = frames_uint8[frame_indices]
+                item[vid_key] = frames if self._return_uint8 else frames.to(torch.float32) / 255.0
             return item
 
         # Mode 2: Per-worker LRU cache
@@ -273,7 +276,8 @@ class FastLeRobotDataset(LeRobotDataset):
                     min(round(ts * self.fps), len(episode_frames) - 1)
                     for ts in query_ts
                 ]
-                item[vid_key] = episode_frames[frame_indices].to(torch.float32) / 255.0
+                frames = episode_frames[frame_indices]
+                item[vid_key] = frames if self._return_uint8 else frames.to(torch.float32) / 255.0
             return item
 
         # Mode 3: On-demand (no caching)
