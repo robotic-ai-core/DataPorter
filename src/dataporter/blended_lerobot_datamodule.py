@@ -336,7 +336,6 @@ class BlendedLeRobotDataModule(L.LightningDataModule):
                     source["repo_id"],
                     cache_frames=self.cache_frames,
                     cache_budget_gb=self.cache_budget_gb,
-                    frame_buffer_capacity=self.frame_buffer_capacity,
                     **kwargs,
                 )
                 val_parts.append(Subset(val_ds, val_idx))
