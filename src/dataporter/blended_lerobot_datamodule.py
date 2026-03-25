@@ -259,49 +259,7 @@ class BlendedLeRobotDataModule(L.LightningDataModule):
             p.stop()
         self._prefetchers.clear()
 
-    @staticmethod
-    def _patch_hf_rate_limiter():
-        """Monkey-patch huggingface_hub to add 429 retry with backoff.
-
-        LeRobot's LeRobotDatasetMetadata calls snapshot_download internally.
-        We wrap hf_hub_download to retry on 429 with exponential backoff,
-        without rate-limiting individual requests (snapshot_download handles
-        its own parallelism and connection pooling).
-        """
-        try:
-            import huggingface_hub
-            import huggingface_hub.file_download
-
-            if not getattr(huggingface_hub, '_rate_limit_patched', False):
-                _original = huggingface_hub.hf_hub_download
-
-                def _retry_on_429(*args, **kwargs):
-                    import time as _time
-                    for attempt in range(4):
-                        try:
-                            return _original(*args, **kwargs)
-                        except Exception as e:
-                            if "429" in str(e) and attempt < 3:
-                                wait = 60 * (2 ** attempt)  # 60, 120, 240s
-                                logger.warning(
-                                    f"HF 429 (attempt {attempt + 1}/4), "
-                                    f"retrying in {wait}s..."
-                                )
-                                _time.sleep(wait)
-                            else:
-                                raise
-
-                huggingface_hub.hf_hub_download = _retry_on_429
-                huggingface_hub.file_download.hf_hub_download = _retry_on_429
-                huggingface_hub._rate_limit_patched = True
-                logger.info("Patched huggingface_hub.hf_hub_download with 429 retry")
-        except Exception as e:
-            logger.warning(f"Failed to patch HF rate limiter: {e}")
-
     def setup(self, stage: str | None = None):
-        # Patch HF rate limiter before any HF calls
-        self._patch_hf_rate_limiter()
-
         # Start background prefetchers for remote sources
         for source in self._sources:
             if "root" not in source and source.get("prefetch", True):
