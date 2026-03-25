@@ -262,17 +262,17 @@ class BlendedLeRobotDataModule(L.LightningDataModule):
         self._prefetchers.clear()
 
     def setup(self, stage: str | None = None):
-        # Start background prefetchers for remote sources
-        for source in self._sources:
-            if "root" not in source and source.get("prefetch", True):
-                self._start_prefetcher(source)
-
-        # Filter to keys common across all sources
+        # Probe metadata FIRST (lightweight API calls) before heavy downloads
         self.delta_timestamps = self._common_delta_timestamps(
             self.delta_timestamps
         )
         val_ts = self._val_delta_timestamps or self.delta_timestamps
         val_ts = self._common_delta_timestamps(val_ts)
+
+        # Start background prefetchers AFTER metadata probe
+        for source in self._sources:
+            if "root" not in source and source.get("prefetch", True):
+                self._start_prefetcher(source)
 
         # Load all sources and split each into train/val
         train_subsets = []
