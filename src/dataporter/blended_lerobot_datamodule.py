@@ -78,6 +78,7 @@ class BlendedLeRobotDataModule(L.LightningDataModule):
         dtype_conversions: list[dict] | dict | None = None,
         cache_frames: bool = False,
         cache_budget_gb: float = 2.0,
+        frame_buffer_capacity: int | None = None,
         train_split_ratio: float = 0.9,
     ):
         super().__init__()
@@ -92,6 +93,7 @@ class BlendedLeRobotDataModule(L.LightningDataModule):
         self._prefetchers: list = []
         self.cache_frames = cache_frames
         self.cache_budget_gb = cache_budget_gb
+        self.frame_buffer_capacity = frame_buffer_capacity
         self.dtype_conversions = dtype_conversions
         self.train_split_ratio = train_split_ratio
 
@@ -216,6 +218,7 @@ class BlendedLeRobotDataModule(L.LightningDataModule):
                     source["repo_id"],
                     cache_frames=self.cache_frames,
                     cache_budget_gb=self.cache_budget_gb,
+                    frame_buffer_capacity=self.frame_buffer_capacity,
                     delta_timestamps=delta_timestamps,
                     **kwargs,
                 )
@@ -333,6 +336,7 @@ class BlendedLeRobotDataModule(L.LightningDataModule):
                     source["repo_id"],
                     cache_frames=self.cache_frames,
                     cache_budget_gb=self.cache_budget_gb,
+                    frame_buffer_capacity=self.frame_buffer_capacity,
                     **kwargs,
                 )
                 val_parts.append(Subset(val_ds, val_idx))
