@@ -45,6 +45,37 @@ logger = logging.getLogger(__name__)
 Producer = Callable[[], Iterator[tuple[int, Any]]]
 
 
+def priority_producer(
+    base_producer: Producer,
+    priority_keys: list[int],
+    decode_fn: Callable[[int], Any],
+) -> Producer:
+    """Wrap a producer to decode priority_keys first, then continue normally.
+
+    Used on resume: ``priority_keys`` are the episodes that were in the
+    buffer at checkpoint time. The producer decodes them first to warm
+    the buffer, then hands off to ``base_producer`` for the normal cycle.
+
+    Args:
+        base_producer: The normal producer (yields (key, value) pairs).
+        priority_keys: Keys to decode first (from state_dict).
+        decode_fn: Function to decode a single key → value.
+    """
+
+    def wrapped() -> Iterator[tuple[int, Any]]:
+        # Phase 1: decode priority keys to warm the buffer
+        for key in priority_keys:
+            try:
+                value = decode_fn(key)
+                yield key, value
+            except Exception:
+                continue  # skip unavailable episodes
+        # Phase 2: normal production
+        yield from base_producer()
+
+    return wrapped
+
+
 class PrefetchedSource:
     """Data source backed by Storage with optional background fill.
 
@@ -91,6 +122,19 @@ class PrefetchedSource:
     @property
     def storage(self) -> Storage:
         return self._storage
+
+    def state_dict(self) -> dict:
+        """Save source state (delegates to storage)."""
+        state = {}
+        if hasattr(self._storage, "state_dict"):
+            state["storage"] = self._storage.state_dict()
+        return state
+
+    def load_state_dict(self, state: dict) -> None:
+        """Restore source state (delegates to storage)."""
+        storage_state = state.get("storage")
+        if storage_state is not None and hasattr(self._storage, "load_state_dict"):
+            self._storage.load_state_dict(storage_state)
 
     def start(self) -> None:
         """Start background producer threads (if any)."""

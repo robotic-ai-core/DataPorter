@@ -488,3 +488,30 @@ class SharedMemoryStorage:
         self._buffer.fill_(0)
         self._next_slot.fill_(0)
         self._count.fill_(0)
+
+    def state_dict(self) -> dict:
+        """Save which episodes are in the buffer.
+
+        Does NOT save the frame data — that must be re-decoded on resume.
+        The ``priority_keys`` list tells the producer which episodes to
+        decode first so the buffer is warm immediately.
+        """
+        return {
+            "episode_keys": self.keys(),
+            "capacity": self._capacity,
+            "max_frames": self._max_frames,
+        }
+
+    def load_state_dict(self, state: dict) -> None:
+        """Restore the priority decode list.
+
+        The buffer itself is cleared (frames can't be checkpointed
+        efficiently). The returned ``priority_keys`` are stored for
+        the producer to decode first.
+        """
+        self._priority_keys = state.get("episode_keys", [])
+
+    @property
+    def priority_keys(self) -> list[int]:
+        """Episode indices to decode first on resume (set by load_state_dict)."""
+        return getattr(self, "_priority_keys", [])

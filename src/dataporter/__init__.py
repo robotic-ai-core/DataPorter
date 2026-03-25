@@ -20,7 +20,7 @@ from .hf_client import hf_download, hf_snapshot, hf_load_dataset
 from .text_prefetcher import TextPrefetcher
 from .raw_text_source import RawTextSource
 from .storage import ShardStorage, MemoryStorage, SharedMemoryStorage
-from .prefetched_source import PrefetchedSource
+from .prefetched_source import PrefetchedSource, priority_producer
 from .transformable_dataset import TransformableDataset
 from .timed_loader import TimedDataLoader
 from .dataset_wrappers import KeyFilterDataset, AugmentedDataset
@@ -62,6 +62,7 @@ __all__ = [
     'MemoryStorage',
     'SharedMemoryStorage',
     'PrefetchedSource',
+    'priority_producer',
     # Text streaming
     'TextPrefetcher',
     'RawTextSource',

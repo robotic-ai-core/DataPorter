@@ -403,10 +403,49 @@ class BlendedLeRobotDataModule(L.LightningDataModule):
         if self._train_sampler is not None:
             kwargs["shuffle"] = False
             kwargs["sampler"] = self._train_sampler
-        return ResumableDataLoader(self.train_dataset, **kwargs)
+        dl = ResumableDataLoader(self.train_dataset, **kwargs)
+        # Apply pending state from checkpoint (if resuming)
+        if hasattr(self, "_pending_dl_state") and self._pending_dl_state is not None:
+            dl.load_state_dict(self._pending_dl_state)
+            self._pending_dl_state = None
+        self._train_dataloader = dl
+        return dl
 
     def val_dataloader(self):
         kwargs = self._build_loader_kwargs(
             self.val_batch_size, shuffle=False
         )
         return ResumableDataLoader(self.val_dataset, **kwargs)
+
+    # ------------------------------------------------------------------
+    # State dict for scientific resumption
+    # ------------------------------------------------------------------
+
+    def state_dict(self) -> dict:
+        """Save DataModule state for deterministic resume.
+
+        Saves DataLoader position and frame buffer episode lists
+        (so producers can re-decode the same episodes on resume).
+        """
+        state = {}
+        # DataLoader position
+        if hasattr(self, "_train_dataloader") and self._train_dataloader is not None:
+            state["dataloader"] = self._train_dataloader.state_dict()
+        # Frame buffer state (episode indices to re-decode on resume)
+        if hasattr(self, "train_dataset") and self.train_dataset is not None:
+            ds = self.train_dataset
+            # Walk through dataset hierarchy to find PrefetchedSource / storage
+            source = getattr(ds, "_source", None)
+            if source is not None and hasattr(source, "state_dict"):
+                state["source"] = source.state_dict()
+        return state
+
+    def load_state_dict(self, state: dict) -> None:
+        """Restore DataModule state from checkpoint."""
+        self._pending_dl_state = state.get("dataloader")
+        source_state = state.get("source")
+        if source_state is not None:
+            if hasattr(self, "train_dataset") and self.train_dataset is not None:
+                source = getattr(self.train_dataset, "_source", None)
+                if source is not None and hasattr(source, "load_state_dict"):
+                    source.load_state_dict(source_state)

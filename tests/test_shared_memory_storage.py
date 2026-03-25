@@ -297,3 +297,113 @@ class TestDataLoaderIntegration:
                 miss_count += 1
 
         assert miss_count == 0
+
+
+# ---------------------------------------------------------------------------
+# State dict / resumption
+# ---------------------------------------------------------------------------
+
+class TestSharedMemoryResumption:
+
+    def test_state_dict_saves_keys(self):
+        """state_dict saves which episodes are in the buffer."""
+        s = SharedMemoryStorage(capacity=10, max_frames=5, channels=3, height=8, width=8)
+        s.put(10, _make_frames(3, c=3, h=8, w=8))
+        s.put(20, _make_frames(5, c=3, h=8, w=8))
+        s.put(30, _make_frames(2, c=3, h=8, w=8))
+
+        state = s.state_dict()
+        assert set(state["episode_keys"]) == {10, 20, 30}
+        assert state["capacity"] == 10
+
+    def test_load_state_dict_sets_priority_keys(self):
+        """load_state_dict stores priority keys for producer."""
+        s = SharedMemoryStorage(capacity=10, max_frames=5, channels=3, height=8, width=8)
+        state = {"episode_keys": [10, 20, 30], "capacity": 10, "max_frames": 5}
+        s.load_state_dict(state)
+
+        assert s.priority_keys == [10, 20, 30]
+        # Buffer is empty — frames must be re-decoded
+        assert len(s) == 0
+
+    def test_priority_producer_decodes_keys_first(self):
+        """priority_producer yields priority keys before normal production."""
+        from dataporter.prefetched_source import priority_producer
+
+        decoded = []
+
+        def decode_fn(key):
+            decoded.append(key)
+            return _make_frames(3, c=3, h=8, w=8)
+
+        def base_producer():
+            for i in range(100, 105):
+                yield i, _make_frames(3, c=3, h=8, w=8)
+
+        producer = priority_producer(base_producer, [10, 20, 30], decode_fn)
+        items = list(producer())
+
+        # Priority keys decoded first
+        assert decoded == [10, 20, 30]
+        # Then base producer continues
+        keys = [k for k, v in items]
+        assert keys[:3] == [10, 20, 30]
+        assert keys[3:] == [100, 101, 102, 103, 104]
+
+    def test_resume_with_priority_fill(self):
+        """Full resume cycle: save state → clear → reload → priority fill."""
+        s = SharedMemoryStorage(capacity=10, max_frames=5, channels=3, height=8, width=8)
+        # Fill with some episodes
+        for i in [10, 20, 30]:
+            s.put(i, _make_frames(4, c=3, h=8, w=8))
+
+        # Save state
+        state = s.state_dict()
+        assert set(state["episode_keys"]) == {10, 20, 30}
+
+        # Clear (simulates restart)
+        s.clear()
+        assert len(s) == 0
+
+        # Load state — sets priority keys
+        s.load_state_dict(state)
+
+        # Producer decodes priority keys first
+        from dataporter.prefetched_source import priority_producer
+
+        def decode_fn(key):
+            return _make_frames(4, c=3, h=8, w=8)
+
+        def base_producer():
+            for i in range(40, 50):
+                yield i, _make_frames(4, c=3, h=8, w=8)
+
+        source = PrefetchedSource(
+            s,
+            producers=[priority_producer(base_producer, s.priority_keys, decode_fn)],
+            shuffle_available=True,
+            min_available=3,
+        )
+        source.start()
+        source.wait_for_min(timeout=10)
+
+        # Priority episodes should be in the buffer first
+        assert 10 in s or 20 in s or 30 in s
+        source.stop()
+
+    def test_prefetched_source_state_dict(self):
+        """PrefetchedSource.state_dict delegates to storage."""
+        s = SharedMemoryStorage(capacity=5, max_frames=5, channels=3, height=8, width=8)
+        s.put(0, _make_frames(3, c=3, h=8, w=8))
+        s.put(1, _make_frames(3, c=3, h=8, w=8))
+
+        source = PrefetchedSource(s, shuffle_available=True)
+        state = source.state_dict()
+        assert "storage" in state
+        assert set(state["storage"]["episode_keys"]) == {0, 1}
+
+        # Round-trip
+        s2 = SharedMemoryStorage(capacity=5, max_frames=5, channels=3, height=8, width=8)
+        source2 = PrefetchedSource(s2, shuffle_available=True)
+        source2.load_state_dict(state)
+        assert s2.priority_keys == [0, 1]
