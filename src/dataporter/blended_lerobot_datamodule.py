@@ -78,7 +78,7 @@ class BlendedLeRobotDataModule(L.LightningDataModule):
         dtype_conversions: list[dict] | dict | None = None,
         cache_frames: bool = False,
         cache_budget_gb: float = 2.0,
-        frame_buffer_capacity: int | None = None,
+        frame_buffer_capacity: int | None = 400,
         train_split_ratio: float = 0.9,
     ):
         super().__init__()
@@ -132,6 +132,7 @@ class BlendedLeRobotDataModule(L.LightningDataModule):
         if len(self._sources) <= 1:
             return raw_timestamps
 
+        import tempfile
         from lerobot.common.datasets.lerobot_dataset import (
             LeRobotDatasetMetadata,
         )
@@ -141,6 +142,13 @@ class BlendedLeRobotDataModule(L.LightningDataModule):
             kwargs = {}
             if "root" in source:
                 kwargs["root"] = source["root"]
+            else:
+                # Probe in a temp dir so metadata-only downloads don't
+                # pollute the HF cache (which would leave an empty data/
+                # directory that breaks LeRobotDataset's download logic).
+                kwargs["root"] = Path(
+                    tempfile.mkdtemp(prefix="lerobot_meta_probe_")
+                )
             meta = LeRobotDatasetMetadata(source["repo_id"], **kwargs)
             available = set(meta.features.keys())
             available.update(
@@ -214,11 +222,15 @@ class BlendedLeRobotDataModule(L.LightningDataModule):
         # Retry on HF rate limit (429)
         for attempt in range(3):
             try:
+                # Per-source frame_buffer_capacity overrides global default
+                buf_cap = source.get(
+                    "frame_buffer_capacity", self.frame_buffer_capacity
+                )
                 dataset = FastLeRobotDataset(
                     source["repo_id"],
                     cache_frames=self.cache_frames,
                     cache_budget_gb=self.cache_budget_gb,
-                    frame_buffer_capacity=self.frame_buffer_capacity,
+                    frame_buffer_capacity=buf_cap,
                     delta_timestamps=delta_timestamps,
                     **kwargs,
                 )
