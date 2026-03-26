@@ -33,6 +33,7 @@ Usage — video (in-memory, shuffle-from-available):
 from __future__ import annotations
 
 import logging
+import multiprocessing as mp
 import threading
 import time
 from typing import Any, Callable, Iterator
@@ -102,15 +103,24 @@ class PrefetchedSource:
         fallback: Callable[[int], Any] | None = None,
         min_available: int = 1,
         keys_refresh_interval: float = 1.0,
+        use_process: bool = False,
     ):
         self._storage = storage
         self._producers = producers or []
         self._shuffle_available = shuffle_available
         self._fallback = fallback
         self._min_available = min_available
+        self._use_process = use_process
 
-        self._threads: list[threading.Thread] = []
-        self._stop_event = threading.Event()
+        self._workers: list[threading.Thread | mp.Process] = []
+        # Use multiprocessing primitives when running producers in processes
+        if use_process:
+            ctx = mp.get_context("fork")
+            self._stop_event = ctx.Event()
+            self._min_ready = ctx.Event()
+        else:
+            self._stop_event = threading.Event()
+            self._min_ready = threading.Event()
         self._started = False
 
         # Shuffle-available mode: index mapping (DataLoader idx → storage key)
@@ -118,7 +128,6 @@ class PrefetchedSource:
         self._keys_lock = threading.Lock()
         self._keys_refresh_interval = keys_refresh_interval
         self._keys_last_refresh = 0.0
-        self._min_ready = threading.Event()
         if not shuffle_available or len(self._storage) >= min_available:
             self._min_ready.set()
 
@@ -140,21 +149,36 @@ class PrefetchedSource:
             self._storage.load_state_dict(storage_state)
 
     def start(self) -> None:
-        """Start background producer threads (if any)."""
+        """Start background producer threads or processes (if any).
+
+        When ``use_process=True``, producers run in forked child processes
+        to avoid GIL contention with the main training loop. The
+        SharedMemoryStorage tensors (created with ``share_memory_()``)
+        are accessible from the child process without extra IPC.
+        """
         if self._started or not self._producers:
             return
         self._stop_event.clear()
         self._started = True
 
         for i, producer_fn in enumerate(self._producers):
-            t = threading.Thread(
-                target=self._run_producer,
-                args=(producer_fn, i),
-                daemon=True,
-                name=f"prefetch-producer-{i}",
-            )
-            self._threads.append(t)
-            t.start()
+            if self._use_process:
+                ctx = mp.get_context("fork")
+                w = ctx.Process(
+                    target=self._run_producer,
+                    args=(producer_fn, i),
+                    daemon=True,
+                    name=f"prefetch-producer-{i}",
+                )
+            else:
+                w = threading.Thread(
+                    target=self._run_producer,
+                    args=(producer_fn, i),
+                    daemon=True,
+                    name=f"prefetch-producer-{i}",
+                )
+            self._workers.append(w)
+            w.start()
 
     def wait_for_min(self, timeout: float = 300.0) -> None:
         """Block until min_available items are loaded."""
@@ -167,9 +191,12 @@ class PrefetchedSource:
     def stop(self) -> None:
         """Stop all background producers."""
         self._stop_event.set()
-        for t in self._threads:
-            t.join(timeout=10)
-        self._threads.clear()
+        for w in self._workers:
+            w.join(timeout=10)
+            # Terminate process if it didn't exit cleanly
+            if isinstance(w, mp.Process) and w.is_alive():
+                w.terminate()
+        self._workers.clear()
         self._started = False
 
     def _refresh_available_keys(self, force: bool = False) -> None:

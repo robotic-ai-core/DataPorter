@@ -124,6 +124,7 @@ class FastLeRobotDataset(LeRobotDataset):
                 producers=[producer],
                 shuffle_available=False,
                 fallback=self._decode_episode_fallback,
+                use_process=True,
             )
             self._frame_source.start()
             logger.info(
