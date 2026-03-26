@@ -566,3 +566,77 @@ class TestCoverage:
         assert insertion_order != list(range(50)), (
             "Producer filled sequentially — should be random"
         )
+
+
+# ---------------------------------------------------------------------------
+# Process-mode PrefetchedSource
+# ---------------------------------------------------------------------------
+
+class TestProcessMode:
+
+    def test_process_producer_fills_shared_storage(self):
+        """use_process=True: producer runs in forked child, fills SharedMemoryStorage."""
+        from dataporter.storage import SharedMemoryStorage
+
+        storage = SharedMemoryStorage(
+            capacity=20, max_frames=5, channels=3, height=8, width=8, max_keys=100,
+        )
+
+        def producer():
+            import torch
+            for i in range(10):
+                frames = torch.randint(0, 255, (5, 3, 8, 8), dtype=torch.uint8)
+                yield i, frames
+                time.sleep(0.01)
+
+        source = PrefetchedSource(
+            storage, producers=[producer], shuffle_available=True,
+            min_available=5, keys_refresh_interval=0.01, use_process=True,
+        )
+        source.start()
+        source.wait_for_min(timeout=10)
+
+        assert len(storage) >= 5
+        item = source[0]
+        assert "frames" in item
+        source.stop()
+
+    def test_process_mode_stop_terminates(self):
+        """Process-mode producers terminate cleanly on stop()."""
+        from dataporter.storage import SharedMemoryStorage
+
+        storage = SharedMemoryStorage(
+            capacity=100, max_frames=5, channels=3, height=8, width=8, max_keys=200,
+        )
+
+        def slow_producer():
+            import torch
+            for i in range(10000):
+                frames = torch.randint(0, 255, (5, 3, 8, 8), dtype=torch.uint8)
+                yield i % 100, frames
+                time.sleep(0.1)
+
+        source = PrefetchedSource(
+            storage, producers=[slow_producer], use_process=True,
+        )
+        source.start()
+        time.sleep(0.3)
+        source.stop()  # should terminate within timeout
+        assert not any(w.is_alive() for w in source._workers)
+
+    def test_thread_mode_with_memory_storage(self):
+        """Thread mode (default) works with MemoryStorage."""
+        storage = MemoryStorage(capacity=50)
+
+        def producer():
+            for i in range(20):
+                yield i, {"value": i}
+
+        source = PrefetchedSource(
+            storage, producers=[producer], shuffle_available=True,
+            min_available=10, keys_refresh_interval=0.01,
+        )
+        source.start()
+        source.wait_for_min(timeout=10)
+        assert len(storage) >= 10
+        source.stop()
