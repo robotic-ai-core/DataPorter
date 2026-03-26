@@ -144,7 +144,7 @@ class PrefetchedSource:
 
         self._workers: list[threading.Thread | mp.Process] = []
         # Use multiprocessing primitives when running producers in processes
-        if use_process:
+        if self._use_process:
             ctx = mp.get_context("fork")
             self._stop_event = ctx.Event()
             self._min_ready = ctx.Event()

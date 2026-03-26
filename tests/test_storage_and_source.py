@@ -625,6 +625,37 @@ class TestProcessMode:
         source.stop()  # should terminate within timeout
         assert not any(w.is_alive() for w in source._workers)
 
+    def test_default_process_mode_with_shared_storage(self):
+        """Without explicit use_process, producers + SharedMemoryStorage defaults to process mode.
+
+        Regression test: previously `if use_process:` checked the parameter (None)
+        instead of `self._use_process`, so process mode never activated by default.
+        """
+        from dataporter.storage import SharedMemoryStorage
+
+        storage = SharedMemoryStorage(
+            capacity=20, max_frames=5, channels=3, height=8, width=8, max_keys=100,
+        )
+
+        def producer():
+            import torch
+            for i in range(10):
+                frames = torch.randint(0, 255, (5, 3, 8, 8), dtype=torch.uint8)
+                yield i, frames
+                time.sleep(0.01)
+
+        # No use_process= argument — should default to True (has producers)
+        source = PrefetchedSource(
+            storage, producers=[producer], shuffle_available=True,
+            min_available=5, keys_refresh_interval=0.01,
+        )
+        assert source._use_process is True, "Should default to process mode with producers"
+        source.start()
+        source.wait_for_min(timeout=10)
+
+        assert len(storage) >= 5
+        source.stop()
+
     def test_thread_mode_with_memory_storage(self):
         """Thread mode (default) works with MemoryStorage."""
         storage = MemoryStorage(capacity=50)
