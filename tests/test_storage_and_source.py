@@ -224,7 +224,7 @@ class TestPrefetchedSourceWithProducers:
             for i in range(50):
                 yield i, {"value": i}
 
-        source = PrefetchedSource(storage, producers=[producer])
+        source = PrefetchedSource(storage, producers=[producer], use_threads=True)
         source.start()
         time.sleep(0.5)
         source.stop()
@@ -243,7 +243,7 @@ class TestPrefetchedSourceWithProducers:
             for i in range(50, 100):
                 yield i, {"src": "b", "idx": i}
 
-        source = PrefetchedSource(storage, producers=[producer_a, producer_b])
+        source = PrefetchedSource(storage, producers=[producer_a, producer_b], use_threads=True)
         source.start()
         time.sleep(0.5)
         source.stop()
@@ -259,7 +259,7 @@ class TestPrefetchedSourceWithProducers:
                 yield i, {"value": i}
                 time.sleep(0.01)
 
-        source = PrefetchedSource(storage, producers=[producer])
+        source = PrefetchedSource(storage, producers=[producer], use_threads=True)
         source.start()
         time.sleep(0.3)
         source.stop()
@@ -275,7 +275,7 @@ class TestPrefetchedSourceWithProducers:
                 yield i, {"value": i}
                 time.sleep(0.1)
 
-        source = PrefetchedSource(storage, producers=[slow_producer])
+        source = PrefetchedSource(storage, producers=[slow_producer], use_threads=True)
         source.start()
         time.sleep(0.2)
         source.stop()
@@ -334,7 +334,7 @@ class TestIntegration:
             for i in range(100):
                 yield i, {"value": float(i)}
 
-        source = PrefetchedSource(storage, producers=[producer])
+        source = PrefetchedSource(storage, producers=[producer], use_threads=True)
         source.start()
         time.sleep(0.3)  # let producer fill
 
@@ -402,7 +402,7 @@ class TestShuffleFromAvailable:
 
         source = PrefetchedSource(
             storage, producers=[producer], shuffle_available=True,
-            min_available=5, keys_refresh_interval=0.01,
+            min_available=5, keys_refresh_interval=0.01, use_threads=True,
         )
         source.start()
         source.wait_for_min(timeout=10)
@@ -481,7 +481,7 @@ class TestShuffleFromAvailable:
         source = PrefetchedSource(
             storage, producers=[slow_producer],
             shuffle_available=True, min_available=10,
-            keys_refresh_interval=0.01,
+            keys_refresh_interval=0.01, use_threads=True,
         )
         source.start()
         source.wait_for_min(timeout=10)
@@ -516,7 +516,7 @@ class TestCoverage:
 
         source = PrefetchedSource(
             storage, producers=[cycling_producer],
-            shuffle_available=True, min_available=buffer_size,
+            shuffle_available=True, min_available=buffer_size, use_threads=True,
         )
         source.start()
         source.wait_for_min(timeout=10)
@@ -557,6 +557,7 @@ class TestCoverage:
 
         source = PrefetchedSource(
             storage, producers=[tracking_producer], shuffle_available=True,
+            use_threads=True,
         )
         source.start()
         time.sleep(0.5)
@@ -634,7 +635,7 @@ class TestProcessMode:
 
         source = PrefetchedSource(
             storage, producers=[producer], shuffle_available=True,
-            min_available=10, keys_refresh_interval=0.01,
+            min_available=10, keys_refresh_interval=0.01, use_threads=True,
         )
         source.start()
         source.wait_for_min(timeout=10)

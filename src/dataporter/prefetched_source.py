@@ -109,7 +109,12 @@ class PrefetchedSource:
         use_process: If True, run producers in forked child processes
             instead of threads. Required for GPU training to avoid GIL
             contention. SharedMemoryStorage tensors are accessible
-            cross-process via share_memory_(). Default: False.
+            cross-process via share_memory_(). Default: True when
+            producers are provided (safe for GPU training), False
+            when no producers (read-only source).
+        use_threads: Explicitly request thread mode. Only use for
+            CPU-only workloads where fork isn't safe. Overrides the
+            default process mode.
     """
 
     def __init__(
@@ -120,14 +125,22 @@ class PrefetchedSource:
         fallback: Callable[[int], Any] | None = None,
         min_available: int = 1,
         keys_refresh_interval: float = 1.0,
-        use_process: bool = False,
+        use_process: bool | None = None,
+        use_threads: bool = False,
     ):
         self._storage = storage
         self._producers = producers or []
         self._shuffle_available = shuffle_available
         self._fallback = fallback
         self._min_available = min_available
-        self._use_process = use_process
+
+        # Default: process mode when producers exist, thread mode when not
+        if use_process is not None:
+            self._use_process = use_process
+        elif use_threads:
+            self._use_process = False
+        else:
+            self._use_process = len(self._producers) > 0
 
         self._workers: list[threading.Thread | mp.Process] = []
         # Use multiprocessing primitives when running producers in processes
