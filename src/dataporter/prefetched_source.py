@@ -82,10 +82,20 @@ class PrefetchedSource:
 
     Implements ``DataSource`` protocol (``__len__``, ``__getitem__``).
 
+    **GIL warning:** When training with GPU, use ``use_process=True`` for
+    producers that do tensor operations (video decode, frame writes).
+    Thread-mode producers hold the GIL during tensor writes, blocking
+    CUDA kernel scheduling and causing up to 60% GPU throughput loss.
+
+    Rule of thumb:
+      - ``SharedMemoryStorage`` → always use ``use_process=True``
+      - ``MemoryStorage`` (CPU-only, no GPU training) → thread mode is fine
+      - ``ShardStorage`` → no producers needed (prefetcher is separate process)
+
     Args:
         storage: The storage backend (ShardStorage, MemoryStorage, etc.).
         producers: List of callables, each returning an iterator of
-            (index, value) pairs. One thread per producer.
+            (index, value) pairs. One worker per producer.
         shuffle_available: If True, __getitem__ only serves items currently
             in storage (zero cache misses). __len__ returns available count.
             If False, passes idx directly to storage (may cache-miss).
@@ -93,6 +103,13 @@ class PrefetchedSource:
             Signature: (idx: int) -> value. Ignored in shuffle-available mode.
         min_available: In shuffle-available mode, wait_for_min() blocks
             until this many items are loaded. Default: 1.
+        keys_refresh_interval: Seconds between key list refreshes in
+            shuffle-available mode. Lower = faster visibility of new items,
+            higher = less overhead per __getitem__. Default: 1.0.
+        use_process: If True, run producers in forked child processes
+            instead of threads. Required for GPU training to avoid GIL
+            contention. SharedMemoryStorage tensors are accessible
+            cross-process via share_memory_(). Default: False.
     """
 
     def __init__(
