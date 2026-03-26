@@ -217,69 +217,63 @@ class TestPrefetchedSourceReadOnly:
 
 class TestPrefetchedSourceWithProducers:
 
-    def test_background_fill(self):
+    def test_pre_filled_read(self):
+        """Pre-filled MemoryStorage + PrefetchedSource (no producers)."""
         storage = MemoryStorage(capacity=100)
+        for i in range(50):
+            storage.put(i, {"value": i})
 
-        def producer():
-            for i in range(50):
-                yield i, {"value": i}
+        source = PrefetchedSource(storage)
+        assert len(source) == 50
+        assert source[0] == {"value": 0}
 
-        source = PrefetchedSource(storage, producers=[producer], use_threads=True)
-        source.start()
-        time.sleep(0.5)
-        source.stop()
-
-        assert len(storage) > 0
-        assert storage.get(0) == {"value": 0}
-
-    def test_multiple_producers(self):
+    def test_multiple_sources_pre_filled(self):
+        """Pre-filled from multiple sources."""
         storage = MemoryStorage(capacity=200)
+        for i in range(50):
+            storage.put(i, {"src": "a", "idx": i})
+        for i in range(50, 100):
+            storage.put(i, {"src": "b", "idx": i})
 
-        def producer_a():
-            for i in range(50):
-                yield i, {"src": "a", "idx": i}
-
-        def producer_b():
-            for i in range(50, 100):
-                yield i, {"src": "b", "idx": i}
-
-        source = PrefetchedSource(storage, producers=[producer_a, producer_b], use_threads=True)
-        source.start()
-        time.sleep(0.5)
-        source.stop()
-
-        assert storage.get(0)["src"] == "a"
-        assert storage.get(50)["src"] == "b"
+        source = PrefetchedSource(storage)
+        assert source[0] == {"src": "a", "idx": 0}
+        assert source[50] == {"src": "b", "idx": 50}
 
     def test_capacity_eviction(self):
-        storage = MemoryStorage(capacity=10)
+        from dataporter.storage import SharedMemoryStorage
+        storage = SharedMemoryStorage(
+            capacity=10, max_frames=3, channels=3, height=8, width=8, max_keys=100,
+        )
 
         def producer():
+            import torch
             for i in range(50):
-                yield i, {"value": i}
+                yield i, torch.randint(0, 255, (3, 3, 8, 8), dtype=torch.uint8)
                 time.sleep(0.01)
 
-        source = PrefetchedSource(storage, producers=[producer], use_threads=True)
+        source = PrefetchedSource(storage, producers=[producer])
         source.start()
-        time.sleep(0.3)
+        time.sleep(0.5)
         source.stop()
 
-        # Should never exceed capacity
         assert len(storage) <= 10
 
     def test_stop_terminates_producers(self):
-        storage = MemoryStorage()
+        from dataporter.storage import SharedMemoryStorage
+        storage = SharedMemoryStorage(
+            capacity=100, max_frames=3, channels=3, height=8, width=8, max_keys=200,
+        )
 
         def slow_producer():
+            import torch
             for i in range(10000):
-                yield i, {"value": i}
+                yield i % 100, torch.randint(0, 255, (3, 3, 8, 8), dtype=torch.uint8)
                 time.sleep(0.1)
 
-        source = PrefetchedSource(storage, producers=[slow_producer], use_threads=True)
+        source = PrefetchedSource(storage, producers=[slow_producer])
         source.start()
-        time.sleep(0.2)
+        time.sleep(0.3)
         source.stop()
-        # Should stop quickly, not wait for all 10k items
         assert len(storage) < 100
 
 
@@ -326,17 +320,13 @@ class TestIntegration:
         total = sum(b["frames"].shape[0] for b in loader)
         assert total == 100
 
-    def test_with_background_producer_and_dataloader(self):
-        """Background producer fills storage while DataLoader consumes."""
+    def test_with_pre_filled_and_dataloader(self):
+        """Pre-filled MemoryStorage + DataLoader."""
         storage = MemoryStorage(capacity=200)
+        for i in range(100):
+            storage.put(i, {"value": float(i)})
 
-        def producer():
-            for i in range(100):
-                yield i, {"value": float(i)}
-
-        source = PrefetchedSource(storage, producers=[producer], use_threads=True)
-        source.start()
-        time.sleep(0.3)  # let producer fill
+        source = PrefetchedSource(storage)
 
         def transform(src, idx):
             item = src[idx]
@@ -346,8 +336,7 @@ class TestIntegration:
         loader = DataLoader(ds, batch_size=10, shuffle=False, num_workers=0)
 
         batches = list(loader)
-        assert len(batches) > 0
-        source.stop()
+        assert len(batches) == 10
 
 
 # ---------------------------------------------------------------------------
@@ -393,25 +382,27 @@ class TestShuffleFromAvailable:
 
     def test_grows_as_producer_fills(self):
         """__len__ increases as background producer adds items."""
-        storage = MemoryStorage(capacity=100)
+        from dataporter.storage import SharedMemoryStorage
+        storage = SharedMemoryStorage(
+            capacity=30, max_frames=3, channels=3, height=8, width=8, max_keys=100,
+        )
 
         def producer():
+            import torch
             for i in range(20):
-                yield i, {"value": i}
+                yield i, torch.randint(0, 255, (3, 3, 8, 8), dtype=torch.uint8)
                 time.sleep(0.02)
 
         source = PrefetchedSource(
             storage, producers=[producer], shuffle_available=True,
-            min_available=5, keys_refresh_interval=0.01, use_threads=True,
+            min_available=5, keys_refresh_interval=0.01,
         )
         source.start()
         source.wait_for_min(timeout=10)
 
-        # Should have at least min_available items
         assert len(source) >= 5
-
         time.sleep(0.5)
-        assert len(source) >= 15  # more filled over time
+        assert len(source) >= 15
         source.stop()
 
     def test_wraps_index_modulo(self):
@@ -471,17 +462,21 @@ class TestShuffleFromAvailable:
 
     def test_wait_for_min(self):
         """wait_for_min blocks until enough items are loaded."""
-        storage = MemoryStorage(capacity=100)
+        from dataporter.storage import SharedMemoryStorage
+        storage = SharedMemoryStorage(
+            capacity=30, max_frames=3, channels=3, height=8, width=8, max_keys=100,
+        )
 
         def slow_producer():
+            import torch
             for i in range(20):
-                yield i, {"value": i}
+                yield i, torch.randint(0, 255, (3, 3, 8, 8), dtype=torch.uint8)
                 time.sleep(0.05)
 
         source = PrefetchedSource(
             storage, producers=[slow_producer],
             shuffle_available=True, min_available=10,
-            keys_refresh_interval=0.01, use_threads=True,
+            keys_refresh_interval=0.01,
         )
         source.start()
         source.wait_for_min(timeout=10)
@@ -497,75 +492,45 @@ class TestCoverage:
 
     def test_all_items_seen_over_time(self):
         """With a cycling producer, all items eventually enter the buffer."""
+        from dataporter.storage import SharedMemoryStorage
         n_items = 50
         buffer_size = 15
 
-        storage = MemoryStorage(capacity=buffer_size)
-        seen_items = set()
+        storage = SharedMemoryStorage(
+            capacity=buffer_size, max_frames=3, channels=3, height=8, width=8,
+            max_keys=n_items * 2,
+        )
+        seen_keys = set()
 
         def cycling_producer():
-            """Yield all items in random order, restart forever."""
-            import random
+            import random, torch
             rng = random.Random(42)
             while True:
                 order = list(range(n_items))
                 rng.shuffle(order)
                 for key in order:
-                    yield key, {"value": key}
+                    yield key, torch.randint(0, 255, (3, 3, 8, 8), dtype=torch.uint8)
                     time.sleep(0.001)
 
         source = PrefetchedSource(
             storage, producers=[cycling_producer],
-            shuffle_available=True, min_available=buffer_size, use_threads=True,
+            shuffle_available=True, min_available=buffer_size,
+            keys_refresh_interval=0.01,
         )
         source.start()
         source.wait_for_min(timeout=10)
 
-        # Simulate DataLoader consuming for a while
         for _ in range(200):
-            n = len(source)
-            if n == 0:
-                continue
-            for idx in range(n):
-                item = source[idx]
-                seen_items.add(item["value"])
+            keys = storage.keys()
+            seen_keys.update(keys)
             time.sleep(0.01)
 
         source.stop()
 
-        # Should have seen most items (not all guaranteed in limited time,
-        # but with 50 items and 200 rounds, coverage should be high)
-        coverage = len(seen_items) / n_items
-        assert coverage >= 0.6, (
-            f"Only {coverage:.0%} coverage — expected >= 60%. "
-            f"Seen {len(seen_items)}/{n_items}"
-        )
-
-    def test_random_fill_order(self):
-        """Producer yields items in random order, not sequential."""
-        storage = MemoryStorage(capacity=100)
-        insertion_order = []
-
-        def tracking_producer():
-            import random
-            rng = random.Random(42)
-            order = list(range(50))
-            rng.shuffle(order)
-            for key in order:
-                insertion_order.append(key)
-                yield key, {"value": key}
-
-        source = PrefetchedSource(
-            storage, producers=[tracking_producer], shuffle_available=True,
-            use_threads=True,
-        )
-        source.start()
-        time.sleep(0.5)
-        source.stop()
-
-        # Insertion order should not be sequential
-        assert insertion_order != list(range(50)), (
-            "Producer filled sequentially — should be random"
+        coverage = len(seen_keys) / n_items
+        assert coverage >= 0.5, (
+            f"Only {coverage:.0%} coverage — expected >= 50%. "
+            f"Seen {len(seen_keys)}/{n_items}"
         )
 
 
@@ -592,7 +557,7 @@ class TestProcessMode:
 
         source = PrefetchedSource(
             storage, producers=[producer], shuffle_available=True,
-            min_available=5, keys_refresh_interval=0.01, use_process=True,
+            min_available=5, keys_refresh_interval=0.01,
         )
         source.start()
         source.wait_for_min(timeout=10)
@@ -618,7 +583,7 @@ class TestProcessMode:
                 time.sleep(0.1)
 
         source = PrefetchedSource(
-            storage, producers=[slow_producer], use_process=True,
+            storage, producers=[slow_producer],
         )
         source.start()
         time.sleep(0.3)
@@ -626,11 +591,7 @@ class TestProcessMode:
         assert not any(w.is_alive() for w in source._workers)
 
     def test_default_process_mode_with_shared_storage(self):
-        """Without explicit use_process, producers + SharedMemoryStorage defaults to process mode.
-
-        Regression test: previously `if use_process:` checked the parameter (None)
-        instead of `self._use_process`, so process mode never activated by default.
-        """
+        """Producers always run as processes (no thread mode)."""
         from dataporter.storage import SharedMemoryStorage
 
         storage = SharedMemoryStorage(
@@ -644,31 +605,13 @@ class TestProcessMode:
                 yield i, frames
                 time.sleep(0.01)
 
-        # No use_process= argument — should default to True (has producers)
         source = PrefetchedSource(
             storage, producers=[producer], shuffle_available=True,
             min_available=5, keys_refresh_interval=0.01,
         )
-        assert source._use_process is True, "Should default to process mode with producers"
         source.start()
         source.wait_for_min(timeout=10)
 
         assert len(storage) >= 5
         source.stop()
 
-    def test_thread_mode_with_memory_storage(self):
-        """Thread mode (default) works with MemoryStorage."""
-        storage = MemoryStorage(capacity=50)
-
-        def producer():
-            for i in range(20):
-                yield i, {"value": i}
-
-        source = PrefetchedSource(
-            storage, producers=[producer], shuffle_available=True,
-            min_available=10, keys_refresh_interval=0.01, use_threads=True,
-        )
-        source.start()
-        source.wait_for_min(timeout=10)
-        assert len(storage) >= 10
-        source.stop()

@@ -82,20 +82,15 @@ class PrefetchedSource:
 
     Implements ``DataSource`` protocol (``__len__``, ``__getitem__``).
 
-    **GIL warning:** When training with GPU, use ``use_process=True`` for
-    producers that do tensor operations (video decode, frame writes).
-    Thread-mode producers hold the GIL during tensor writes, blocking
-    CUDA kernel scheduling and causing up to 60% GPU throughput loss.
-
-    Rule of thumb:
-      - ``SharedMemoryStorage`` → always use ``use_process=True``
-      - ``MemoryStorage`` (CPU-only, no GPU training) → thread mode is fine
-      - ``ShardStorage`` → no producers needed (prefetcher is separate process)
+    Producers always run in **forked child processes** to avoid GIL
+    contention with CUDA training (60% throughput loss with threads).
+    ``SharedMemoryStorage`` tensors are accessible cross-process via
+    ``share_memory_()``.
 
     Args:
         storage: The storage backend (ShardStorage, MemoryStorage, etc.).
         producers: List of callables, each returning an iterator of
-            (index, value) pairs. One worker per producer.
+            (index, value) pairs. One process per producer.
         shuffle_available: If True, __getitem__ only serves items currently
             in storage (zero cache misses). __len__ returns available count.
             If False, passes idx directly to storage (may cache-miss).
@@ -106,15 +101,6 @@ class PrefetchedSource:
         keys_refresh_interval: Seconds between key list refreshes in
             shuffle-available mode. Lower = faster visibility of new items,
             higher = less overhead per __getitem__. Default: 1.0.
-        use_process: If True, run producers in forked child processes
-            instead of threads. Required for GPU training to avoid GIL
-            contention. SharedMemoryStorage tensors are accessible
-            cross-process via share_memory_(). Default: True when
-            producers are provided (safe for GPU training), False
-            when no producers (read-only source).
-        use_threads: Explicitly request thread mode. Only use for
-            CPU-only workloads where fork isn't safe. Overrides the
-            default process mode.
     """
 
     def __init__(
@@ -125,8 +111,6 @@ class PrefetchedSource:
         fallback: Callable[[int], Any] | None = None,
         min_available: int = 1,
         keys_refresh_interval: float = 1.0,
-        use_process: bool | None = None,
-        use_threads: bool = False,
     ):
         self._storage = storage
         self._producers = producers or []
@@ -134,17 +118,8 @@ class PrefetchedSource:
         self._fallback = fallback
         self._min_available = min_available
 
-        # Default: process mode when producers exist, thread mode when not
-        if use_process is not None:
-            self._use_process = use_process
-        elif use_threads:
-            self._use_process = False
-        else:
-            self._use_process = len(self._producers) > 0
-
-        self._workers: list[threading.Thread | mp.Process] = []
-        # Use multiprocessing primitives when running producers in processes
-        if self._use_process:
+        self._workers: list[mp.Process] = []
+        if self._producers:
             ctx = mp.get_context("fork")
             self._stop_event = ctx.Event()
             self._min_ready = ctx.Event()
@@ -179,34 +154,25 @@ class PrefetchedSource:
             self._storage.load_state_dict(storage_state)
 
     def start(self) -> None:
-        """Start background producer threads or processes (if any).
+        """Start background producer processes (if any).
 
-        When ``use_process=True``, producers run in forked child processes
-        to avoid GIL contention with the main training loop. The
-        SharedMemoryStorage tensors (created with ``share_memory_()``)
-        are accessible from the child process without extra IPC.
+        Producers run in forked child processes to avoid GIL contention
+        with CUDA training. SharedMemoryStorage tensors are accessible
+        cross-process via share_memory_().
         """
         if self._started or not self._producers:
             return
         self._stop_event.clear()
         self._started = True
 
+        ctx = mp.get_context("fork")
         for i, producer_fn in enumerate(self._producers):
-            if self._use_process:
-                ctx = mp.get_context("fork")
-                w = ctx.Process(
-                    target=self._run_producer,
-                    args=(producer_fn, i),
-                    daemon=True,
-                    name=f"prefetch-producer-{i}",
-                )
-            else:
-                w = threading.Thread(
-                    target=self._run_producer,
-                    args=(producer_fn, i),
-                    daemon=True,
-                    name=f"prefetch-producer-{i}",
-                )
+            w = ctx.Process(
+                target=self._run_producer,
+                args=(producer_fn, i),
+                daemon=True,
+                name=f"prefetch-producer-{i}",
+            )
             self._workers.append(w)
             w.start()
 
@@ -223,8 +189,7 @@ class PrefetchedSource:
         self._stop_event.set()
         for w in self._workers:
             w.join(timeout=10)
-            # Terminate process if it didn't exit cleanly
-            if isinstance(w, mp.Process) and w.is_alive():
+            if w.is_alive():
                 w.terminate()
         self._workers.clear()
         self._started = False

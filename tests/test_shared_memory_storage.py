@@ -264,7 +264,6 @@ class TestDataLoaderIntegration:
 
         source = PrefetchedSource(
             s, producers=[producer], shuffle_available=True, min_available=10,
-            use_threads=True,  # unit test — process mode tested in TestProcessMode
         )
         source.start()
         source.wait_for_min(timeout=10)
@@ -383,7 +382,7 @@ class TestSharedMemoryResumption:
             s,
             producers=[priority_producer(base_producer, s.priority_keys, decode_fn)],
             shuffle_available=True,
-            min_available=3, use_threads=True,
+            min_available=3,
         )
         source.start()
         source.wait_for_min(timeout=10)
