@@ -38,6 +38,28 @@ from .strategies import ResumptionStrategy, UnifiedResumptionStrategy
 from .converters import KeyBasedDtypeConverter
 
 
+class _ConvertingCollate:
+    """Picklable collate wrapper that applies dtype conversion in workers.
+
+    Must be a class (not a closure/lambda) so multiprocessing can pickle it.
+    """
+
+    def __init__(self, base_collate, converter):
+        self._base_collate = base_collate
+        self._converter = converter
+
+    def __call__(self, batch):
+        from torch.utils.data.dataloader import default_collate
+        collate_fn = self._base_collate or default_collate
+        collated = collate_fn(batch)
+        return self._converter.convert_batch(collated)
+
+
+def _make_converting_collate(collate_fn, converter):
+    """Create a collate function that includes dtype conversion."""
+    return _ConvertingCollate(collate_fn, converter)
+
+
 class _ResumableIter:
     """Iterator wrapper that updates the parent counter on each iteration."""
 
@@ -139,20 +161,35 @@ class ResumableDataLoader(DataLoader):
             # Disable shuffle since we're using a custom sampler
             shuffle = False
         
+        # Move dtype conversion into collate_fn when using workers.
+        # This runs in worker processes, freeing the main thread for
+        # GPU kernel scheduling (eliminates ~15ms idle gap per step).
+        resolved_converter = None
+        if isinstance(converter, dict):
+            resolved_converter = KeyBasedDtypeConverter(converter)
+        elif converter is not None:
+            resolved_converter = converter
+
+        effective_collate = collate_fn
+        if resolved_converter is not None and num_workers > 0:
+            effective_collate = _make_converting_collate(
+                collate_fn, resolved_converter
+            )
+
         # Build DataLoader arguments
         dataloader_kwargs = {
             'dataset': dataset, 'batch_size': batch_size, 'shuffle': shuffle,
             'sampler': sampler, 'batch_sampler': batch_sampler, 'num_workers': num_workers,
-            'collate_fn': collate_fn, 'pin_memory': pin_memory, 'drop_last': drop_last,
+            'collate_fn': effective_collate, 'pin_memory': pin_memory, 'drop_last': drop_last,
             'timeout': timeout, 'worker_init_fn': worker_init_fn,
             'multiprocessing_context': multiprocessing_context, 'generator': generator,
             'persistent_workers': persistent_workers
         }
-        
+
         # Only add prefetch_factor if num_workers > 0 (PyTorch constraint)
         if num_workers > 0:
             dataloader_kwargs['prefetch_factor'] = prefetch_factor
-            
+
         super().__init__(**dataloader_kwargs, **kwargs)
         
         # Initialize resumption strategy
@@ -166,11 +203,11 @@ class ResumableDataLoader(DataLoader):
         # Control increment semantics around explicit epoch switches
         self._suppress_next_increment = False
         
-        # Initialize converter
-        if isinstance(converter, dict):
-            self._converter = KeyBasedDtypeConverter(converter)
+        # Main-thread fallback: only when num_workers=0 and converter is set
+        if resolved_converter is not None and num_workers == 0:
+            self._converter = resolved_converter
         else:
-            self._converter = converter
+            self._converter = None
         
     def __iter__(self) -> _ResumableIter:
         """Return an iterator that updates batch progress on each step."""
