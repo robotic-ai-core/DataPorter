@@ -44,29 +44,31 @@ from .converters import KeyBasedDtypeConverter
 logger = logging.getLogger(__name__)
 
 
-def resolve_num_workers(num_workers: int | str) -> int:
-    """Resolve num_workers, supporting "auto" for core-count-based scaling.
+def resolve_num_workers(num_workers: int) -> int:
+    """Resolve num_workers, supporting -1 for core-count-based auto-scaling.
 
-    "auto" uses ``ceil(cpu_count / 8)``, rounded up to even. This gives:
+    -1 uses ``ceil(cpu_count / 8)``, rounded up to even. This gives:
       12-16 cores → 2,  17-24 → 4,  25-40 → 4,
       41-64 → 8,  65-96 → 12,  97-128 → 16
 
+    Convention follows scikit-learn's ``n_jobs=-1`` (use all cores).
+
     Args:
-        num_workers: Integer worker count, or "auto" for auto-detection.
+        num_workers: Worker count. -1 = auto, 0 = main process, >0 = explicit.
 
     Returns:
-        Resolved integer worker count.
+        Resolved integer worker count (always >= 0).
     """
-    if isinstance(num_workers, int):
+    if num_workers >= 0:
         return num_workers
-    if num_workers == "auto":
+    if num_workers == -1:
         cores = os.cpu_count() or 4
         n = math.ceil(cores / 8)
         n += n % 2  # round up to even
         n = max(2, n)  # at least 2
         logger.info(f"Auto num_workers: {n} (from {cores} cores)")
         return n
-    raise ValueError(f"num_workers must be int or 'auto', got {num_workers!r}")
+    raise ValueError(f"num_workers must be >= -1, got {num_workers}")
 
 
 class _ConvertingCollate:
@@ -137,8 +139,8 @@ class ResumableDataLoader(DataLoader):
         shuffle: Whether to shuffle samples (default: None -> True if no sampler provided)
         sampler: Custom sampler (default: None -> auto-create resumable sampler)
         batch_sampler: Custom batch sampler (default: None)
-        num_workers: Number of worker processes (default: 0). Use "auto"
-            for core-count-based scaling (ceil(cores/8), rounded to even).
+        num_workers: Number of worker processes (default: 0). Use -1
+            for core-count-based auto-scaling (ceil(cores/8), rounded to even).
         collate_fn: Function to collate samples into batches (default: None)
         pin_memory: Whether to pin memory for faster GPU transfer (default: False)
         drop_last: Whether to drop last incomplete batch (default: False)
@@ -157,7 +159,7 @@ class ResumableDataLoader(DataLoader):
     
     def __init__(self, dataset, batch_size: int = 1, shuffle: bool = None,
                  sampler: Optional[Sampler] = None, batch_sampler=None,
-                 num_workers: int | str = 0, collate_fn=None, pin_memory: bool = False,
+                 num_workers: int = 0, collate_fn=None, pin_memory: bool = False,
                  drop_last: bool = False, timeout: float = 0,
                  worker_init_fn=None, multiprocessing_context=None,
                  generator=None, prefetch_factor: int = 2,
@@ -324,7 +326,7 @@ class ResumableDataLoader(DataLoader):
 
 
 def create_resumable_dataloader(dataset, batch_size: int, shuffle: bool = True,
-                               num_workers: int | str = 0, pin_memory: bool = True,
+                               num_workers: int = 0, pin_memory: bool = True,
                                drop_last: bool = False, 
                                strategy: Optional[str] = None,
                                distributed: Optional[bool] = None,

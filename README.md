@@ -28,7 +28,7 @@ pip install -e external/DataPorter/
 from dataporter import ResumableDataLoader
 
 # Drop-in replacement for DataLoader with exact resume
-loader = ResumableDataLoader(dataset, batch_size=32, shuffle=True, num_workers="auto")
+loader = ResumableDataLoader(dataset, batch_size=32, shuffle=True, num_workers=-1)
 
 # Save / restore
 state = loader.state_dict()
@@ -54,7 +54,7 @@ prefetcher.wait_for_min()
 # Workers tokenize in parallel (no single-threaded bottleneck)
 source = RawTextSource("/data/cache", max_shards=200)
 dataset = TransformableDataset(source, my_tokenize_transform)
-loader = ResumableDataLoader(dataset, batch_size=32, num_workers="auto")
+loader = ResumableDataLoader(dataset, batch_size=32, num_workers=-1)
 ```
 
 ### Video Frame Pipeline (LeRobot)
@@ -74,7 +74,7 @@ source.wait_for_min()
 
 # DataLoader workers read from shared memory — no cache misses
 dataset = TransformableDataset(source, augment_transform)
-loader = ResumableDataLoader(dataset, batch_size=256, num_workers="auto")
+loader = ResumableDataLoader(dataset, batch_size=256, num_workers=-1)
 ```
 
 ### LeRobot Dataset Download
@@ -121,7 +121,7 @@ Both run in separate processes (forkserver) to avoid GIL contention with CUDA tr
 - **Atomic shard writes**: `.tmp` → `os.rename()` → `.parquet`. Readers never see partial files.
 - **Deferred eviction**: Shards scheduled for deletion, executed after file handles close. Zero race conditions.
 - **Scientific resumption**: `state_dict()` pins shard list + DataLoader position. Deterministic resume.
-- **`num_workers="auto"`**: Scales with CPU cores (`ceil(cores/8)`). Prevents GPU starvation on cloud machines.
+- **`num_workers=-1`**: Scales with CPU cores (`ceil(cores/8)`). Prevents GPU starvation on cloud machines.
 - **HF rate limiter**: Shared token bucket across all HF API calls. Prevents 429 rate limit errors.
 - **`return_uint8`**: Video frames stay uint8 through DataLoader (7x faster batches). Convert on GPU.
 
