@@ -241,15 +241,17 @@ class PrefetchedSource:
         return item
 
     def _getitem_direct(self, idx: int) -> Any:
-        """Direct mode: pass idx to storage, fallback on miss."""
+        """Direct mode: pass idx to storage, fallback on miss.
+
+        Note: fallback results are NOT written back to storage to avoid
+        race conditions when multiple DataLoader workers and the producer
+        process write to shared memory concurrently without locks.
+        """
         item = self._storage.get(idx)
         if item is not None:
             return item
         if self._fallback is not None:
-            value = self._fallback(idx)
-            if hasattr(self._storage, "put"):
-                self._storage.put(idx, value)
-            return value
+            return self._fallback(idx)
         raise IndexError(f"Index {idx} not available in storage")
 
     def _run_producer(self, producer_fn: Producer, producer_idx: int) -> None:

@@ -207,8 +207,9 @@ class TestPrefetchedSourceReadOnly:
         )
         item = source[42]
         assert item == {"text": "fallback_42"}
-        # Fallback result should be cached
-        assert storage.get(42) == {"text": "fallback_42"}
+        # Fallback results are NOT written back to storage (avoids race
+        # conditions when multiple DataLoader workers share the storage)
+        assert storage.get(42) is None
 
 
 # ---------------------------------------------------------------------------
