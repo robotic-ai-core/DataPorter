@@ -23,7 +23,7 @@ from torch.utils.data import ConcatDataset, Subset, WeightedRandomSampler
 
 from .dataset_wrappers import AugmentedDataset, KeyFilterDataset
 from .fast_lerobot_dataset import FastLeRobotDataset
-from .resumable import ResumableDataLoader
+from .resumable import ResumableDataLoader, resolve_num_workers
 
 logger = logging.getLogger(__name__)
 
@@ -69,7 +69,7 @@ class BlendedLeRobotDataModule(L.LightningDataModule):
         val_delta_timestamps: dict | None = None,
         batch_size: int = 32,
         val_batch_size: int | None = None,
-        num_workers: int | str = 4,
+        num_workers: int = 4,
         prefetch_factor: int = 4,
         persistent_workers: bool = True,
         pin_memory: bool = True,
@@ -104,16 +104,7 @@ class BlendedLeRobotDataModule(L.LightningDataModule):
 
         self.batch_size = batch_size
         self.val_batch_size = val_batch_size or batch_size
-        # Resolve "auto" num_workers: ceil(cpu_count / 8), rounded to even
-        if isinstance(num_workers, str) and num_workers == "auto":
-            import math, os
-            cores = os.cpu_count() or 4
-            resolved = math.ceil(cores / 8)
-            resolved += resolved % 2  # round up to even
-            logger.info(f"Auto num_workers: {resolved} (from {cores} cores)")
-            self.num_workers = resolved
-        else:
-            self.num_workers = int(num_workers)
+        self.num_workers = resolve_num_workers(num_workers)
         self.prefetch_factor = prefetch_factor
         self.persistent_workers = persistent_workers
         self.pin_memory = pin_memory
