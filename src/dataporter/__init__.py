@@ -24,6 +24,9 @@ from .prefetched_source import PrefetchedSource, priority_producer
 from .transformable_dataset import TransformableDataset
 from .timed_loader import TimedDataLoader
 from .dataset_wrappers import KeyFilterDataset, AugmentedDataset
+from .shuffle_buffer import ShuffleBuffer
+from .producer_pool import ProducerPool, AsyncProducer
+from .shuffle_buffer_dataset import ShuffleBufferDataset
 
 # Lazy imports for optional dependencies (lerobot, lightning)
 def __getattr__(name):
@@ -77,6 +80,11 @@ __all__ = [
     # LeRobot integration (lazy — requires lerobot)
     'FastLeRobotDataset',
     'BlendedLeRobotDataModule',
+    # Shuffle buffer (video pipeline)
+    'ShuffleBuffer',
+    'ProducerPool',
+    'AsyncProducer',
+    'ShuffleBufferDataset',
     # Instrumentation
     'TimedDataLoader',
     # Utilities
