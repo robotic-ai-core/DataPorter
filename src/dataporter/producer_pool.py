@@ -1,31 +1,32 @@
-"""Async producer pool for filling ShuffleBuffer.
+"""Producer pool for filling ShuffleBuffer.
 
-Single child process running an asyncio event loop. Coordinates multiple
-producers (one per data source) with weighted scheduling. Each producer
-dispatches video decode to a ProcessPoolExecutor.
+Spawned child process with asyncio event loop and per-source
+ThreadPoolExecutor for parallel video decode. Uses spawn context
+(not fork) to avoid deadlocks from inherited HF Arrow mmaps.
 
 Architecture::
 
     Main process (GPU training)
     |
-    +-- ProducerPool process (asyncio event loop)
-        |
-        +-- Thread pool A (weight=3, 3 threads) -- decode source A episodes
-        +-- Thread pool B (weight=1, 1 thread)  -- decode source B episodes
-        |
-        +-- ShuffleBuffer.put() (single writer, serialized by event loop)
-
-Workers (in main process) call ShuffleBuffer.sample() — read-only, no decode.
+    +-- ProducerPool process (SPAWNED, fresh)
+    |   +-- FastLeRobotDataset per source (own mmap, created in child)
+    |   +-- ThreadPoolExecutor per source (sized by weight)
+    |   +-- asyncio loop serializes buffer.put() (single writer)
+    |
+    +-- DataLoader workers (forked, read-only)
+        +-- buffer.sample() (shared memory read)
+        +-- HF dataset reads (inherited mmap, read-only)
 """
 
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import logging
 import multiprocessing as mp
 import random
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Callable
+from typing import Callable
 
 import torch
 
@@ -34,14 +35,33 @@ from .shuffle_buffer import ShuffleBuffer
 logger = logging.getLogger(__name__)
 
 
+@dataclasses.dataclass
+class ProducerConfig:
+    """Picklable configuration for a data source producer.
+
+    All fields are primitives — no dataset objects, no closures.
+    The spawned child process creates its own dataset from these params.
+    """
+    source_name: str
+    repo_id: str
+    root: str
+    episode_indices: list[int]
+    weight: float = 1.0
+    seed: int = 42
+    tolerance_s: float | None = None
+    delta_timestamps_keys: list[str] | None = None
+
+
+# Keep AsyncProducer as a convenience wrapper for thread-based usage
 class AsyncProducer:
     """Configuration for a single data source producer.
 
+    For thread-based ProducerPool (legacy API). For spawn-based,
+    use ProducerConfig instead.
+
     Args:
         source_name: Human-readable source name (for logging).
-        decode_fn: Callable that decodes an episode. Signature:
-            ``(episode_idx: int) -> torch.Tensor`` returning
-            frames as ``[T, C, H, W]`` uint8.
+        decode_fn: Callable that decodes an episode.
         episode_indices: List of episode indices to cycle through.
         weight: Relative sampling weight (controls blend ratio).
         seed: Random seed for episode shuffle order.
@@ -62,62 +82,116 @@ class AsyncProducer:
         self.seed = seed
 
 
-def _pool_entry(
+# ---------------------------------------------------------------------------
+# Spawn-based producer pool (primary path)
+# ---------------------------------------------------------------------------
+
+def _spawn_pool_entry(
     buffer: ShuffleBuffer,
-    producers: list[AsyncProducer],
+    configs: list[ProducerConfig],
     total_workers: int,
     warmup_target: int,
-    warmup_event: mp.Event,
-    stop_event: mp.Event,
+    warmup_event,
+    stop_event,
 ) -> None:
-    """Entry point for the producer pool child process."""
+    """Entry point for the spawned producer process."""
     try:
-        asyncio.run(_run_pool(
-            buffer, producers, total_workers,
+        asyncio.run(_run_spawn_pool(
+            buffer, configs, total_workers,
             warmup_target, warmup_event, stop_event,
         ))
     except Exception as e:
         logger.error(f"ProducerPool error: {e}", exc_info=True)
     finally:
-        warmup_event.set()  # unblock parent even on error
+        warmup_event.set()
 
 
-async def _run_pool(
+def _make_child_decode_fn(config: ProducerConfig) -> Callable[[int], torch.Tensor]:
+    """Create a decode function inside the child process.
+
+    Lazily initializes a fresh FastLeRobotDataset on first call —
+    the child gets its own Arrow mmap, independent of the parent.
+    """
+    from pathlib import Path
+
+    _state = {}
+
+    def decode(ep_idx: int) -> torch.Tensor:
+        if "ds" not in _state:
+            from .fast_lerobot_dataset import FastLeRobotDataset
+            kwargs = {"root": Path(config.root)}
+            if config.tolerance_s is not None:
+                kwargs["tolerance_s"] = config.tolerance_s
+            _state["ds"] = FastLeRobotDataset(
+                config.repo_id,
+                delta_timestamps={"observation.image": [0.0]},
+                **kwargs,
+            )
+            logger.info(
+                f"[child] Loaded {config.source_name} from {config.root}"
+            )
+        ds = _state["ds"]
+
+        from lerobot.common.datasets.video_utils import decode_video_frames
+
+        for vid_key in ds.meta.video_keys:
+            ep_start = ds.episode_data_index["from"][ep_idx].item()
+            ep_end = ds.episode_data_index["to"][ep_idx].item()
+            num_frames = ep_end - ep_start
+            all_ts = [i / ds.fps for i in range(num_frames)]
+            video_path = ds.root / ds.meta.get_video_file_path(ep_idx, vid_key)
+            all_frames = decode_video_frames(
+                video_path, all_ts, ds.tolerance_s, ds.video_backend,
+            )
+            if all_frames.dim() == 5:
+                all_frames = all_frames.squeeze(0)
+            return (all_frames * 255).to(torch.uint8)
+
+    return decode
+
+
+async def _run_spawn_pool(
     buffer: ShuffleBuffer,
-    producers: list[AsyncProducer],
+    configs: list[ProducerConfig],
     total_workers: int,
     warmup_target: int,
-    warmup_event: mp.Event,
-    stop_event: mp.Event,
+    warmup_event,
+    stop_event,
 ) -> None:
-    """Async event loop: weighted scheduling + executor dispatch."""
+    """Async event loop in spawned child: ThreadPoolExecutor per source."""
     loop = asyncio.get_event_loop()
 
-    # Distribute workers by weight
-    total_weight = sum(p.weight for p in producers)
+    # Build decode functions (fresh datasets in this process)
+    decode_fns = {}
+    for cfg in configs:
+        decode_fns[cfg.source_name] = _make_child_decode_fn(cfg)
+
+    # Distribute thread workers by weight
+    total_weight = sum(cfg.weight for cfg in configs)
     executors = {}
+    for cfg in configs:
+        n = max(1, round(total_workers * cfg.weight / total_weight))
+        executors[cfg.source_name] = ThreadPoolExecutor(
+            max_workers=n, thread_name_prefix=f"decode-{cfg.source_name}",
+        )
+
+    # Episode iterators (infinite, shuffled)
     iterators = {}
+    for cfg in configs:
+        rng = random.Random(cfg.seed)
+        iterators[cfg.source_name] = _episode_iterator(cfg.episode_indices, rng)
 
-    for p in producers:
-        n_workers = max(1, round(total_workers * p.weight / total_weight))
-        executors[p.source_name] = ThreadPoolExecutor(max_workers=n_workers)
-        iterators[p.source_name] = _episode_iterator(p)
-
-    # Weighted round-robin tokens
-    tokens = {p.source_name: 0.0 for p in producers}
-    weight_map = {p.source_name: p.weight for p in producers}
+    # Weighted round-robin
+    tokens = {cfg.source_name: 0.0 for cfg in configs}
+    weight_map = {cfg.source_name: cfg.weight for cfg in configs}
 
     while not stop_event.is_set():
-        # Pick producer with highest deficit
         name = max(tokens, key=lambda n: weight_map[n] - tokens[n])
-        producer = next(p for p in producers if p.source_name == name)
-
         ep_idx = next(iterators[name])
 
-        # Dispatch decode to executor
         try:
             frames = await loop.run_in_executor(
-                executors[name], producer.decode_fn, ep_idx
+                executors[name], decode_fns[name], ep_idx,
             )
         except Exception as e:
             logger.warning(f"Decode failed for {name} ep {ep_idx}: {e}")
@@ -125,90 +199,179 @@ async def _run_pool(
 
         buffer.put(ep_idx, frames)
 
-        # Update tokens
         tokens[name] += 1
         if all(t >= weight_map[n] for n, t in tokens.items()):
             tokens = {n: 0.0 for n in tokens}
 
-        # Check warmup
         if not warmup_event.is_set() and len(buffer) >= warmup_target:
             warmup_event.set()
             logger.info(
                 f"ProducerPool warmup complete: {len(buffer)} items in buffer"
             )
 
-        # Backpressure: if buffer full, yield to let workers consume
         while len(buffer) >= buffer.capacity and not stop_event.is_set():
-            await asyncio.sleep(0.01)
+            await asyncio.sleep(0.05)
 
-    # Shutdown executors
     for ex in executors.values():
         ex.shutdown(wait=False, cancel_futures=True)
 
 
-def _episode_iterator(producer: AsyncProducer):
+# ---------------------------------------------------------------------------
+# Thread-based fallback (for when spawn isn't needed)
+# ---------------------------------------------------------------------------
+
+def _run_thread_pool(
+    buffer: ShuffleBuffer,
+    producers: list[AsyncProducer],
+    warmup_target: int,
+    warmup_event,
+    stop_event,
+) -> None:
+    """Thread-based producer loop (fallback for simple cases)."""
+    import time
+
+    iterators = {}
+    for p in producers:
+        rng = random.Random(p.seed)
+        iterators[p.source_name] = _episode_iterator(p.episode_indices, rng)
+
+    tokens = {p.source_name: 0.0 for p in producers}
+    weight_map = {p.source_name: p.weight for p in producers}
+    decode_map = {p.source_name: p.decode_fn for p in producers}
+
+    while not stop_event.is_set():
+        name = max(tokens, key=lambda n: weight_map[n] - tokens[n])
+        ep_idx = next(iterators[name])
+
+        try:
+            frames = decode_map[name](ep_idx)
+        except Exception as e:
+            logger.warning(f"Decode failed for {name} ep {ep_idx}: {e}")
+            continue
+
+        buffer.put(ep_idx, frames)
+
+        tokens[name] += 1
+        if all(t >= weight_map[n] for n, t in tokens.items()):
+            tokens = {n: 0.0 for n in tokens}
+
+        if not warmup_event.is_set() and len(buffer) >= warmup_target:
+            warmup_event.set()
+            logger.info(
+                f"ProducerPool warmup complete: {len(buffer)} items in buffer"
+            )
+
+        while len(buffer) >= buffer.capacity and not stop_event.is_set():
+            time.sleep(0.05)
+
+
+# ---------------------------------------------------------------------------
+# Shared helpers
+# ---------------------------------------------------------------------------
+
+def _episode_iterator(episode_indices: list[int], rng: random.Random):
     """Infinite iterator that cycles through episodes in shuffled order."""
-    rng = random.Random(producer.seed)
     while True:
-        order = list(producer.episode_indices)
+        order = list(episode_indices)
         rng.shuffle(order)
         yield from order
 
 
+# ---------------------------------------------------------------------------
+# ProducerPool
+# ---------------------------------------------------------------------------
+
 class ProducerPool:
     """Manages background episode decoding into a ShuffleBuffer.
 
-    Single child process with asyncio event loop. Coordinates multiple
-    data sources with weighted scheduling.
+    Two modes:
+
+    1. **Spawn mode** (default when ``configs`` provided): spawns a fresh
+       child process with its own datasets and ThreadPoolExecutor per
+       source. No inherited state, no fork deadlocks, true parallelism.
+
+    2. **Thread mode** (fallback when ``producers`` provided): daemon
+       thread in the main process. Simpler but shares GIL. Used when
+       decode_fn closures aren't picklable.
 
     Args:
         buffer: The ShuffleBuffer to fill.
-        producers: List of AsyncProducer configs (one per source).
-        total_workers: Total decode workers distributed across sources.
+        configs: List of ProducerConfig (spawn mode). Picklable.
+        producers: List of AsyncProducer (thread mode). Not picklable.
+        total_workers: Total decode threads distributed across sources.
         warmup_target: Fill buffer to this level before signaling ready.
-            Default: buffer capacity (fill completely before training).
     """
 
     def __init__(
         self,
         buffer: ShuffleBuffer,
-        producers: list[AsyncProducer],
+        configs: list[ProducerConfig] | None = None,
+        producers: list[AsyncProducer] | None = None,
         total_workers: int = 4,
         warmup_target: int | None = None,
     ):
+        if configs is None and producers is None:
+            raise ValueError("Either configs or producers must be provided")
+
         self._buffer = buffer
+        self._configs = configs
         self._producers = producers
         self._total_workers = total_workers
         self._warmup_target = warmup_target or buffer.capacity
-        self._process: mp.Process | None = None
+        self._use_spawn = configs is not None
 
-        ctx = mp.get_context("fork")
-        self._warmup_event = ctx.Event()
-        self._stop_event = ctx.Event()
+        self._worker = None  # Process or Thread
+
+        if self._use_spawn:
+            ctx = mp.get_context("spawn")
+            self._warmup_event = ctx.Event()
+            self._stop_event = ctx.Event()
+        else:
+            import threading
+            self._warmup_event = threading.Event()
+            self._stop_event = threading.Event()
 
     def start(self) -> None:
-        """Spawn child process running the producer pool."""
-        if self._process is not None and self._process.is_alive():
+        """Start the producer (spawn process or daemon thread)."""
+        if self._worker is not None and (
+            hasattr(self._worker, 'is_alive') and self._worker.is_alive()
+        ):
             raise RuntimeError("ProducerPool already running")
 
         self._stop_event.clear()
         self._warmup_event.clear()
 
-        ctx = mp.get_context("fork")
-        self._process = ctx.Process(
-            target=_pool_entry,
-            args=(
-                self._buffer,
-                self._producers,
-                self._total_workers,
-                self._warmup_target,
-                self._warmup_event,
-                self._stop_event,
-            ),
-            daemon=True,
-            name="producer-pool",
-        )
-        self._process.start()
+        if self._use_spawn:
+            ctx = mp.get_context("spawn")
+            self._worker = ctx.Process(
+                target=_spawn_pool_entry,
+                args=(
+                    self._buffer,
+                    self._configs,
+                    self._total_workers,
+                    self._warmup_target,
+                    self._warmup_event,
+                    self._stop_event,
+                ),
+                daemon=True,
+                name="producer-pool",
+            )
+        else:
+            import threading
+            self._worker = threading.Thread(
+                target=_run_thread_pool,
+                args=(
+                    self._buffer,
+                    self._producers,
+                    self._warmup_target,
+                    self._warmup_event,
+                    self._stop_event,
+                ),
+                daemon=True,
+                name="producer-pool",
+            )
+
+        self._worker.start()
 
     def wait_for_warmup(self, timeout: float = 300.0) -> None:
         """Block until warmup_target items are in the buffer."""
@@ -219,14 +382,14 @@ class ProducerPool:
             )
 
     def stop(self) -> None:
-        """Stop the producer pool process."""
+        """Stop the producer."""
         self._stop_event.set()
-        if self._process is not None:
-            self._process.join(timeout=10)
-            if self._process.is_alive():
-                self._process.terminate()
-            self._process = None
+        if self._worker is not None:
+            self._worker.join(timeout=10)
+            if hasattr(self._worker, 'terminate') and self._worker.is_alive():
+                self._worker.terminate()
+            self._worker = None
 
     @property
     def is_alive(self) -> bool:
-        return self._process is not None and self._process.is_alive()
+        return self._worker is not None and self._worker.is_alive()

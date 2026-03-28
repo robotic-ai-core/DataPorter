@@ -27,6 +27,7 @@ from .dataset_wrappers import KeyFilterDataset, AugmentedDataset
 from .shuffle_buffer import ShuffleBuffer
 from .producer_pool import ProducerPool, AsyncProducer
 from .shuffle_buffer_dataset import ShuffleBufferDataset
+from .lerobot_shuffle_buffer_dataset import LeRobotShuffleBufferDataset
 
 # Lazy imports for optional dependencies (lerobot, lightning)
 def __getattr__(name):
@@ -85,6 +86,7 @@ __all__ = [
     'ProducerPool',
     'AsyncProducer',
     'ShuffleBufferDataset',
+    'LeRobotShuffleBufferDataset',
     # Instrumentation
     'TimedDataLoader',
     # Utilities

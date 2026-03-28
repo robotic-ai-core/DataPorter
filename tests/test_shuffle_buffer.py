@@ -157,7 +157,7 @@ class TestProducerPool:
             episode_indices=list(range(50)),
             weight=1.0,
         )
-        pool = ProducerPool(buf, [producer], total_workers=2, warmup_target=10)
+        pool = ProducerPool(buf, producers=[producer], total_workers=2, warmup_target=10)
         pool.start()
         pool.wait_for_warmup(timeout=30)
 
@@ -172,7 +172,7 @@ class TestProducerPool:
         producer_a = AsyncProducer("A", _synthetic_decode, list(range(100)), weight=3.0)
         producer_b = AsyncProducer("B", _synthetic_decode, list(range(100, 200)), weight=1.0)
 
-        pool = ProducerPool(buf, [producer_a, producer_b], total_workers=2, warmup_target=80)
+        pool = ProducerPool(buf, producers=[producer_a, producer_b], total_workers=2, warmup_target=80)
         pool.start()
         pool.wait_for_warmup(timeout=30)
         time.sleep(0.5)
@@ -194,7 +194,7 @@ class TestProducerPool:
     def test_stop_terminates(self):
         buf = ShuffleBuffer(capacity=100, max_frames=5, channels=3, height=8, width=8)
         producer = AsyncProducer("test", _synthetic_decode, list(range(1000)), weight=1.0)
-        pool = ProducerPool(buf, [producer], total_workers=1, warmup_target=5)
+        pool = ProducerPool(buf, producers=[producer], total_workers=1, warmup_target=5)
         pool.start()
         pool.wait_for_warmup(timeout=30)
 
@@ -296,7 +296,7 @@ class TestEndToEnd:
             episode_indices=list(range(100)),
             weight=1.0,
         )
-        pool = ProducerPool(buf, [producer], total_workers=2, warmup_target=20)
+        pool = ProducerPool(buf, producers=[producer], total_workers=2, warmup_target=20)
         pool.start()
         pool.wait_for_warmup(timeout=30)
 

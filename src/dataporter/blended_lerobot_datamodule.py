@@ -79,6 +79,7 @@ class BlendedLeRobotDataModule(L.LightningDataModule):
         cache_frames: bool = False,
         cache_budget_gb: float = 2.0,
         frame_buffer_capacity: int | None = None,
+        shuffle_buffer_capacity: int | None = None,
         train_split_ratio: float = 0.9,
     ):
         super().__init__()
@@ -93,7 +94,12 @@ class BlendedLeRobotDataModule(L.LightningDataModule):
         self._prefetchers: list = []
         self.cache_frames = cache_frames
         self.cache_budget_gb = cache_budget_gb
-        self.frame_buffer_capacity = frame_buffer_capacity
+        # Mutually exclusive: shuffle_buffer overrides frame_buffer
+        if shuffle_buffer_capacity is not None:
+            self.frame_buffer_capacity = None
+        else:
+            self.frame_buffer_capacity = frame_buffer_capacity
+        self.shuffle_buffer_capacity = shuffle_buffer_capacity
         self.dtype_conversions = dtype_conversions
         self.train_split_ratio = train_split_ratio
 
@@ -111,6 +117,8 @@ class BlendedLeRobotDataModule(L.LightningDataModule):
         self.pin_memory_device = pin_memory_device
         self.multiprocessing_context = multiprocessing_context
 
+        self._producer_pool = None
+
     # ------------------------------------------------------------------
     # Subclass hooks
     # ------------------------------------------------------------------
@@ -122,6 +130,10 @@ class BlendedLeRobotDataModule(L.LightningDataModule):
     def get_val_transform(self) -> Callable | None:
         """Return validation transform. Override in subclass."""
         return None
+
+    def get_image_keys(self) -> list[str]:
+        """Return image/video keys used in the dataset. Override in subclass."""
+        return ["observation.image"]
 
     # ------------------------------------------------------------------
     # Key intersection
@@ -266,11 +278,149 @@ class BlendedLeRobotDataModule(L.LightningDataModule):
         return train_subset, val_indices, dataset
 
     # ------------------------------------------------------------------
+    # Shuffle buffer setup
+    # ------------------------------------------------------------------
+
+    def _make_decode_fn(
+        self, dataset: FastLeRobotDataset,
+    ) -> Callable:
+        """Create a decode function for an AsyncProducer.
+
+        Returns a callable that decodes all video frames for an episode
+        as uint8 tensor [T, C, H, W]. Same logic as _make_frame_producer
+        but as a single-episode callable (no generator).
+
+        The decode_fn runs in a daemon thread (ProducerPool), not a
+        forked process — so it can safely reference the dataset object.
+        """
+        from lerobot.common.datasets.video_utils import decode_video_frames
+
+        def decode_episode(ep_idx: int) -> "torch.Tensor":
+            import torch as _torch
+
+            for vid_key in dataset.meta.video_keys:
+                ep_start = dataset.episode_data_index["from"][ep_idx].item()
+                ep_end = dataset.episode_data_index["to"][ep_idx].item()
+                num_frames = ep_end - ep_start
+                all_ts = [i / dataset.fps for i in range(num_frames)]
+
+                video_path = (
+                    dataset.root
+                    / dataset.meta.get_video_file_path(ep_idx, vid_key)
+                )
+                all_frames = decode_video_frames(
+                    video_path, all_ts,
+                    dataset.tolerance_s, dataset.video_backend,
+                )
+                if all_frames.dim() == 5:
+                    all_frames = all_frames.squeeze(0)
+                return (all_frames * 255).to(_torch.uint8)
+
+        return decode_episode
+
+    def _setup_shuffle_buffer_training(
+        self, delta_timestamps: dict, full_datasets: list,
+    ) -> None:
+        """Set up training dataset using ShuffleBuffer pipeline.
+
+        Replaces the standard Subset + WeightedRandomSampler path with:
+        1. ShuffleBuffer (pre-allocated shared memory)
+        2. ProducerPool (background video decode, weighted scheduling)
+        3. LeRobotShuffleBufferDataset (complete samples from buffer)
+        """
+        from .shuffle_buffer import ShuffleBuffer
+        from .producer_pool import ProducerConfig, ProducerPool
+        from .lerobot_shuffle_buffer_dataset import LeRobotShuffleBufferDataset
+
+        # Determine max_frames and frame dimensions across all sources
+        max_frames = 0
+        height, width, channels = 96, 96, 3
+        producers = []
+        sources_for_dataset = []
+
+        for source, val_idx, full_ds in full_datasets:
+            ep_data_index = full_ds.episode_data_index
+            num_episodes = len(ep_data_index["from"])
+            train_episodes = int(self.train_split_ratio * num_episodes)
+            train_ep_indices = list(range(train_episodes))
+
+            # Max frames per episode across this source
+            for ep_idx in train_ep_indices:
+                ep_len = int(
+                    ep_data_index["to"][ep_idx]
+                    - ep_data_index["from"][ep_idx]
+                )
+                max_frames = max(max_frames, ep_len)
+
+            # Build ProducerConfig (picklable, for spawn mode)
+            config = ProducerConfig(
+                source_name=source["repo_id"],
+                repo_id=source["repo_id"],
+                root=str(full_ds.root),
+                episode_indices=train_ep_indices,
+                weight=source["weight"],
+                tolerance_s=source.get("tolerance_s"),
+            )
+            producers.append(config)
+
+            # Build source dict for LeRobotShuffleBufferDataset
+            transform = self.get_train_transform(source)
+            sources_for_dataset.append({
+                "dataset": full_ds,
+                "train_episode_indices": train_ep_indices,
+                "transform": transform,
+            })
+
+        # Create buffer + pool
+        buffer = ShuffleBuffer(
+            capacity=self.shuffle_buffer_capacity,
+            max_frames=max_frames,
+            channels=channels,
+            height=height,
+            width=width,
+        )
+        self._producer_pool = ProducerPool(
+            buffer, configs=producers, total_workers=4,
+        )
+        self._producer_pool.start()
+        logger.info(
+            f"ShuffleBuffer pipeline started: capacity={self.shuffle_buffer_capacity}, "
+            f"max_frames={max_frames}, sources={len(producers)}"
+        )
+        self._producer_pool.wait_for_warmup()
+
+        # Create training dataset
+        # epoch_length: use total training samples across all sources
+        # as a reasonable epoch size
+        total_train_samples = 0
+        for source, val_idx, full_ds in full_datasets:
+            ep_data_index = full_ds.episode_data_index
+            num_episodes = len(ep_data_index["from"])
+            train_episodes = int(self.train_split_ratio * num_episodes)
+            for ep_idx in range(train_episodes):
+                total_train_samples += int(
+                    ep_data_index["to"][ep_idx]
+                    - ep_data_index["from"][ep_idx]
+                )
+
+        self.train_dataset = LeRobotShuffleBufferDataset(
+            buffer=buffer,
+            sources=sources_for_dataset,
+            delta_timestamps=delta_timestamps,
+            epoch_length=total_train_samples,
+            image_keys=self.get_image_keys(),
+        )
+        self._train_sampler = None  # No sampler needed
+
+    # ------------------------------------------------------------------
     # Setup / teardown
     # ------------------------------------------------------------------
 
     def teardown(self, stage: str | None = None):
-        """Stop background prefetchers."""
+        """Stop background prefetchers and producer pool."""
+        if self._producer_pool is not None:
+            self._producer_pool.stop()
+            self._producer_pool = None
         for p in self._prefetchers:
             p.stop()
         self._prefetchers.clear()
@@ -289,55 +439,80 @@ class BlendedLeRobotDataModule(L.LightningDataModule):
                 self._start_prefetcher(source)
 
         # Load all sources and split each into train/val
-        train_subsets = []
-        train_weights = []
         full_datasets = []
 
         for source in self._sources:
             train_sub, val_idx, full_ds = self._load_and_split_source(
                 source, self.delta_timestamps
             )
-
-            # Per-source transform
-            transform = self.get_train_transform(source)
-            if transform is not None:
-                train_sub = AugmentedDataset(train_sub, transform)
-
-            train_subsets.append(train_sub)
-            train_weights.append((source["weight"], len(train_sub)))
             full_datasets.append((source, val_idx, full_ds))
 
-        # Common keys for collator when blending
-        common_keys = set(self.delta_timestamps.keys())
-        common_keys.update([
-            "episode_index", "frame_index", "timestamp", "index",
-            "task_index",
-        ])
-
-        # Filter samples to common keys when blending
-        if len(train_subsets) > 1:
-            train_subsets = [
-                KeyFilterDataset(sub, common_keys) for sub in train_subsets
-            ]
-
-        # Combine training subsets
-        if len(train_subsets) == 1:
-            combined_train = train_subsets[0]
-            self._train_sampler = None
-        else:
-            combined_train = ConcatDataset(train_subsets)
-            sample_weights = []
-            for weight, count in train_weights:
-                sample_weights.extend([weight] * count)
-            self._train_sampler = WeightedRandomSampler(
-                weights=sample_weights,
-                num_samples=len(combined_train),
-                replacement=True,
+        # ---- Training dataset ----
+        if self.shuffle_buffer_capacity is not None:
+            # ShuffleBuffer path: ProducerPool decodes video in background,
+            # workers only read from shared memory + HF dataset
+            self._setup_shuffle_buffer_training(
+                self.delta_timestamps, full_datasets,
             )
+        else:
+            # Standard path: Subset + WeightedRandomSampler
+            train_subsets = []
+            train_weights = []
 
-        self.train_dataset = combined_train
+            for source, val_idx, full_ds in full_datasets:
+                # Rebuild train subset (same split as _load_and_split_source)
+                ep_data_index = full_ds.episode_data_index
+                num_episodes = len(ep_data_index["from"])
+                train_episodes = int(self.train_split_ratio * num_episodes)
 
-        # Build validation datasets
+                train_indices = []
+                for ep_idx in range(train_episodes):
+                    start = int(ep_data_index["from"][ep_idx])
+                    end = int(ep_data_index["to"][ep_idx])
+                    train_indices.extend(range(start, end))
+
+                train_sub = Subset(full_ds, train_indices)
+
+                # Per-source transform
+                transform = self.get_train_transform(source)
+                if transform is not None:
+                    train_sub = AugmentedDataset(train_sub, transform)
+
+                train_subsets.append(train_sub)
+                train_weights.append((source["weight"], len(train_sub)))
+
+            # Common keys for collator when blending
+            common_keys = set(self.delta_timestamps.keys())
+            common_keys.update([
+                "episode_index", "frame_index", "timestamp", "index",
+                "task_index",
+            ])
+
+            # Filter samples to common keys when blending
+            if len(train_subsets) > 1:
+                train_subsets = [
+                    KeyFilterDataset(sub, common_keys)
+                    for sub in train_subsets
+                ]
+
+            # Combine training subsets
+            if len(train_subsets) == 1:
+                combined_train = train_subsets[0]
+                self._train_sampler = None
+            else:
+                combined_train = ConcatDataset(train_subsets)
+                sample_weights = []
+                for weight, count in train_weights:
+                    sample_weights.extend([weight] * count)
+                self._train_sampler = WeightedRandomSampler(
+                    weights=sample_weights,
+                    num_samples=len(combined_train),
+                    replacement=True,
+                )
+
+            self.train_dataset = combined_train
+
+        # ---- Validation dataset (always uses old path) ----
         val_parts = []
         for source, val_idx, full_ds in full_datasets:
             if val_ts is not self.delta_timestamps:
@@ -355,6 +530,13 @@ class BlendedLeRobotDataModule(L.LightningDataModule):
                 val_parts.append(Subset(val_ds, val_idx))
             else:
                 val_parts.append(Subset(full_ds, val_idx))
+
+        # Common keys for collator when blending
+        common_keys = set(self.delta_timestamps.keys())
+        common_keys.update([
+            "episode_index", "frame_index", "timestamp", "index",
+            "task_index",
+        ])
 
         # Filter val samples to common keys when blending
         if len(val_parts) > 1:
@@ -417,6 +599,15 @@ class BlendedLeRobotDataModule(L.LightningDataModule):
         if self._train_sampler is not None:
             kwargs["shuffle"] = False
             kwargs["sampler"] = self._train_sampler
+        # ShuffleBuffer mode: workers need per-worker RNG seeding
+        if self.shuffle_buffer_capacity is not None:
+            from .lerobot_shuffle_buffer_dataset import (
+                LeRobotShuffleBufferDataset,
+            )
+            kwargs["shuffle"] = False  # Sampling is random from buffer
+            kwargs["worker_init_fn"] = (
+                LeRobotShuffleBufferDataset.worker_init_fn
+            )
         dl = ResumableDataLoader(self.train_dataset, **kwargs)
         # Apply pending state from checkpoint (if resuming)
         if hasattr(self, "_pending_dl_state") and self._pending_dl_state is not None:
