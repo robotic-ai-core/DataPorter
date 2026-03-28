@@ -301,8 +301,9 @@ class BlendedLeRobotDataModule(L.LightningDataModule):
         first_ds = full_datasets[0][2]
         vid_keys = first_ds.meta.video_keys
         if vid_keys:
-            shape = first_ds.meta.features[vid_keys[0]].get("shape", [3, 96, 96])
-            channels, height, width = shape[0], shape[1], shape[2]
+            # LeRobot metadata stores shape as (H, W, C)
+            shape = first_ds.meta.features[vid_keys[0]].get("shape", (96, 96, 3))
+            height, width, channels = shape[0], shape[1], shape[2]
         else:
             height, width, channels = 96, 96, 3
         producers = []
