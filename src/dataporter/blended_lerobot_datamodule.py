@@ -281,43 +281,6 @@ class BlendedLeRobotDataModule(L.LightningDataModule):
     # Shuffle buffer setup
     # ------------------------------------------------------------------
 
-    def _make_decode_fn(
-        self, dataset: FastLeRobotDataset,
-    ) -> Callable:
-        """Create a decode function for an AsyncProducer.
-
-        Returns a callable that decodes all video frames for an episode
-        as uint8 tensor [T, C, H, W]. Same logic as _make_frame_producer
-        but as a single-episode callable (no generator).
-
-        The decode_fn runs in a daemon thread (ProducerPool), not a
-        forked process — so it can safely reference the dataset object.
-        """
-        from lerobot.common.datasets.video_utils import decode_video_frames
-
-        def decode_episode(ep_idx: int) -> "torch.Tensor":
-            import torch as _torch
-
-            for vid_key in dataset.meta.video_keys:
-                ep_start = dataset.episode_data_index["from"][ep_idx].item()
-                ep_end = dataset.episode_data_index["to"][ep_idx].item()
-                num_frames = ep_end - ep_start
-                all_ts = [i / dataset.fps for i in range(num_frames)]
-
-                video_path = (
-                    dataset.root
-                    / dataset.meta.get_video_file_path(ep_idx, vid_key)
-                )
-                all_frames = decode_video_frames(
-                    video_path, all_ts,
-                    dataset.tolerance_s, dataset.video_backend,
-                )
-                if all_frames.dim() == 5:
-                    all_frames = all_frames.squeeze(0)
-                return (all_frames * 255).to(_torch.uint8)
-
-        return decode_episode
-
     def _setup_shuffle_buffer_training(
         self, delta_timestamps: dict, full_datasets: list,
     ) -> None:
@@ -334,7 +297,14 @@ class BlendedLeRobotDataModule(L.LightningDataModule):
 
         # Determine max_frames and frame dimensions across all sources
         max_frames = 0
-        height, width, channels = 96, 96, 3
+        # Probe frame shape from first source's metadata
+        first_ds = full_datasets[0][2]
+        vid_keys = first_ds.meta.video_keys
+        if vid_keys:
+            shape = first_ds.meta.features[vid_keys[0]].get("shape", [3, 96, 96])
+            channels, height, width = shape[0], shape[1], shape[2]
+        else:
+            height, width, channels = 96, 96, 3
         producers = []
         sources_for_dataset = []
 

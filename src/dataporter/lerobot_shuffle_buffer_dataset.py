@@ -111,12 +111,26 @@ class LeRobotShuffleBufferDataset(Dataset):
         # 1. Sample random episode from buffer
         ep_idx, frames_uint8 = self._buffer.sample(self._rng)
 
-        # 2. Map to source dataset
+        # 2. Map to source dataset (retry up to 10 times on miss)
         src_idx = self._ep_to_source.get(ep_idx)
+        _retries = getattr(self, "_retry_count", 0)
         if src_idx is None:
-            # Episode not in our training split -- sample again
-            # This can happen during buffer warmup / eviction race
-            return self.__getitem__(idx)
+            if _retries >= 10:
+                self._retry_count = 0
+                raise RuntimeError(
+                    f"Episode {ep_idx} not in any source after 10 retries. "
+                    f"Buffer may contain stale episodes."
+                )
+            self._retry_count = _retries + 1
+            ep_idx, frames_uint8 = self._buffer.sample(self._rng)
+            src_idx = self._ep_to_source.get(ep_idx)
+            if src_idx is None:
+                self._retry_count = 0
+                raise RuntimeError(
+                    f"Episode {ep_idx} not in any source. "
+                    f"Known episodes: {sorted(self._ep_to_source.keys())[:10]}..."
+                )
+        self._retry_count = 0
 
         source = self._sources[src_idx]
         dataset = source["dataset"]
@@ -190,10 +204,12 @@ class LeRobotShuffleBufferDataset(Dataset):
     def worker_init_fn(worker_id: int) -> None:
         """Seed per-worker RNG for diverse sampling across workers.
 
-        Pass as ``worker_init_fn`` to DataLoader::
-
-            DataLoader(dataset, worker_init_fn=LeRobotShuffleBufferDataset.worker_init_fn)
+        Must be passed as ``worker_init_fn`` to DataLoader to avoid
+        correlated sampling across forked workers.
         """
-        import random as _random
+        import torch as _torch
 
-        _random.seed(worker_id + 1000)
+        info = _torch.utils.data.get_worker_info()
+        if info is not None and hasattr(info.dataset, "_rng"):
+            import random as _random
+            info.dataset._rng = _random.Random(info.seed)

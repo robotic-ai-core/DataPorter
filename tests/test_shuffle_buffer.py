@@ -309,3 +309,144 @@ class TestEndToEnd:
         assert all(b["frames"].dtype == torch.uint8 for b in batches)
 
         pool.stop()
+
+    def test_multi_worker_no_stalls(self):
+        """Multi-worker DataLoader with ShuffleBuffer — uniform latency."""
+        buf = ShuffleBuffer(capacity=50, max_frames=5, channels=3, height=8, width=8)
+        for i in range(50):
+            buf.put(i, _make_frames(5, c=3, h=8, w=8))
+
+        ds = ShuffleBufferDataset(buf, epoch_length=128)
+        loader = DataLoader(
+            ds, batch_size=16, shuffle=False, num_workers=2,
+            worker_init_fn=ShuffleBufferDataset.worker_init_fn,
+        )
+
+        total = sum(b["frames"].shape[0] for b in loader)
+        assert total == 128
+
+
+# ---------------------------------------------------------------------------
+# Throughput benchmark
+# ---------------------------------------------------------------------------
+
+class TestThroughput:
+
+    def test_uniform_sample_latency(self):
+        """Every sample() call should be fast — no slow outliers."""
+        buf = ShuffleBuffer(capacity=200, max_frames=10, channels=3, height=8, width=8)
+        for i in range(200):
+            buf.put(i, _make_frames(10, c=3, h=8, w=8))
+
+        rng = random.Random(42)
+        times = []
+        for _ in range(500):
+            t0 = time.perf_counter()
+            buf.sample(rng)
+            times.append((time.perf_counter() - t0) * 1e6)
+
+        avg = sum(times) / len(times)
+        p99 = sorted(times)[int(len(times) * 0.99)]
+        assert p99 < avg * 20, f"avg={avg:.0f}us, p99={p99:.0f}us"
+
+    def test_put_latency_vs_decode(self):
+        """put() should be negligible compared to typical decode time."""
+        buf = ShuffleBuffer(capacity=50, max_frames=30, channels=3, height=96, width=96)
+        frames = _make_frames(30, c=3, h=96, w=96)
+
+        times = []
+        for i in range(100):
+            t0 = time.perf_counter()
+            buf.put(i, frames)
+            times.append((time.perf_counter() - t0) * 1e6)
+
+        avg = sum(times) / len(times)
+        decode_us = 50_000  # 50ms
+        pct = avg / decode_us * 100
+        assert pct < 5, f"put() is {pct:.1f}% of decode — GIL contention risk"
+
+
+# ---------------------------------------------------------------------------
+# Randomness validation
+# ---------------------------------------------------------------------------
+
+class TestRandomness:
+
+    def test_multi_worker_sample_diversity(self):
+        """Different workers should sample different episodes."""
+        buf = ShuffleBuffer(capacity=50, max_frames=3, channels=3, height=8, width=8)
+        for i in range(50):
+            buf.put(i, _make_frames(3, c=3, h=8, w=8))
+
+        ds = ShuffleBufferDataset(buf, epoch_length=200)
+        loader = DataLoader(
+            ds, batch_size=1, shuffle=False, num_workers=2,
+            worker_init_fn=ShuffleBufferDataset.worker_init_fn,
+        )
+
+        episodes = []
+        for batch in loader:
+            episodes.append(int(batch["episode_index"]))
+
+        unique = len(set(episodes))
+        assert unique >= 20, f"Only {unique} unique episodes — workers may be correlated"
+
+    def test_blend_ratio_proportional(self):
+        """Weighted producers fill buffer at correct blend ratio."""
+        buf = ShuffleBuffer(capacity=100, max_frames=3, channels=3, height=8, width=8)
+
+        producer_a = AsyncProducer("A", _synthetic_decode, list(range(50)), weight=3.0)
+        producer_b = AsyncProducer("B", _synthetic_decode, list(range(100, 150)), weight=1.0)
+
+        pool = ProducerPool(buf, producers=[producer_a, producer_b], total_workers=2, warmup_target=80)
+        pool.start()
+        pool.wait_for_warmup(timeout=30)
+        time.sleep(0.5)
+        pool.stop()
+
+        keys = buf.keys()
+        a_count = sum(1 for k in keys if k < 50)
+        b_count = sum(1 for k in keys if k >= 100)
+        total = a_count + b_count
+
+        if total > 0:
+            a_ratio = a_count / total
+            assert 0.5 < a_ratio < 0.95, (
+                f"Blend: A={a_ratio:.0%} (expected ~75%). A={a_count}, B={b_count}"
+            )
+
+    def test_sample_covers_buffer(self):
+        """Repeated sampling should cover most of the buffer contents."""
+        buf = ShuffleBuffer(capacity=30, max_frames=3, channels=3, height=8, width=8)
+        for i in range(30):
+            buf.put(i, _make_frames(3, c=3, h=8, w=8))
+
+        rng = random.Random(42)
+        seen = set()
+        for _ in range(500):
+            key, _ = buf.sample(rng)
+            seen.add(key)
+
+        coverage = len(seen) / 30
+        assert coverage >= 0.8, f"Only {coverage:.0%} buffer coverage"
+
+
+# ---------------------------------------------------------------------------
+# Error handling
+# ---------------------------------------------------------------------------
+
+class TestErrorHandling:
+
+    def test_both_configs_and_producers_raises(self):
+        buf = ShuffleBuffer(capacity=10, max_frames=3, channels=3, height=8, width=8)
+        from dataporter.producer_pool import ProducerConfig
+        config = ProducerConfig("test", "repo", "/tmp", [0], weight=1.0)
+        producer = AsyncProducer("test", _synthetic_decode, [0], weight=1.0)
+
+        with pytest.raises(ValueError, match="Cannot specify both"):
+            ProducerPool(buf, configs=[config], producers=[producer])
+
+    def test_neither_configs_nor_producers_raises(self):
+        buf = ShuffleBuffer(capacity=10, max_frames=3, channels=3, height=8, width=8)
+        with pytest.raises(ValueError, match="Either configs or producers"):
+            ProducerPool(buf)

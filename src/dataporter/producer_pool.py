@@ -49,7 +49,6 @@ class ProducerConfig:
     weight: float = 1.0
     seed: int = 42
     tolerance_s: float | None = None
-    delta_timestamps_keys: list[str] | None = None
 
 
 # Keep AsyncProducer as a convenience wrapper for thread-based usage
@@ -134,18 +133,23 @@ def _make_child_decode_fn(config: ProducerConfig) -> Callable[[int], torch.Tenso
 
         from lerobot.common.datasets.video_utils import decode_video_frames
 
-        for vid_key in ds.meta.video_keys:
-            ep_start = ds.episode_data_index["from"][ep_idx].item()
-            ep_end = ds.episode_data_index["to"][ep_idx].item()
-            num_frames = ep_end - ep_start
-            all_ts = [i / ds.fps for i in range(num_frames)]
-            video_path = ds.root / ds.meta.get_video_file_path(ep_idx, vid_key)
-            all_frames = decode_video_frames(
-                video_path, all_ts, ds.tolerance_s, ds.video_backend,
+        if not ds.meta.video_keys:
+            raise RuntimeError(
+                f"Dataset {config.source_name} has no video keys — "
+                "cannot decode frames"
             )
-            if all_frames.dim() == 5:
-                all_frames = all_frames.squeeze(0)
-            return (all_frames * 255).to(torch.uint8)
+        vid_key = ds.meta.video_keys[0]
+        ep_start = ds.episode_data_index["from"][ep_idx].item()
+        ep_end = ds.episode_data_index["to"][ep_idx].item()
+        num_frames = ep_end - ep_start
+        all_ts = [i / ds.fps for i in range(num_frames)]
+        video_path = ds.root / ds.meta.get_video_file_path(ep_idx, vid_key)
+        all_frames = decode_video_frames(
+            video_path, all_ts, ds.tolerance_s, ds.video_backend,
+        )
+        if all_frames.dim() == 5:
+            all_frames = all_frames.squeeze(0)
+        return (all_frames * 255).to(torch.uint8)
 
     return decode
 
@@ -312,6 +316,8 @@ class ProducerPool:
     ):
         if configs is None and producers is None:
             raise ValueError("Either configs or producers must be provided")
+        if configs is not None and producers is not None:
+            raise ValueError("Cannot specify both configs and producers")
 
         self._buffer = buffer
         self._configs = configs

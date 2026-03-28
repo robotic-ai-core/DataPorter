@@ -67,10 +67,10 @@ class ShuffleBufferDataset(Dataset):
     def worker_init_fn(worker_id: int) -> None:
         """Seed per-worker RNG for diverse sampling across workers.
 
-        Pass as ``worker_init_fn`` to DataLoader::
-
-            DataLoader(dataset, worker_init_fn=ShuffleBufferDataset.worker_init_fn)
+        Must be passed as ``worker_init_fn`` to DataLoader to avoid
+        correlated sampling across forked workers (all inherit the
+        same ``_rng`` state from the parent process).
         """
-        import random as _random
-
-        _random.seed(worker_id + 1000)
+        info = torch.utils.data.get_worker_info()
+        if info is not None and hasattr(info.dataset, "_rng"):
+            info.dataset._rng = random.Random(info.seed)
