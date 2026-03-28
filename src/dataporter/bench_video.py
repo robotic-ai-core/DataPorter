@@ -199,6 +199,14 @@ def print_video_report(results: dict[str, Any]) -> None:
         print(f"    data_pct:     {results['data_pct_est']:.1f}%")
         print(f"    step time:    {results['step_time_est_ms']:.0f} ms")
 
+    # ShuffleBuffer results (if present)
+    if "sb_put_avg_us" in results:
+        print(f"\n  ShuffleBuffer:")
+        print(f"    put:          {results['sb_put_avg_us']:.1f} us (p99: {results['sb_put_p99_us']:.1f} us)")
+        print(f"    sample:       {results['sb_sample_avg_us']:.1f} us (p99: {results['sb_sample_p99_us']:.1f} us)")
+        print(f"    put_pct:      {results['sb_put_pct_of_decode']:.1f}% of decode time")
+        print(f"    verdict:      {results['sb_gil_verdict']}")
+
     if results.get("bottlenecks"):
         print(f"\n  {'!'*50}")
         print("  BOTTLENECKS DETECTED:")
@@ -207,3 +215,136 @@ def print_video_report(results: dict[str, Any]) -> None:
         print(f"  {'!'*50}")
 
     print(f"\n{'='*55}")
+
+
+# ---------------------------------------------------------------------------
+# ShuffleBuffer + GIL contention benchmark
+# ---------------------------------------------------------------------------
+
+
+def benchmark_shuffle_buffer(
+    capacity: int = 200,
+    max_frames: int = 30,
+    channels: int = 3,
+    height: int = 96,
+    width: int = 96,
+    simulated_decode_ms: float = 50.0,
+) -> dict[str, Any]:
+    """Benchmark ShuffleBuffer put/sample latency and GIL contention risk.
+
+    Measures:
+    - put() latency: time to copy frames into shared memory
+    - sample() latency: time to read random frames from shared memory
+    - put as % of simulated decode time: if >5%, GIL contention is a concern
+
+    Args:
+        capacity: Buffer capacity.
+        max_frames: Max frames per episode.
+        channels: Image channels.
+        height: Frame height.
+        width: Frame width.
+        simulated_decode_ms: Assumed decode time per episode for ratio calc.
+    """
+    from .shuffle_buffer import ShuffleBuffer
+    import random
+
+    buf = ShuffleBuffer(
+        capacity=capacity, max_frames=max_frames,
+        channels=channels, height=height, width=width,
+    )
+
+    frame_bytes = max_frames * channels * height * width
+    results: dict[str, Any] = {
+        "frame_bytes": frame_bytes,
+        "frame_mb": frame_bytes / 1e6,
+    }
+
+    # Pre-generate frames (exclude alloc from timing)
+    frames = torch.randint(0, 255, (max_frames, channels, height, width), dtype=torch.uint8)
+
+    # --- put() benchmark ---
+    put_times = []
+    for i in range(min(500, capacity * 2)):
+        t0 = time.perf_counter()
+        buf.put(i % (capacity * 10), frames)
+        put_times.append((time.perf_counter() - t0) * 1e6)
+
+    sorted_put = sorted(put_times)
+    results["sb_put_avg_us"] = sum(put_times) / len(put_times)
+    results["sb_put_p50_us"] = sorted_put[len(sorted_put) // 2]
+    results["sb_put_p99_us"] = sorted_put[int(len(sorted_put) * 0.99)]
+
+    # --- sample() benchmark ---
+    rng = random.Random(42)
+    sample_times = []
+    for _ in range(1000):
+        t0 = time.perf_counter()
+        buf.sample(rng)
+        sample_times.append((time.perf_counter() - t0) * 1e6)
+
+    sorted_sample = sorted(sample_times)
+    results["sb_sample_avg_us"] = sum(sample_times) / len(sample_times)
+    results["sb_sample_p50_us"] = sorted_sample[len(sorted_sample) // 2]
+    results["sb_sample_p99_us"] = sorted_sample[int(len(sorted_sample) * 0.99)]
+
+    # --- GIL contention analysis ---
+    decode_us = simulated_decode_ms * 1000
+    put_pct = results["sb_put_avg_us"] / decode_us * 100
+    results["sb_put_pct_of_decode"] = put_pct
+
+    if put_pct < 2:
+        results["sb_gil_verdict"] = "OK — put() is negligible vs decode"
+    elif put_pct < 10:
+        results["sb_gil_verdict"] = "WATCH — put() is measurable, monitor at scale"
+    else:
+        results["sb_gil_verdict"] = (
+            "WARNING — put() takes {:.0f}% of decode time. "
+            "Consider separating decode and buffer write into separate processes."
+        ).format(put_pct)
+
+    # --- Resolution scaling ---
+    results["resolutions"] = {}
+    for label, h, w in [("96x96", 96, 96), ("224x224", 224, 224), ("256x256", 256, 256)]:
+        test_frames = torch.randint(0, 255, (max_frames, channels, h, w), dtype=torch.uint8)
+        test_buf = ShuffleBuffer(capacity=10, max_frames=max_frames, channels=channels, height=h, width=w)
+        times = []
+        for i in range(50):
+            t0 = time.perf_counter()
+            test_buf.put(i, test_frames)
+            times.append((time.perf_counter() - t0) * 1e6)
+        avg = sum(times) / len(times)
+        mb = max_frames * channels * h * w / 1e6
+        pct = avg / decode_us * 100
+        results["resolutions"][label] = {
+            "put_avg_us": avg,
+            "frame_mb": mb,
+            "put_pct_of_decode": pct,
+        }
+
+    return results
+
+
+def print_shuffle_buffer_report(results: dict[str, Any]) -> None:
+    """Print ShuffleBuffer benchmark report."""
+    print(f"\n{'='*60}")
+    print("ShuffleBuffer GIL Contention Analysis")
+    print(f"{'='*60}")
+
+    print(f"\n  Frame size:     {results['frame_mb']:.2f} MB/episode")
+    print(f"\n  put() latency:")
+    print(f"    avg:          {results['sb_put_avg_us']:.1f} us")
+    print(f"    p50:          {results['sb_put_p50_us']:.1f} us")
+    print(f"    p99:          {results['sb_put_p99_us']:.1f} us")
+    print(f"\n  sample() latency:")
+    print(f"    avg:          {results['sb_sample_avg_us']:.1f} us")
+    print(f"    p99:          {results['sb_sample_p99_us']:.1f} us")
+    print(f"\n  GIL contention (vs {results['sb_put_pct_of_decode']:.1f}% of 50ms decode):")
+    print(f"    Verdict:      {results['sb_gil_verdict']}")
+
+    print(f"\n  Resolution scaling:")
+    print(f"    {'Resolution':<12} {'put (us)':<12} {'Frame (MB)':<12} {'% of decode':<12}")
+    print(f"    {'-'*48}")
+    for label, data in results["resolutions"].items():
+        print(f"    {label:<12} {data['put_avg_us']:<12.1f} {data['frame_mb']:<12.2f} {data['put_pct_of_decode']:<12.1f}%")
+
+    print(f"\n{'='*60}")
