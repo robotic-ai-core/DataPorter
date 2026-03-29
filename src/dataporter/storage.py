@@ -86,6 +86,8 @@ class ShardStorage:
         refresh_interval: Seconds between directory rescans.
         max_shards: Auto-evict oldest shards when count exceeded.
         max_cache_gb: Auto-evict oldest shards when total size exceeded (GB).
+            This is the size of processed files on disk (e.g., compressed
+            Parquet text shards), not the raw HF dataset size.
             Both limits can be set — eviction triggers when either is exceeded.
     """
 
