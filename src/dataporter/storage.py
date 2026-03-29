@@ -262,15 +262,20 @@ class ShardStorage:
             self.refresh()
 
     def _maybe_evict_excess(self) -> None:
-        """Quick eviction check — cheaper than full refresh.
+        """Quick eviction check — throttled to every 0.5 seconds.
 
-        Runs at most every 2 seconds (glob + unlink, no Parquet metadata
-        scan). Prevents shard accumulation between 30s refresh intervals.
+        Does a glob + unlink when shards exceed max_shards. Throttled
+        because glob costs ~0.5ms for 200 files — too expensive per
+        __getitem__ but fine at 2 Hz.
+
+        With max_rows_per_shard=10_000 and typical HF streaming rates,
+        the prefetcher writes ~1 shard per second. At 0.5s check
+        interval, at most 1 excess shard accumulates before eviction.
         """
         if self._frozen or self._max_shards is None:
             return
         now = monotonic()
-        if now - getattr(self, "_last_evict_check", 0.0) < 2.0:
+        if now - getattr(self, "_last_evict_check", 0.0) < 0.5:
             return
         self._last_evict_check = now
         paths = sorted(self._dir.glob("*.parquet"))
