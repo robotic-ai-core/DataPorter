@@ -80,6 +80,38 @@ class TestShardStorage:
         assert s.shard_count == 5
         assert not (tmp_path / "shard_000000.parquet").exists()
 
+    def test_eviction_keeps_up_with_fast_writer(self, tmp_path):
+        """Shards written faster than refresh interval are still evicted.
+
+        Regression test: previously, shards accumulated unbounded between
+        30s refresh intervals because eviction only ran during refresh().
+        With _maybe_evict_excess(), excess shards are cleaned up on get().
+        """
+        _write_shards(tmp_path, n=5, docs_per_shard=5)
+        s = ShardStorage(tmp_path, refresh_interval=60, max_shards=5)
+        assert s.shard_count == 5
+
+        # Simulate fast writer (prefetcher writes 20 more shards between refreshes)
+        for i in range(5, 25):
+            _write_text_shard(
+                tmp_path / f"shard_{i:06d}.parquet",
+                [f"fast_doc_{j}" for j in range(5)],
+            )
+
+        # 25 shards on disk, but max_shards=5
+        on_disk = len(list(tmp_path.glob("*.parquet")))
+        assert on_disk == 25  # no eviction yet (refresh interval not reached)
+
+        # A single get() should trigger excess eviction
+        s.get(0)
+
+        # Should be back near max_shards
+        on_disk_after = len(list(tmp_path.glob("*.parquet")))
+        assert on_disk_after <= 7, (  # max_shards + small tolerance
+            f"Eviction didn't keep up: {on_disk_after} shards on disk "
+            f"(expected <= 7 with max_shards=5)"
+        )
+
     def test_wraps_index(self, tmp_path):
         _write_shards(tmp_path, n=1, docs_per_shard=5)
         s = ShardStorage(tmp_path)

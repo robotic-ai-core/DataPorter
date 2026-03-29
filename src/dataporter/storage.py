@@ -115,6 +115,7 @@ class ShardStorage:
 
     def get(self, idx: int) -> dict[str, str] | None:
         self._maybe_refresh()
+        self._maybe_evict_excess()
         if self._total_rows == 0:
             return None
         idx = idx % self._total_rows
@@ -259,6 +260,26 @@ class ShardStorage:
     def _maybe_refresh(self) -> None:
         if monotonic() - self._last_refresh >= self._refresh_interval:
             self.refresh()
+
+    def _maybe_evict_excess(self) -> None:
+        """Quick eviction check — cheaper than full refresh.
+
+        Runs at most every 2 seconds (glob + unlink, no Parquet metadata
+        scan). Prevents shard accumulation between 30s refresh intervals.
+        """
+        if self._frozen or self._max_shards is None:
+            return
+        now = monotonic()
+        if now - getattr(self, "_last_evict_check", 0.0) < 2.0:
+            return
+        self._last_evict_check = now
+        paths = sorted(self._dir.glob("*.parquet"))
+        if len(paths) > self._max_shards:
+            for p in paths[: len(paths) - self._max_shards]:
+                try:
+                    p.unlink()
+                except (FileNotFoundError, OSError):
+                    pass
 
     def _locate(self, idx: int) -> tuple[int, int]:
         shard_idx = bisect_right(self._cumulative_rows, idx)
