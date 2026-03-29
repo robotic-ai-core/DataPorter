@@ -41,8 +41,8 @@ FAKE_META = {
 }
 
 
-def _fake_meta_loader(repo_id: str, output_dir: Path) -> dict:
-    meta_dir = output_dir / "meta"
+def _fake_meta_loader(repo_id: str, cache_dir: Path) -> dict:
+    meta_dir = cache_dir / "meta"
     meta_dir.mkdir(parents=True, exist_ok=True)
     (meta_dir / "info.json").write_text(json.dumps(FAKE_META))
     return FAKE_META
@@ -98,8 +98,8 @@ def _make_fake_snapshot_fn(source_dir: Path):
     """
     import fnmatch
 
-    def snapshot_fn(repo_id, output_dir, allow_patterns=None, ignore_patterns=None):
-        output_dir = Path(output_dir)
+    def snapshot_fn(repo_id, cache_dir, allow_patterns=None, ignore_patterns=None):
+        cache_dir = Path(cache_dir)
         for src_file in source_dir.rglob("*"):
             if not src_file.is_file():
                 continue
@@ -115,7 +115,7 @@ def _make_fake_snapshot_fn(source_dir: Path):
                 if any(fnmatch.fnmatch(rel, p) for p in ignore_patterns):
                     continue
 
-            dst = output_dir / rel
+            dst = cache_dir / rel
             dst.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(src_file, dst)
 
@@ -130,12 +130,12 @@ class TestLeRobotPrefetcher:
 
     def test_auto_detects_video_keys(self, tmp_path):
         source_dir = tmp_path / "source"
-        output_dir = tmp_path / "output"
+        cache_dir = tmp_path / "output"
         _populate_fake_dataset(source_dir, n_episodes=3)
 
         prefetcher = LeRobotPrefetcher(
             repo_id="test/dataset",
-            output_dir=output_dir,
+            cache_dir=cache_dir,
             min_shards=1,
             max_shards=100,
             _snapshot_fn=_make_fake_snapshot_fn(source_dir),
@@ -146,12 +146,12 @@ class TestLeRobotPrefetcher:
 
     def test_bulk_downloads_all_episodes(self, tmp_path):
         source_dir = tmp_path / "source"
-        output_dir = tmp_path / "output"
+        cache_dir = tmp_path / "output"
         _populate_fake_dataset(source_dir, n_episodes=5)
 
         prefetcher = LeRobotPrefetcher(
             repo_id="test/dataset",
-            output_dir=output_dir,
+            cache_dir=cache_dir,
             episode_indices=[0, 1, 2, 3, 4],
             min_shards=2,
             max_shards=100,
@@ -164,27 +164,27 @@ class TestLeRobotPrefetcher:
         prefetcher.stop()
 
         # Parquet files downloaded
-        parquets = list(output_dir.rglob("episode_*.parquet"))
+        parquets = list(cache_dir.rglob("episode_*.parquet"))
         assert len(parquets) == 5
 
         # Video files downloaded
-        videos = list(output_dir.rglob("*.mp4"))
+        videos = list(cache_dir.rglob("*.mp4"))
         assert len(videos) == 5
 
         # Each episode has both parquet + video
         for pq_file in parquets:
             ep_name = pq_file.stem
-            video_files = list(output_dir.rglob(f"{ep_name}.mp4"))
+            video_files = list(cache_dir.rglob(f"{ep_name}.mp4"))
             assert len(video_files) >= 1, f"Missing video for {ep_name}"
 
     def test_specific_episodes(self, tmp_path):
         source_dir = tmp_path / "source"
-        output_dir = tmp_path / "output"
+        cache_dir = tmp_path / "output"
         _populate_fake_dataset(source_dir, n_episodes=10)
 
         prefetcher = LeRobotPrefetcher(
             repo_id="test/dataset",
-            output_dir=output_dir,
+            cache_dir=cache_dir,
             episode_indices=[2, 5, 7],
             min_shards=1,
             max_shards=100,
@@ -196,14 +196,14 @@ class TestLeRobotPrefetcher:
         time.sleep(0.5)
         prefetcher.stop()
 
-        parquets = list(output_dir.rglob("episode_*.parquet"))
+        parquets = list(cache_dir.rglob("episode_*.parquet"))
         ep_indices = {int(p.stem.split("_")[1]) for p in parquets}
         assert ep_indices == {2, 5, 7}
 
     def test_episode_paths(self, tmp_path):
         prefetcher = LeRobotPrefetcher(
             repo_id="test/dataset",
-            output_dir=tmp_path,
+            cache_dir=tmp_path,
             _meta_loader=_fake_meta_loader,
         )
 
@@ -217,7 +217,7 @@ class TestLeRobotPrefetcher:
     def test_episode_patterns(self, tmp_path):
         prefetcher = LeRobotPrefetcher(
             repo_id="test/dataset",
-            output_dir=tmp_path,
+            cache_dir=tmp_path,
             _meta_loader=_fake_meta_loader,
         )
 
@@ -234,15 +234,15 @@ class TestLeRobotPrefetcher:
             "action": {"dtype": "float32", "shape": [2]},
         }}
 
-        def loader(repo_id, output_dir):
-            meta_dir = output_dir / "meta"
+        def loader(repo_id, cache_dir):
+            meta_dir = cache_dir / "meta"
             meta_dir.mkdir(parents=True, exist_ok=True)
             (meta_dir / "info.json").write_text(json.dumps(meta_no_video))
             return meta_no_video
 
         prefetcher = LeRobotPrefetcher(
             repo_id="test/no-video",
-            output_dir=tmp_path,
+            cache_dir=tmp_path,
             _meta_loader=loader,
         )
 
@@ -253,12 +253,12 @@ class TestLeRobotPrefetcher:
 
     def test_shard_count(self, tmp_path):
         source_dir = tmp_path / "source"
-        output_dir = tmp_path / "output"
+        cache_dir = tmp_path / "output"
         _populate_fake_dataset(source_dir, n_episodes=3)
 
         prefetcher = LeRobotPrefetcher(
             repo_id="test/dataset",
-            output_dir=output_dir,
+            cache_dir=cache_dir,
             episode_indices=[0, 1, 2],
             min_shards=3,
             max_shards=100,
@@ -274,21 +274,21 @@ class TestLeRobotPrefetcher:
     def test_download_all_when_no_indices(self, tmp_path):
         """Without episode_indices, downloads everything."""
         source_dir = tmp_path / "source"
-        output_dir = tmp_path / "output"
+        cache_dir = tmp_path / "output"
         _populate_fake_dataset(source_dir, n_episodes=5)
 
         # Update meta to reflect 5 episodes
         meta = {**FAKE_META, "total_episodes": 5}
 
-        def loader(repo_id, output_dir):
-            meta_dir = output_dir / "meta"
+        def loader(repo_id, cache_dir):
+            meta_dir = cache_dir / "meta"
             meta_dir.mkdir(parents=True, exist_ok=True)
             (meta_dir / "info.json").write_text(json.dumps(meta))
             return meta
 
         prefetcher = LeRobotPrefetcher(
             repo_id="test/dataset",
-            output_dir=output_dir,
+            cache_dir=cache_dir,
             min_shards=1,
             _snapshot_fn=_make_fake_snapshot_fn(source_dir),
             _meta_loader=loader,
@@ -297,30 +297,30 @@ class TestLeRobotPrefetcher:
         prefetcher.wait_for_min(timeout=30)
         prefetcher.stop()
 
-        parquets = list(output_dir.rglob("episode_*.parquet"))
+        parquets = list(cache_dir.rglob("episode_*.parquet"))
         assert len(parquets) == 5
 
     def test_snapshot_fn_receives_patterns(self, tmp_path):
         """Verify that specific episodes use allow_patterns."""
         calls = []
 
-        def tracking_snapshot(repo_id, output_dir, allow_patterns=None, ignore_patterns=None):
+        def tracking_snapshot(repo_id, cache_dir, allow_patterns=None, ignore_patterns=None):
             calls.append({
                 "repo_id": repo_id,
                 "allow_patterns": allow_patterns,
             })
             # Create dummy files so shard_count works
-            output_dir = Path(output_dir)
+            cache_dir = Path(cache_dir)
             for p in (allow_patterns or []):
                 if p.endswith(".parquet"):
-                    f = output_dir / p
+                    f = cache_dir / p
                     f.parent.mkdir(parents=True, exist_ok=True)
                     schema = pa.schema([("x", pa.int64())])
                     pq.write_table(pa.table({"x": [1]}, schema=schema), f)
 
         prefetcher = LeRobotPrefetcher(
             repo_id="test/dataset",
-            output_dir=tmp_path,
+            cache_dir=tmp_path,
             episode_indices=[0, 3],
             min_shards=1,
             _snapshot_fn=tracking_snapshot,
@@ -340,14 +340,14 @@ class TestLeRobotPrefetcher:
         """Without episode_indices, snapshot_download gets no allow_patterns."""
         calls = []
 
-        def tracking_snapshot(repo_id, output_dir, allow_patterns=None, ignore_patterns=None):
+        def tracking_snapshot(repo_id, cache_dir, allow_patterns=None, ignore_patterns=None):
             calls.append({"allow_patterns": allow_patterns})
 
         meta = {**FAKE_META, "total_episodes": 3}
 
         prefetcher = LeRobotPrefetcher(
             repo_id="test/dataset",
-            output_dir=tmp_path,
+            cache_dir=tmp_path,
             min_shards=1,
             _snapshot_fn=tracking_snapshot,
             _meta_loader=lambda r, d: meta,

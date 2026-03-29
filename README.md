@@ -42,7 +42,7 @@ from dataporter import TextPrefetcher, RawTextSource, TransformableDataset
 
 # Background process streams HF docs to local Parquet shards
 prefetcher = TextPrefetcher(
-    output_dir="/data/cache",
+    cache_dir="/data/cache",
     dataset="HuggingFaceTB/smollm-corpus",
     data_dir="fineweb-edu-dedup",
     offsets=[0, 2_000_000],       # parallel streams for diversity
@@ -85,7 +85,7 @@ from dataporter import LeRobotPrefetcher
 # Downloads entire dataset via snapshot_download (one batched HF API call)
 prefetcher = LeRobotPrefetcher(
     repo_id="lerobot/pusht",
-    output_dir="/data/pusht",
+    cache_dir="/data/pusht",
     min_shards=50,
 )
 prefetcher.start()

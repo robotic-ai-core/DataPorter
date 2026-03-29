@@ -126,7 +126,7 @@ class TextPrefetcher(BasePrefetcher):
     offset. Streaming only stops when stop() is called.
 
     Args:
-        output_dir: Local directory for Parquet shards.
+        cache_dir: Local directory for Parquet shards.
         dataset: HuggingFace dataset ID.
         data_dir: Subdirectory within the dataset.
         text_field: Column name for text.
@@ -151,7 +151,7 @@ class TextPrefetcher(BasePrefetcher):
 
     def __init__(
         self,
-        output_dir: str | Path,
+        cache_dir: str | Path,
         dataset: str = "",
         data_dir: str | None = None,
         text_field: str = "text",
@@ -166,7 +166,7 @@ class TextPrefetcher(BasePrefetcher):
         _dataset_factory: Callable | None = None,
     ):
         super().__init__(
-            output_dir=output_dir,
+            cache_dir=cache_dir,
             min_shards=min_shards,
             max_shards=None,  # prefetcher never evicts — reader handles it
             seed=seed,
@@ -185,7 +185,7 @@ class TextPrefetcher(BasePrefetcher):
 
     def _get_init_kwargs(self) -> dict[str, Any]:
         return dict(
-            output_dir=str(self._output_dir),
+            cache_dir=str(self._cache_dir),
             dataset=self._dataset,
             data_dir=self._data_dir,
             text_field=self._text_field,

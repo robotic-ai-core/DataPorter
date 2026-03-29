@@ -7,7 +7,7 @@ For TB-scale datasets: downloads in batches via ``allow_patterns``,
 with eviction to stay within disk budget.
 
 On-disk layout mirrors HuggingFace Hub:
-    output_dir/
+    cache_dir/
     ├── meta/info.json, episodes.jsonl, ...
     ├── data/chunk-000/episode_000000.parquet
     └── videos/chunk-000/observation.images.laptop/episode_000000.mp4
@@ -76,7 +76,7 @@ class LeRobotPrefetcher(BasePrefetcher):
 
     Args:
         repo_id: HuggingFace dataset repo (e.g. "lerobot/pusht").
-        output_dir: Local directory to mirror the dataset structure.
+        cache_dir: Local directory to mirror the dataset structure.
         revision: Dataset revision/version. Defaults to "v2.1".
         episode_indices: Specific episodes to download. None = all.
         min_shards: Min episodes ready before training starts.
@@ -91,7 +91,7 @@ class LeRobotPrefetcher(BasePrefetcher):
     def __init__(
         self,
         repo_id: str,
-        output_dir: str | Path,
+        cache_dir: str | Path,
         revision: str | None = None,
         episode_indices: list[int] | None = None,
         min_shards: int = 5,
@@ -103,7 +103,7 @@ class LeRobotPrefetcher(BasePrefetcher):
         _meta_loader: Callable[[str, Path], dict] | None = None,
     ):
         super().__init__(
-            output_dir=output_dir,
+            cache_dir=cache_dir,
             min_shards=min_shards,
             max_shards=max_shards,
             eviction=eviction,
@@ -122,7 +122,7 @@ class LeRobotPrefetcher(BasePrefetcher):
     def _get_init_kwargs(self) -> dict[str, Any]:
         return dict(
             repo_id=self._repo_id,
-            output_dir=str(self._output_dir),
+            cache_dir=str(self._cache_dir),
             revision=self._revision,
             episode_indices=self._episode_indices,
             min_shards=self._min_shards,
@@ -137,10 +137,10 @@ class LeRobotPrefetcher(BasePrefetcher):
             return
         while self.shard_count > self._max_shards:
             evict_shard(
-                self._output_dir,
+                self._cache_dir,
                 self._eviction,
                 rng,
-                companion_dir=self._output_dir,
+                companion_dir=self._cache_dir,
                 glob_pattern=self._shard_glob,
             )
 
@@ -152,13 +152,13 @@ class LeRobotPrefetcher(BasePrefetcher):
         if self._meta is not None:
             return self._meta
         if self._meta_loader is not None:
-            self._meta = self._meta_loader(self._repo_id, self._output_dir)
+            self._meta = self._meta_loader(self._repo_id, self._cache_dir)
             return self._meta
 
         from lerobot.common.datasets.lerobot_dataset import LeRobotDatasetMetadata
 
         meta = LeRobotDatasetMetadata(
-            self._repo_id, root=self._output_dir, revision=self._revision
+            self._repo_id, root=self._cache_dir, revision=self._revision
         )
         self._meta = meta.info
         return self._meta
@@ -224,7 +224,7 @@ class LeRobotPrefetcher(BasePrefetcher):
         if self._snapshot_fn is not None:
             self._snapshot_fn(
                 self._repo_id,
-                self._output_dir,
+                self._cache_dir,
                 allow_patterns=allow_patterns,
                 ignore_patterns=ignore_patterns,
             )
@@ -232,7 +232,7 @@ class LeRobotPrefetcher(BasePrefetcher):
             _snapshot_with_retry(
                 self._repo_id,
                 self._revision,
-                self._output_dir,
+                self._cache_dir,
                 allow_patterns=allow_patterns,
                 ignore_patterns=ignore_patterns,
             )

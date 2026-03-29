@@ -89,7 +89,7 @@ class TestTextPrefetcher:
         docs = _make_text_docs(200)
         prefetcher = TextPrefetcher(
             dataset="test",
-            output_dir=tmp_path,
+            cache_dir=tmp_path,
             min_shards=2,
             max_rows_per_shard=50,
             offsets=[0],
@@ -110,7 +110,7 @@ class TestTextPrefetcher:
         docs = _make_text_docs(500)
         prefetcher = TextPrefetcher(
             dataset="test",
-            output_dir=tmp_path,
+            cache_dir=tmp_path,
             min_shards=3,
             max_rows_per_shard=50,
             offsets=[0],
@@ -133,7 +133,7 @@ class TestTextPrefetcher:
 
         prefetcher = TextPrefetcher(
             dataset="test",
-            output_dir=tmp_path,
+            cache_dir=tmp_path,
             min_shards=1,
             max_rows_per_shard=1000,
             offsets=[0, 50],
@@ -152,7 +152,7 @@ class TestTextPrefetcher:
         """Prefetcher only writes — eviction is the reader's job."""
         docs = _make_text_docs(200)
         prefetcher = TextPrefetcher(
-            output_dir=tmp_path,
+            cache_dir=tmp_path,
             dataset="test",
             min_shards=1,
             max_rows_per_shard=20,
@@ -169,14 +169,14 @@ class TestTextPrefetcher:
         assert prefetcher.shard_count >= 5
 
     def test_stop_without_start(self, tmp_path):
-        prefetcher = TextPrefetcher(dataset="test", output_dir=tmp_path)
+        prefetcher = TextPrefetcher(dataset="test", cache_dir=tmp_path)
         prefetcher.stop()  # should not raise
 
     def test_double_start_raises(self, tmp_path):
         docs = _make_text_docs(1000)
         prefetcher = TextPrefetcher(
             dataset="test",
-            output_dir=tmp_path,
+            cache_dir=tmp_path,
             min_shards=1,
             max_rows_per_shard=100_000,
             offsets=[0],
@@ -195,7 +195,7 @@ class TestTextPrefetcher:
 
         prefetcher = TextPrefetcher(
             dataset="test",
-            output_dir=tmp_path,
+            cache_dir=tmp_path,
             min_shards=1,
             max_restarts=0,
             _dataset_factory=failing_factory,
@@ -216,7 +216,7 @@ class TestTextPrefetcher:
         docs = _make_text_docs(50)
         prefetcher = TextPrefetcher(
             dataset="test",
-            output_dir=tmp_path,
+            cache_dir=tmp_path,
             min_shards=3,
             offsets=[0],
             max_restarts=0,
@@ -232,7 +232,7 @@ class TestTextPrefetcher:
         docs = [{"text": ""}, {"text": "   "}, {"text": "real doc " * 10}] * 100
         prefetcher = TextPrefetcher(
             dataset="test",
-            output_dir=tmp_path,
+            cache_dir=tmp_path,
             min_shards=1,
             max_rows_per_shard=50,
             offsets=[0],
@@ -375,7 +375,7 @@ class TestEndToEnd:
 
         prefetcher = TextPrefetcher(
             dataset="test",
-            output_dir=tmp_path,
+            cache_dir=tmp_path,
             min_shards=3,
             max_rows_per_shard=50,
             offsets=[0],
@@ -460,7 +460,7 @@ class TestParallelOffsets:
 
         prefetcher = TextPrefetcher(
             dataset="test",
-            output_dir=tmp_path,
+            cache_dir=tmp_path,
             min_shards=2,
             max_rows_per_shard=30,
             offsets=[0, 100],  # offset 0 → region A, offset 100 → region B
@@ -498,7 +498,7 @@ class TestParallelOffsets:
 
         prefetcher = TextPrefetcher(
             dataset="test",
-            output_dir=tmp_path,
+            cache_dir=tmp_path,
             min_shards=4,
             max_rows_per_shard=30,
             offsets=[0, 200],
@@ -548,7 +548,7 @@ def _run_prefetcher_and_read(
         return _FakeHFDataset(all_docs).skip(offset)
 
     kwargs = dict(
-        output_dir=tmp_path,
+        cache_dir=tmp_path,
         dataset="test",
         min_shards=max(2, n_regions),
         max_rows_per_shard=max_rows_per_shard,
@@ -711,7 +711,7 @@ class TestContinuousStreaming:
 
         prefetcher = TextPrefetcher(
             dataset="test",
-            output_dir=tmp_path,
+            cache_dir=tmp_path,
             min_shards=1,
                         max_rows_per_shard=10,
             offsets=[0],
@@ -732,7 +732,7 @@ class TestContinuousStreaming:
 
         prefetcher = TextPrefetcher(
             dataset="test",
-            output_dir=tmp_path,
+            cache_dir=tmp_path,
             min_shards=1,
                         max_rows_per_shard=20,
             offsets=[0],
@@ -754,7 +754,7 @@ class TestContinuousStreaming:
 
         prefetcher = TextPrefetcher(
             dataset="test",
-            output_dir=tmp_path,
+            cache_dir=tmp_path,
             min_shards=2,
             max_rows_per_shard=20,
             offsets=[0],

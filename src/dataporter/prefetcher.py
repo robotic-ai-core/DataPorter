@@ -261,12 +261,12 @@ class BasePrefetcher:
     unpicklable test hooks are provided (e.g. ``_dataset_factory``).
 
     Communication with the child:
-      - Filesystem: Parquet shards in output_dir (the primary interface)
+      - Filesystem: Parquet shards in cache_dir (the primary interface)
       - ``multiprocessing.Event``: stop signal and min-ready signal
       - ``multiprocessing.Queue``: error propagation from child to parent
 
     Args:
-        output_dir: Local directory for shard files.
+        cache_dir: Local directory for shard files.
         min_shards: Block training until this many shards are ready.
         max_shards: Evict shards when exceeded. None = no limit.
         eviction: Eviction strategy ("stochastic_oldest", "fifo", "random").
@@ -280,7 +280,7 @@ class BasePrefetcher:
 
     def __init__(
         self,
-        output_dir: str | Path,
+        cache_dir: str | Path,
         min_shards: int = 5,
         max_shards: int | None = 100,
         eviction: str = "stochastic_oldest",
@@ -294,7 +294,7 @@ class BasePrefetcher:
         if eviction not in ("stochastic_oldest", "fifo", "random"):
             raise ValueError(f"Unknown eviction strategy: {eviction}")
 
-        self._output_dir = Path(output_dir)
+        self._cache_dir = Path(cache_dir)
         self._min_shards = min_shards
         self._max_shards = max_shards
         self._eviction = eviction
@@ -316,7 +316,7 @@ class BasePrefetcher:
 
     @property
     def shard_count(self) -> int:
-        return len(list(self._output_dir.rglob(self._shard_glob)))
+        return len(list(self._cache_dir.rglob(self._shard_glob)))
 
     @property
     def is_alive(self) -> bool:
@@ -343,15 +343,15 @@ class BasePrefetcher:
             idx = self._shard_counter
             self._shard_counter += 1
         # Write to .tmp first — caller should rename to .parquet after write
-        return self._output_dir / f"shard_{idx:06d}.parquet"
+        return self._cache_dir / f"shard_{idx:06d}.parquet"
 
     def _next_shard_tmp_path(self) -> tuple[Path, Path]:
         """Return (tmp_path, final_path) for atomic shard writing."""
         with self._lock:
             idx = self._shard_counter
             self._shard_counter += 1
-        final = self._output_dir / f"shard_{idx:06d}.parquet"
-        tmp = self._output_dir / f"shard_{idx:06d}.parquet.tmp"
+        final = self._cache_dir / f"shard_{idx:06d}.parquet"
+        tmp = self._cache_dir / f"shard_{idx:06d}.parquet.tmp"
         return tmp, final
 
     def start(self) -> None:
@@ -359,7 +359,7 @@ class BasePrefetcher:
         if self._worker is not None and self._worker.is_alive():
             raise RuntimeError(f"{type(self).__name__} already running")
 
-        self._output_dir.mkdir(parents=True, exist_ok=True)
+        self._cache_dir.mkdir(parents=True, exist_ok=True)
         self._error = None
 
         if self._use_thread:
@@ -458,7 +458,7 @@ class BasePrefetcher:
             return
         while self.shard_count > self._max_shards:
             evict_shard(
-                self._output_dir,
+                self._cache_dir,
                 self._eviction,
                 rng,
                 glob_pattern=self._shard_glob,

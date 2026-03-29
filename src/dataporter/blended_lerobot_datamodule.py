@@ -194,7 +194,7 @@ class BlendedLeRobotDataModule(L.LightningDataModule):
 
         prefetcher = LeRobotPrefetcher(
             repo_id=repo_id,
-            output_dir=local_dir,
+            cache_dir=local_dir,
             min_shards=min(50, source.get("prefetch_min_episodes", 50)),
             max_shards=source.get("prefetch_max_episodes", 10000),
         )

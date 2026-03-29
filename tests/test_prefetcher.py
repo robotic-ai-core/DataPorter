@@ -77,16 +77,16 @@ class TestBasePrefetcherValidation:
 
     def test_min_shards_zero_raises(self, tmp_path):
         with pytest.raises(ValueError, match="min_shards"):
-            BasePrefetcher(output_dir=tmp_path, min_shards=0)
+            BasePrefetcher(cache_dir=tmp_path, min_shards=0)
 
     def test_max_lt_min_raises(self, tmp_path):
         with pytest.raises(ValueError, match="max_shards"):
-            BasePrefetcher(output_dir=tmp_path, min_shards=10, max_shards=5)
+            BasePrefetcher(cache_dir=tmp_path, min_shards=10, max_shards=5)
 
     def test_invalid_eviction_raises(self, tmp_path):
         with pytest.raises(ValueError, match="eviction"):
-            BasePrefetcher(output_dir=tmp_path, eviction="invalid")
+            BasePrefetcher(cache_dir=tmp_path, eviction="invalid")
 
     def test_max_shards_none_allowed(self, tmp_path):
-        bp = BasePrefetcher(output_dir=tmp_path, max_shards=None)
+        bp = BasePrefetcher(cache_dir=tmp_path, max_shards=None)
         assert bp._max_shards is None
