@@ -24,7 +24,6 @@ class RawTextSource:
         refresh_interval_seconds: How often to rescan for new shards.
         max_cache_gb: Auto-evict oldest shards when total size exceeded (GB).
             Refers to processed Parquet shard size on disk, not raw HF dataset size.
-            None = no limit (cache grows until disk is full).
     """
 
     def __init__(
