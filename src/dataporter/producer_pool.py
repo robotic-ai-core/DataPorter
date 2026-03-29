@@ -162,7 +162,13 @@ async def _run_spawn_pool(
     warmup_event,
     stop_event,
 ) -> None:
-    """Async event loop in spawned child: ThreadPoolExecutor per source."""
+    """Async event loop in spawned child: parallel decode via executors.
+
+    Dispatches ``total_workers`` decode tasks concurrently across
+    per-source ThreadPoolExecutors. Results are collected as they
+    complete and written to the buffer. This gives true parallelism
+    (N decodes in flight) instead of sequential await.
+    """
     loop = asyncio.get_event_loop()
 
     # Build decode functions (fresh datasets in this process)
@@ -173,11 +179,13 @@ async def _run_spawn_pool(
     # Distribute thread workers by weight
     total_weight = sum(cfg.weight for cfg in configs)
     executors = {}
+    workers_per_source = {}
     for cfg in configs:
         n = max(1, round(total_workers * cfg.weight / total_weight))
         executors[cfg.source_name] = ThreadPoolExecutor(
             max_workers=n, thread_name_prefix=f"decode-{cfg.source_name}",
         )
+        workers_per_source[cfg.source_name] = n
 
     # Episode iterators (infinite, shuffled)
     iterators = {}
@@ -185,37 +193,71 @@ async def _run_spawn_pool(
         rng = random.Random(cfg.seed)
         iterators[cfg.source_name] = _episode_iterator(cfg.episode_indices, rng)
 
-    # Weighted round-robin
-    tokens = {cfg.source_name: 0.0 for cfg in configs}
     weight_map = {cfg.source_name: cfg.weight for cfg in configs}
 
-    while not stop_event.is_set():
-        name = max(tokens, key=lambda n: weight_map[n] - tokens[n])
-        ep_idx = next(iterators[name])
-
+    async def _decode_one(source_name: str, ep_idx: int) -> tuple[str, int, torch.Tensor | None]:
+        """Dispatch one decode to the source's executor."""
         try:
             frames = await loop.run_in_executor(
-                executors[name], decode_fns[name], ep_idx,
+                executors[source_name], decode_fns[source_name], ep_idx,
             )
+            return source_name, ep_idx, frames
         except Exception as e:
-            logger.warning(f"Decode failed for {name} ep {ep_idx}: {e}")
-            continue
+            logger.warning(f"Decode failed for {source_name} ep {ep_idx}: {e}")
+            return source_name, ep_idx, None
 
-        buffer.put(ep_idx, frames)
+    # Weighted dispatch: fill the pipeline with total_workers tasks
+    tokens = {name: 0.0 for name in weight_map}
+    pending: set[asyncio.Task] = set()
 
+    def _next_dispatch() -> tuple[str, int]:
+        """Pick next (source, episode) using weighted round-robin."""
+        name = max(tokens, key=lambda n: weight_map[n] - tokens[n])
+        ep_idx = next(iterators[name])
         tokens[name] += 1
         if all(t >= weight_map[n] for n, t in tokens.items()):
-            tokens = {n: 0.0 for n in tokens}
+            for k in tokens:
+                tokens[k] = 0.0
+        return name, ep_idx
 
-        if not warmup_event.is_set() and len(buffer) >= warmup_target:
-            warmup_event.set()
-            logger.info(
-                f"ProducerPool warmup complete: {len(buffer)} items in buffer"
-            )
+    # Seed the pipeline with total_workers concurrent decodes
+    for _ in range(total_workers):
+        name, ep_idx = _next_dispatch()
+        task = asyncio.create_task(_decode_one(name, ep_idx))
+        pending.add(task)
 
+    while not stop_event.is_set():
+        # Wait for any decode to complete
+        done, pending = await asyncio.wait(
+            pending, return_when=asyncio.FIRST_COMPLETED,
+        )
+
+        for task in done:
+            source_name, ep_idx, frames = task.result()
+            if frames is not None:
+                buffer.put(ep_idx, frames)
+
+            # Check warmup
+            if not warmup_event.is_set() and len(buffer) >= warmup_target:
+                warmup_event.set()
+                logger.info(
+                    f"ProducerPool warmup complete: "
+                    f"{len(buffer)} items in buffer"
+                )
+
+            # Dispatch a replacement task
+            if not stop_event.is_set():
+                name, ep_idx = _next_dispatch()
+                new_task = asyncio.create_task(_decode_one(name, ep_idx))
+                pending.add(new_task)
+
+        # Backpressure: pause dispatching when buffer is full
         while len(buffer) >= buffer.capacity and not stop_event.is_set():
             await asyncio.sleep(0.05)
 
+    # Cancel remaining tasks
+    for task in pending:
+        task.cancel()
     for ex in executors.values():
         ex.shutdown(wait=False, cancel_futures=True)
 
