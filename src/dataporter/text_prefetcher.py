@@ -146,7 +146,7 @@ class TextPrefetcher(BasePrefetcher):
 
     Note:
         The prefetcher only writes shards — it never deletes them.
-        Eviction is the reader's responsibility (RawTextSource.max_shards).
+        Eviction is the reader's responsibility (RawTextSource.max_cache_gb).
     """
 
     def __init__(

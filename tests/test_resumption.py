@@ -157,26 +157,28 @@ class TestFreezeUnfreeze:
         assert s.shard_count == 4
 
     def test_freeze_blocks_auto_eviction(self, tmp_path):
-        """When frozen, max_shards auto-eviction is deferred."""
+        """When frozen, max_cache_gb auto-eviction is deferred."""
         _write_shards(tmp_path, n=10)
-        s = ShardStorage(tmp_path, refresh_interval=0.01, max_shards=5)
-        # Initial refresh evicts to 5
-        assert s.shard_count == 5
+        total = sum(p.stat().st_size for p in tmp_path.glob("*.parquet"))
+        half_gb = (total * 0.55) / 1_073_741_824
+        s = ShardStorage(tmp_path, refresh_interval=0.01, max_cache_gb=half_gb)
+        initial_count = s.shard_count
+        assert initial_count <= 6  # evicted to ~half
 
         s.freeze()
-        # Write more shards — should exceed max but not evict
+        # Write more shards — should exceed limit but not evict
         for i in range(10, 15):
             _write_text_shard(tmp_path / f"shard_{i:06d}.parquet", ["x"] * 5)
         time.sleep(0.02)
         _ = len(s)
 
-        # Should be over max_shards (frozen)
-        assert s.shard_count > 5
+        # Should be over limit (frozen)
+        assert s.shard_count > initial_count
 
         s.unfreeze()
         time.sleep(0.02)
         _ = len(s)
-        assert s.shard_count <= 5
+        assert s.shard_count <= initial_count + 1
 
     def test_load_state_dict_freezes(self, tmp_path):
         """load_state_dict automatically freezes."""

@@ -534,7 +534,7 @@ class TestParallelOffsets:
 
 def _run_prefetcher_and_read(
     tmp_path, n_regions, docs_per_region, max_rows_per_shard=25,
-    max_shards_reader=None, high_water=None, low_water=None,
+    max_cache_gb=None, high_water=None, low_water=None,
 ):
     """Helper: run prefetcher with N regions, return (region_counts, shard_region_sets)."""
     all_docs = []
@@ -569,9 +569,9 @@ def _run_prefetcher_and_read(
 
     src = RawTextSource(
         tmp_path, refresh_interval_seconds=0.01,
-        max_shards=max_shards_reader,
+        max_cache_gb=max_cache_gb,
     )
-    # Trigger eviction via refresh if max_shards_reader is set
+    # Trigger eviction via refresh if max_cache_gb is set
     _ = len(src)
     region_counts = {r: 0 for r in range(n_regions)}
     shard_region_sets = {}  # shard_name -> set of regions in that shard
@@ -678,7 +678,7 @@ class TestRandomnessValidation:
         (stochastic oldest eviction doesn't wipe out entire regions)."""
         region_counts, _ = _run_prefetcher_and_read(
             tmp_path, n_regions=3, docs_per_region=300,
-            max_rows_per_shard=20, max_shards_reader=20,
+            max_rows_per_shard=20, max_cache_gb=0.001,  # ~1MB limit forces eviction
             high_water=20, low_water=5,
         )
         total = sum(region_counts.values())
@@ -951,26 +951,24 @@ class TestDeferredEviction:
         assert len(src) == 0
         assert src.shard_count == 0
 
-    def test_auto_eviction_via_max_shards(self, tmp_path):
-        """max_shards triggers automatic eviction of oldest shards."""
+    def test_auto_eviction_via_max_cache_gb(self, tmp_path):
+        """max_cache_gb triggers automatic eviction of oldest shards."""
         self._write_shards(tmp_path, n=10, docs_per_shard=5)
+        total = sum(p.stat().st_size for p in tmp_path.glob("*.parquet"))
+        half_gb = (total * 0.55) / 1_073_741_824  # ~55% = ~5.5 shards
         src = RawTextSource(
-            tmp_path, refresh_interval_seconds=0.01, max_shards=5,
+            tmp_path, refresh_interval_seconds=0.01, max_cache_gb=half_gb,
         )
-
-        # Initial refresh should evict 5 oldest
-        assert src.shard_count == 5
-        # Oldest shards should be gone
-        assert not (tmp_path / "shard_000000.parquet").exists()
-        assert not (tmp_path / "shard_000004.parquet").exists()
-        # Newest should survive
-        assert (tmp_path / "shard_000009.parquet").exists()
+        assert src.shard_count <= 6
+        assert src.shard_count >= 4
 
     def test_auto_eviction_as_new_shards_arrive(self, tmp_path):
-        """Auto-eviction triggers when new shards push count over max."""
+        """Auto-eviction triggers when new shards push size over limit."""
         self._write_shards(tmp_path, n=3, docs_per_shard=10)
+        one_shard = list(tmp_path.glob("*.parquet"))[0].stat().st_size
+        limit_gb = (one_shard * 3.5) / 1_073_741_824  # fits ~3 shards
         src = RawTextSource(
-            tmp_path, refresh_interval_seconds=0.01, max_shards=3,
+            tmp_path, refresh_interval_seconds=0.01, max_cache_gb=limit_gb,
         )
         assert src.shard_count == 3
 

@@ -84,11 +84,10 @@ class ShardStorage:
         data_dir: Directory containing shard_*.parquet files.
         text_column: Column name to read.
         refresh_interval: Seconds between directory rescans.
-        max_shards: Auto-evict oldest shards when count exceeded.
         max_cache_gb: Auto-evict oldest shards when total size exceeded (GB).
             This is the size of processed files on disk (e.g., compressed
             Parquet text shards), not the raw HF dataset size.
-            Both limits can be set — eviction triggers when either is exceeded.
+            None = no limit (cache grows until disk is full).
     """
 
     def __init__(
@@ -96,13 +95,11 @@ class ShardStorage:
         data_dir: str | Path,
         text_column: str = "text",
         refresh_interval: float = 30.0,
-        max_shards: int | None = None,
         max_cache_gb: float | None = None,
     ):
         self._dir = Path(data_dir)
         self._text_column = text_column
         self._refresh_interval = refresh_interval
-        self._max_shards = max_shards
         self._max_cache_bytes = int(max_cache_gb * 1_073_741_824) if max_cache_gb else None
         self._last_refresh = 0.0
 
@@ -155,7 +152,7 @@ class ShardStorage:
 
     @property
     def capacity(self) -> int | None:
-        return self._max_shards
+        return None  # size-based, not count-based
 
     @property
     def shard_count(self) -> int:
@@ -232,25 +229,16 @@ class ShardStorage:
 
         paths = sorted(self._dir.glob("*.parquet"))
 
-        # Auto-evict if over limits (only if not frozen)
-        if not self._frozen:
-            if self._max_shards is not None and len(paths) > self._max_shards:
-                for p in paths[: len(paths) - self._max_shards]:
-                    try:
-                        p.unlink()
-                    except (FileNotFoundError, OSError):
-                        pass
-                paths = sorted(self._dir.glob("*.parquet"))
-
-            if self._max_cache_bytes is not None:
-                total = sum(p.stat().st_size for p in paths)
-                while total > self._max_cache_bytes and paths:
-                    victim = paths.pop(0)
-                    try:
-                        total -= victim.stat().st_size
-                        victim.unlink()
-                    except (FileNotFoundError, OSError):
-                        pass
+        # Auto-evict if over size limit (only if not frozen)
+        if not self._frozen and self._max_cache_bytes is not None:
+            total = sum(p.stat().st_size for p in paths)
+            while total > self._max_cache_bytes and paths:
+                victim = paths.pop(0)
+                try:
+                    total -= victim.stat().st_size
+                    victim.unlink()
+                except (FileNotFoundError, OSError):
+                    pass
 
         # If pinned, filter to only the pinned shard names
         if self._pinned_shards is not None:
@@ -281,15 +269,10 @@ class ShardStorage:
     def _maybe_evict_excess(self) -> None:
         """Quick eviction check — throttled to every 0.5 seconds.
 
-        Evicts oldest shards when either limit is exceeded:
-        - ``max_shards``: shard count limit
-        - ``max_cache_gb``: total cache size limit
-
+        Evicts oldest shards when total cache size exceeds max_cache_gb.
         Throttled because glob + stat costs ~1ms for 200 files.
         """
-        if self._frozen:
-            return
-        if self._max_shards is None and self._max_cache_bytes is None:
+        if self._frozen or self._max_cache_bytes is None:
             return
         now = monotonic()
         if now - getattr(self, "_last_evict_check", 0.0) < 0.5:
@@ -297,26 +280,14 @@ class ShardStorage:
         self._last_evict_check = now
 
         paths = sorted(self._dir.glob("*.parquet"))
-
-        # Evict by count
-        if self._max_shards is not None and len(paths) > self._max_shards:
-            for p in paths[: len(paths) - self._max_shards]:
-                try:
-                    p.unlink()
-                except (FileNotFoundError, OSError):
-                    pass
-            paths = sorted(self._dir.glob("*.parquet"))
-
-        # Evict by size
-        if self._max_cache_bytes is not None:
-            total = sum(p.stat().st_size for p in paths)
-            while total > self._max_cache_bytes and paths:
-                victim = paths.pop(0)
-                try:
-                    total -= victim.stat().st_size
-                    victim.unlink()
-                except (FileNotFoundError, OSError):
-                    pass
+        total = sum(p.stat().st_size for p in paths)
+        while total > self._max_cache_bytes and paths:
+            victim = paths.pop(0)
+            try:
+                total -= victim.stat().st_size
+                victim.unlink()
+            except (FileNotFoundError, OSError):
+                pass
 
     def _locate(self, idx: int) -> tuple[int, int]:
         shard_idx = bisect_right(self._cumulative_rows, idx)

@@ -18,7 +18,7 @@ Two access modes:
 
 Usage — text (shards on disk, direct mode):
 
-    storage = ShardStorage("/data/shards", max_shards=100)
+    storage = ShardStorage("/data/shards", max_cache_gb=50)
     source = PrefetchedSource(storage)
     dataset = TransformableDataset(source, tokenize_transform)
 

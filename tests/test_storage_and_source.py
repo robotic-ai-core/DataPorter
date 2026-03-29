@@ -76,9 +76,12 @@ class TestShardStorage:
 
     def test_auto_eviction(self, tmp_path):
         _write_shards(tmp_path, n=10, docs_per_shard=5)
-        s = ShardStorage(tmp_path, refresh_interval=0.01, max_shards=5)
-        assert s.shard_count == 5
-        assert not (tmp_path / "shard_000000.parquet").exists()
+        # Limit to ~half the total size
+        total = sum(p.stat().st_size for p in tmp_path.glob("*.parquet"))
+        half_gb = (total * 0.55) / 1_073_741_824  # 55% of total = ~5.5 shards
+        s = ShardStorage(tmp_path, refresh_interval=0.01, max_cache_gb=half_gb)
+        assert s.shard_count <= 6
+        assert s.shard_count >= 4
 
     def test_eviction_keeps_up_with_fast_writer(self, tmp_path):
         """Shards written between refreshes don't accumulate unbounded.
@@ -92,7 +95,10 @@ class TestShardStorage:
         the on-disk count exceed max_shards by more than a small margin.
         """
         _write_shards(tmp_path, n=5, docs_per_shard=5)
-        s = ShardStorage(tmp_path, refresh_interval=60, max_shards=5)
+        # Size-based limit: allow ~5 shards worth (use 5.5x shard size)
+        one_shard = list(tmp_path.glob("*.parquet"))[0].stat().st_size
+        limit_gb = (one_shard * 5.5) / 1_073_741_824
+        s = ShardStorage(tmp_path, refresh_interval=60, max_cache_gb=limit_gb)
         assert s.shard_count == 5
 
         max_seen = 5
@@ -138,23 +144,6 @@ class TestShardStorage:
         remaining_bytes = sum(p.stat().st_size for p in tmp_path.glob("*.parquet"))
         assert remaining_bytes <= total_bytes / 2 + 10000  # small tolerance
         assert s.shard_count < 10
-
-    def test_max_cache_gb_and_max_shards_both_enforced(self, tmp_path):
-        """Both limits apply — eviction triggers on whichever is hit first."""
-        for i in range(20):
-            _write_text_shard(
-                tmp_path / f"shard_{i:06d}.parquet",
-                [f"doc_{j}" for j in range(100)],
-            )
-        total_bytes = sum(p.stat().st_size for p in tmp_path.glob("*.parquet"))
-        # Set max_shards=15 and max_cache_gb to hold only 5 shards
-        five_shard_gb = (total_bytes / 20 * 5) / 1_073_741_824
-        s = ShardStorage(
-            tmp_path, refresh_interval=0.01,
-            max_shards=15, max_cache_gb=five_shard_gb,
-        )
-        # Size limit (5 shards) is tighter than count limit (15)
-        assert s.shard_count <= 6
 
     def test_wraps_index(self, tmp_path):
         _write_shards(tmp_path, n=1, docs_per_shard=5)

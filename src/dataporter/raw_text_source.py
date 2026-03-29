@@ -22,9 +22,9 @@ class RawTextSource:
         data_dir: Directory containing .parquet files.
         text_column: Column name containing text strings.
         refresh_interval_seconds: How often to rescan for new shards.
-        max_shards: Auto-evict oldest shards when count exceeded.
         max_cache_gb: Auto-evict oldest shards when total size exceeded (GB).
             Refers to processed Parquet shard size on disk, not raw HF dataset size.
+            None = no limit (cache grows until disk is full).
     """
 
     def __init__(
@@ -32,14 +32,12 @@ class RawTextSource:
         data_dir: str | Path,
         text_column: str = "text",
         refresh_interval_seconds: float = 30.0,
-        max_shards: int | None = None,
         max_cache_gb: float | None = None,
     ):
         self._storage = ShardStorage(
             data_dir=data_dir,
             text_column=text_column,
             refresh_interval=refresh_interval_seconds,
-            max_shards=max_shards,
             max_cache_gb=max_cache_gb,
         )
 
