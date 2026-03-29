@@ -115,6 +115,14 @@ class PrefetchedSource:
         self._storage = storage
         self._producers = producers or []
         self._shuffle_available = shuffle_available
+        if shuffle_available:
+            import warnings
+            warnings.warn(
+                "PrefetchedSource(shuffle_available=True) is deprecated. "
+                "Use ShuffleBuffer + ShuffleBufferDataset instead.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
         self._fallback = fallback
         self._min_available = min_available
 

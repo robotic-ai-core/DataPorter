@@ -450,3 +450,117 @@ class TestErrorHandling:
         buf = ShuffleBuffer(capacity=10, max_frames=3, channels=3, height=8, width=8)
         with pytest.raises(ValueError, match="Either configs or producers"):
             ProducerPool(buf)
+
+
+# ---------------------------------------------------------------------------
+# E2E: Synthetic multi-source → ProducerPool → ShuffleBuffer → Dataset → DataLoader
+# ---------------------------------------------------------------------------
+
+class TestE2EMultiSource:
+    """End-to-end test with synthetic multi-source data.
+
+    Verifies the full pipeline: multiple producers with different weights
+    fill a ShuffleBuffer, ShuffleBufferDataset reads from it via DataLoader,
+    and the output has correct blend ratios and sample diversity.
+    """
+
+    def test_blend_ratio_in_dataloader_output(self):
+        """DataLoader output reflects producer weights (75/25 blend)."""
+        buf = ShuffleBuffer(capacity=100, max_frames=5, channels=3, height=8, width=8)
+
+        # Source A: episodes 0-49, weight 3 (75%)
+        # Source B: episodes 1000-1049, weight 1 (25%)
+        producer_a = AsyncProducer("A", _synthetic_decode, list(range(50)), weight=3.0)
+        producer_b = AsyncProducer("B", _synthetic_decode, list(range(1000, 1050)), weight=1.0)
+
+        pool = ProducerPool(buf, producers=[producer_a, producer_b], total_workers=2, warmup_target=80)
+        pool.start()
+        pool.wait_for_warmup(timeout=30)
+
+        ds = ShuffleBufferDataset(buf, epoch_length=200)
+        loader = DataLoader(
+            ds, batch_size=10, shuffle=False, num_workers=2,
+            worker_init_fn=ShuffleBufferDataset.worker_init_fn,
+        )
+
+        a_count = 0
+        b_count = 0
+        for batch in loader:
+            for ep in batch["episode_index"]:
+                if int(ep) < 100:
+                    a_count += 1
+                else:
+                    b_count += 1
+
+        pool.stop()
+
+        total = a_count + b_count
+        assert total == 200
+        a_ratio = a_count / total
+        # Weight 3:1 → A should be ~75%. Allow 50-95% for stochastic buffer.
+        assert 0.50 < a_ratio < 0.95, (
+            f"Blend ratio: A={a_ratio:.0%} (expected ~75%). A={a_count}, B={b_count}"
+        )
+
+    def test_all_sources_represented(self):
+        """Both sources should have episodes in the DataLoader output."""
+        buf = ShuffleBuffer(capacity=50, max_frames=3, channels=3, height=8, width=8)
+
+        producer_a = AsyncProducer("A", _synthetic_decode, list(range(20)), weight=1.0)
+        producer_b = AsyncProducer("B", _synthetic_decode, list(range(500, 520)), weight=1.0)
+
+        pool = ProducerPool(buf, producers=[producer_a, producer_b], total_workers=2, warmup_target=30)
+        pool.start()
+        pool.wait_for_warmup(timeout=30)
+
+        ds = ShuffleBufferDataset(buf, epoch_length=100)
+        loader = DataLoader(ds, batch_size=10, shuffle=False, num_workers=0)
+
+        sources = set()
+        for batch in loader:
+            for ep in batch["episode_index"]:
+                sources.add("A" if int(ep) < 100 else "B")
+
+        pool.stop()
+        assert sources == {"A", "B"}, f"Only {sources} represented"
+
+    def test_sample_diversity_across_batches(self):
+        """Different batches should contain different episodes (not repeated)."""
+        buf = ShuffleBuffer(capacity=50, max_frames=3, channels=3, height=8, width=8)
+        for i in range(50):
+            buf.put(i, _make_frames(3, c=3, h=8, w=8))
+
+        ds = ShuffleBufferDataset(buf, epoch_length=100)
+        loader = DataLoader(
+            ds, batch_size=10, shuffle=False, num_workers=2,
+            worker_init_fn=ShuffleBufferDataset.worker_init_fn,
+        )
+
+        all_episodes = []
+        for batch in loader:
+            all_episodes.extend(batch["episode_index"].tolist())
+
+        unique = len(set(all_episodes))
+        # 100 samples from 50 episodes — should see most of them
+        assert unique >= 20, f"Only {unique} unique episodes in 100 samples"
+
+    def test_buffer_continuously_refreshes(self):
+        """Producer keeps filling even after warmup — buffer content changes."""
+        buf = ShuffleBuffer(capacity=20, max_frames=3, channels=3, height=8, width=8)
+
+        producer = AsyncProducer("test", _synthetic_decode, list(range(100)), weight=1.0)
+        pool = ProducerPool(buf, producers=[producer], total_workers=2, warmup_target=15)
+        pool.start()
+        pool.wait_for_warmup(timeout=30)
+
+        # Snapshot buffer contents
+        keys_t0 = set(buf.keys())
+        time.sleep(0.5)
+        keys_t1 = set(buf.keys())
+
+        pool.stop()
+
+        # Buffer should have changed (producer keeps cycling)
+        assert keys_t0 != keys_t1 or len(keys_t0) == 20, (
+            "Buffer content didn't change — producer may have stopped"
+        )

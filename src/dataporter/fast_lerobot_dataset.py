@@ -94,8 +94,16 @@ class FastLeRobotDataset(LeRobotDataset):
         self._return_uint8 = return_uint8
         self._frame_source = None
 
-        # Shared memory buffer mode (overrides LRU cache)
+        # Shared memory buffer mode (DEPRECATED — use ShuffleBuffer pipeline)
         if frame_buffer_capacity is not None:
+            import warnings
+            warnings.warn(
+                "frame_buffer_capacity is deprecated. Use ShuffleBuffer + "
+                "ProducerPool + ShuffleBufferDataset instead (see "
+                "BlendedLeRobotDataModule with shuffle_buffer_capacity).",
+                DeprecationWarning,
+                stacklevel=2,
+            )
             from .storage import SharedMemoryStorage
             from .prefetched_source import PrefetchedSource
 
@@ -106,9 +114,13 @@ class FastLeRobotDataset(LeRobotDataset):
             ]
             max_frames = max(ep_lengths) if ep_lengths else 50
 
-            # Get frame dimensions from first video key metadata
-            # PushT: 96x96x3
-            height, width, channels = 96, 96, 3
+            # Probe frame dimensions from dataset metadata
+            vid_keys = self.meta.video_keys
+            if vid_keys:
+                shape = self.meta.features[vid_keys[0]].get("shape", (96, 96, 3))
+                height, width, channels = shape[0], shape[1], shape[2]
+            else:
+                height, width, channels = 96, 96, 3
 
             storage = SharedMemoryStorage(
                 capacity=frame_buffer_capacity,

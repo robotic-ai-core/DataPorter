@@ -357,9 +357,9 @@ class SharedMemoryStorage:
         self,
         capacity: int,
         max_frames: int,
-        channels: int = 3,
-        height: int = 96,
-        width: int = 96,
+        channels: int,
+        height: int,
+        width: int,
         max_keys: int | None = None,
     ):
         import torch

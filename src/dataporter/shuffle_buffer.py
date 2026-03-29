@@ -44,9 +44,9 @@ class ShuffleBuffer:
         self,
         capacity: int,
         max_frames: int,
-        channels: int = 3,
-        height: int = 96,
-        width: int = 96,
+        channels: int,
+        height: int,
+        width: int,
     ):
         self._capacity = capacity
         self._max_frames = max_frames
