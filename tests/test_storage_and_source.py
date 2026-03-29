@@ -121,6 +121,41 @@ class TestShardStorage:
             f"Eviction isn't keeping up with writer."
         )
 
+    def test_max_cache_gb_evicts_by_size(self, tmp_path):
+        """max_cache_gb evicts oldest shards when total size exceeds limit."""
+        # Write 10 shards, each ~1KB
+        for i in range(10):
+            _write_text_shard(
+                tmp_path / f"shard_{i:06d}.parquet",
+                [f"doc_{j}" for j in range(100)],
+            )
+
+        total_bytes = sum(p.stat().st_size for p in tmp_path.glob("*.parquet"))
+        half_gb = total_bytes / 2 / 1_073_741_824  # half the total in GB
+
+        s = ShardStorage(tmp_path, refresh_interval=0.01, max_cache_gb=half_gb)
+        # Initial refresh should evict to under the size limit
+        remaining_bytes = sum(p.stat().st_size for p in tmp_path.glob("*.parquet"))
+        assert remaining_bytes <= total_bytes / 2 + 10000  # small tolerance
+        assert s.shard_count < 10
+
+    def test_max_cache_gb_and_max_shards_both_enforced(self, tmp_path):
+        """Both limits apply — eviction triggers on whichever is hit first."""
+        for i in range(20):
+            _write_text_shard(
+                tmp_path / f"shard_{i:06d}.parquet",
+                [f"doc_{j}" for j in range(100)],
+            )
+        total_bytes = sum(p.stat().st_size for p in tmp_path.glob("*.parquet"))
+        # Set max_shards=15 and max_cache_gb to hold only 5 shards
+        five_shard_gb = (total_bytes / 20 * 5) / 1_073_741_824
+        s = ShardStorage(
+            tmp_path, refresh_interval=0.01,
+            max_shards=15, max_cache_gb=five_shard_gb,
+        )
+        # Size limit (5 shards) is tighter than count limit (15)
+        assert s.shard_count <= 6
+
     def test_wraps_index(self, tmp_path):
         _write_shards(tmp_path, n=1, docs_per_shard=5)
         s = ShardStorage(tmp_path)
