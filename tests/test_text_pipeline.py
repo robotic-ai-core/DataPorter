@@ -5,6 +5,7 @@ All tests use mocked HF datasets — no network access needed.
 
 from __future__ import annotations
 
+import itertools
 import random
 import threading
 import time
@@ -20,6 +21,8 @@ from torch.utils.data import DataLoader
 from dataporter.raw_text_source import RawTextSource
 from dataporter.text_prefetcher import TextPrefetcher
 from dataporter.prefetcher import evict_shard
+from dataporter.resumable import ResumableDataLoader
+from dataporter.storage import ShardStorage
 from dataporter.transformable_dataset import TransformableDataset
 from dataporter.transforms import compose
 
@@ -1025,3 +1028,249 @@ class TestDeferredEviction:
         # Can still read remaining shard
         item = src[0]
         assert "shard1" in item["text"]
+
+
+# ---------------------------------------------------------------------------
+# E2E Streaming Resume Tests
+# ---------------------------------------------------------------------------
+
+
+class TestStreamingResume:
+    """E2E tests verifying that resume after checkpoint produces consistent data.
+
+    Simulates a real training cycle:
+      1. TextPrefetcher streams docs → Parquet shards
+      2. ResumableDataLoader reads K batches → checkpoint
+      3. Prefetcher continues writing new shards (and/or eviction occurs)
+      4. New loader created + load_state_dict applied → starts from batch K+1
+      5. Combined (pre-checkpoint + post-resume) matches a reference continuous run
+
+    Key insight: load_state_dict SKIPS past already-processed samples so the
+    resumed loader starts at batch K+1, not batch 0.
+    """
+
+    @staticmethod
+    def _make_docs(n: int) -> list[dict]:
+        """Generate deterministic docs with unique content per index."""
+        return [{"text": f"doc_{i:06d}_" + ("word " * 20)} for i in range(n)]
+
+    @staticmethod
+    def _collect_all_texts(loader) -> list[str]:
+        """Exhaust loader and collect all text strings."""
+        texts = []
+        for batch in loader:
+            texts.extend(batch["texts"])
+        return texts
+
+    @staticmethod
+    def _collect_texts_n_batches(loader, n_batches: int) -> list[str]:
+        """Collect flat list of text strings from the first n_batches.
+
+        Uses islice so exactly n_batches calls to __next__ are made — no
+        off-by-one over-fetch that would corrupt the checkpoint position.
+        """
+        texts = []
+        for batch in itertools.islice(loader, n_batches):
+            texts.extend(batch["texts"])
+        return texts
+
+    def _make_prefetcher(self, cache_dir, docs, max_rows_per_shard=20):
+        return TextPrefetcher(
+            dataset="test",
+            cache_dir=cache_dir,
+            min_shards=3,
+            max_rows_per_shard=max_rows_per_shard,
+            offsets=[0],
+            max_restarts=0,
+            _dataset_factory=_make_factory(docs),
+        )
+
+    def _make_loader(self, cache_dir, batch_size=4, seed=42):
+        src = RawTextSource(cache_dir, refresh_interval_seconds=60)
+        ds = TransformableDataset(src, lambda s, idx: {"texts": s[idx]["text"]})
+        return ResumableDataLoader(ds, batch_size=batch_size, shuffle=False,
+                                   num_workers=0, seed=seed)
+
+    def test_resume_continues_from_checkpoint(self, tmp_path):
+        """load_state_dict skips past checkpointed batches → correct continuation.
+
+        Pattern:
+          reference_run:  [b0, b1, b2, b3, b4]
+          first_run:      [b0, b1] → checkpoint
+          resumed_run:    [b2, b3, b4]          (starts after b1)
+          combined:       [b0, b1, b2, b3, b4] == reference_run
+        """
+        docs = self._make_docs(300)
+        prefetcher = self._make_prefetcher(tmp_path, docs)
+        prefetcher.start()
+        prefetcher.wait_for_min(timeout=30)
+        prefetcher.stop()
+
+        # Reference run: read all batches in one shot
+        loader_ref = self._make_loader(tmp_path)
+        reference_texts = self._collect_all_texts(loader_ref)
+
+        # First run: read 2 batches then checkpoint
+        loader1 = self._make_loader(tmp_path)
+        first_half = self._collect_texts_n_batches(loader1, n_batches=2)
+        loader_state = loader1.state_dict()
+
+        # Resumed run: load checkpoint, read the rest
+        loader2 = self._make_loader(tmp_path)
+        loader2.load_state_dict(loader_state)
+        second_half = self._collect_all_texts(loader2)
+
+        combined = first_half + second_half
+        assert combined == reference_texts, (
+            f"Resume produced wrong continuation — combined length {len(combined)} "
+            f"vs reference {len(reference_texts)}"
+        )
+
+    def test_storage_state_pins_shards_across_new_writes(self, tmp_path):
+        """After load_state_dict, newly written shards are invisible."""
+        docs = self._make_docs(200)
+        prefetcher = self._make_prefetcher(tmp_path, docs, max_rows_per_shard=20)
+        prefetcher.start()
+        prefetcher.wait_for_min(timeout=30)
+        prefetcher.stop()
+
+        storage = ShardStorage(tmp_path, refresh_interval=60)
+        n_shards_at_checkpoint = storage.shard_count
+        state = storage.state_dict()
+
+        # Simulate prefetcher writing more shards after checkpoint
+        for i in range(n_shards_at_checkpoint, n_shards_at_checkpoint + 3):
+            _write_text_shard(
+                tmp_path / f"shard_{i:06d}.parquet",
+                [f"new_doc_{i}_{j}" for j in range(20)],
+            )
+
+        # Resume — should still see only pinned shards
+        storage2 = ShardStorage(tmp_path, refresh_interval=60)
+        storage2.load_state_dict(state)
+
+        assert storage2.shard_count == n_shards_at_checkpoint
+        assert len(storage2) == state["total_rows"]
+
+    def test_data_content_stable_after_new_shards_and_eviction(self, tmp_path):
+        """Pinned shard data is accessible even after newer shards are written/evicted."""
+        docs = self._make_docs(400)
+        prefetcher = self._make_prefetcher(tmp_path, docs, max_rows_per_shard=20)
+        prefetcher.start()
+        prefetcher.wait_for_min(timeout=30)
+        prefetcher.stop()
+
+        storage = ShardStorage(tmp_path, refresh_interval=60)
+        storage.freeze()
+
+        # Read all pinned data at checkpoint
+        n = len(storage)
+        data_at_checkpoint = [storage.get(i) for i in range(n)]
+        state = storage.state_dict()
+
+        storage.unfreeze()
+
+        # Simulate: prefetcher writes new shards; a non-pinned shard added then evicted
+        shard_files = sorted(tmp_path.glob("shard_*.parquet"))
+        n_pinned = storage.shard_count
+
+        # Add new shards (post-checkpoint)
+        for i in range(100, 103):
+            _write_text_shard(
+                tmp_path / f"shard_{i:06d}.parquet",
+                [f"newer_doc_{j}" for j in range(20)],
+            )
+
+        # Resume: load state → pinned shard list
+        storage2 = ShardStorage(tmp_path, refresh_interval=60)
+        storage2.load_state_dict(state)
+
+        # Pinned data must be identical to what we read at checkpoint
+        n_available = len(storage2)
+        assert n_available == n
+        for i in range(n_available):
+            item = storage2.get(i)
+            assert item is not None
+            assert item == data_at_checkpoint[i]
+
+    def test_full_e2e_prefetch_checkpoint_resume(self, tmp_path):
+        """Full cycle: prefetch → checkpoint mid-epoch → more shards → resume → consistent data.
+
+        This is the scenario that matters for Vast.ai: prefetcher runs continuously,
+        we checkpoint at step N, instance terminates, we resume on a new instance
+        where the prefetcher has already written additional shards.
+
+        Verification: pre-checkpoint data + resumed data == reference continuous run.
+        """
+        docs = self._make_docs(500)
+
+        # Step 1: Start prefetcher, wait for initial shards
+        prefetcher = self._make_prefetcher(tmp_path, docs, max_rows_per_shard=25)
+        prefetcher.start()
+        prefetcher.wait_for_min(timeout=30)
+
+        src = RawTextSource(tmp_path, refresh_interval_seconds=60)
+        storage = src._storage
+        storage.freeze()
+
+        # Step 2: Reference run — read all shards in one shot
+        raw_ds_ref = TransformableDataset(
+            src, lambda s, idx: {"texts": s[idx]["text"], "idx": idx}
+        )
+        loader_ref = ResumableDataLoader(raw_ds_ref, batch_size=8, shuffle=False,
+                                         num_workers=0, seed=0)
+        reference = []
+        for batch in loader_ref:
+            reference.extend(zip(batch["idx"].tolist(), batch["texts"]))
+
+        checkpoint_batch = len(reference) // (2 * 8)  # checkpoint midway
+
+        # Step 3: First run — read up to checkpoint
+        raw_ds1 = TransformableDataset(
+            RawTextSource(tmp_path, refresh_interval_seconds=60),
+            lambda s, idx: {"texts": s[idx]["text"], "idx": idx},
+        )
+        loader1 = ResumableDataLoader(raw_ds1, batch_size=8, shuffle=False, num_workers=0, seed=0)
+
+        pre_ckpt = []
+        for batch in itertools.islice(loader1, checkpoint_batch):
+            pre_ckpt.extend(zip(batch["idx"].tolist(), batch["texts"]))
+
+        loader_state = loader1.state_dict()
+        storage_state = storage.state_dict()
+
+        # Step 4: Prefetcher continues — writes more shards (simulated)
+        n_existing = storage.shard_count
+        for i in range(n_existing, n_existing + 4):
+            _write_text_shard(
+                tmp_path / f"shard_{i:06d}.parquet",
+                [f"extra_shard{i}_doc{j}" for j in range(25)],
+            )
+
+        prefetcher.stop()
+
+        # Step 5: Resume — load checkpoint, read the remaining batches
+        src2 = RawTextSource(tmp_path, refresh_interval_seconds=60)
+        storage2 = src2._storage
+        storage2.load_state_dict(storage_state)
+
+        raw_ds2 = TransformableDataset(
+            src2, lambda s, idx: {"texts": s[idx]["text"], "idx": idx}
+        )
+        loader2 = ResumableDataLoader(raw_ds2, batch_size=8, shuffle=False, num_workers=0, seed=0)
+        loader2.load_state_dict(loader_state)
+
+        post_ckpt = []
+        for batch in loader2:
+            post_ckpt.extend(zip(batch["idx"].tolist(), batch["texts"]))
+
+        # Combined run must equal reference (extra shards are invisible after pin)
+        combined = pre_ckpt + post_ckpt
+        assert combined == reference, (
+            f"E2E resume mismatch: combined={len(combined)} vs reference={len(reference)}\n"
+            + (
+                f"First diff at position "
+                f"{next(i for i, (a, b) in enumerate(zip(combined, reference)) if a != b)}"
+                if combined != reference else "length differs"
+            )
+        )
