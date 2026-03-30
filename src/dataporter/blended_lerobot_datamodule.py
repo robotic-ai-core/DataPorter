@@ -199,9 +199,12 @@ class BlendedLeRobotDataModule(L.LightningDataModule):
             max_shards=source.get("prefetch_max_episodes", 10000),
         )
         prefetcher.start()
-        # 600s timeout: accounts for HF 429 rate limit retry (310s)
-        # plus actual download time on slow networks
-        prefetcher.wait_for_min(timeout=600.0)
+        # 3600s timeout: bulk mode downloads all episodes in one snapshot_download
+        # call before signalling ready. With 2000+ files and HF rate-limiting
+        # (429 retries up to 3x with exponential backoff), downloads can take
+        # 5-20 minutes on a fresh machine. 1 hour is a safe upper bound.
+        wait_timeout = source.get("prefetch_wait_timeout_s", 3600.0)
+        prefetcher.wait_for_min(timeout=wait_timeout)
 
         self._prefetchers.append(prefetcher)
         source["root"] = str(local_dir)
