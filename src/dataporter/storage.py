@@ -109,6 +109,10 @@ class ShardStorage:
         self._shard_texts: dict[int, list[str]] = {}
         self._pending_evictions: set[Path] = set()
 
+        # Metadata cache: shard_name → (num_rows, file_size_bytes)
+        # Avoids re-opening ParquetFiles on every refresh (~80µs/file × 4000 = 320ms).
+        self._shard_meta: dict[str, tuple[int, int]] = {}
+
         # Epoch-aware eviction: when frozen, eviction is deferred
         self._frozen = False
         # Pinned shard list from state_dict (for resume)
@@ -203,6 +207,14 @@ class ShardStorage:
         """
         self._pinned_shards = state.get("shard_names")
         self._frozen = True
+        # Pre-populate metadata cache from checkpoint — avoids
+        # opening every ParquetFile during the upcoming refresh.
+        shard_names = state.get("shard_names", [])
+        shard_rows = state.get("shard_rows", [])
+        for name, rows in zip(shard_names, shard_rows):
+            if name not in self._shard_meta:
+                # file_size=0 sentinel — will be filled on first stat
+                self._shard_meta[name] = (rows, 0)
         # Force a refresh to apply the pinned list
         self._last_refresh = 0.0
         self.refresh()
@@ -210,9 +222,6 @@ class ShardStorage:
     def refresh(self) -> None:
         now = monotonic()
         self._last_refresh = now
-
-        # Close caches before evicting
-        self._shard_texts.clear()
 
         # Execute pending evictions (only if not frozen)
         if not self._frozen:
@@ -223,6 +232,7 @@ class ShardStorage:
                         if manifest.exists():
                             manifest.unlink()
                         path.unlink()
+                    self._shard_meta.pop(path.name, None)
                 except (FileNotFoundError, OSError):
                     pass
             self._pending_evictions.clear()
@@ -231,12 +241,13 @@ class ShardStorage:
 
         # Auto-evict if over size limit (only if not frozen)
         if not self._frozen and self._max_cache_bytes is not None:
-            total = sum(p.stat().st_size for p in paths)
-            while total > self._max_cache_bytes and paths:
+            total_size = sum(self._cached_file_size(p) for p in paths)
+            while total_size > self._max_cache_bytes and paths:
                 victim = paths.pop(0)
                 try:
-                    total -= victim.stat().st_size
+                    total_size -= self._cached_file_size(victim)
                     victim.unlink()
+                    self._shard_meta.pop(victim.name, None)
                 except (FileNotFoundError, OSError):
                     pass
 
@@ -245,22 +256,60 @@ class ShardStorage:
             pinned_set = set(self._pinned_shards)
             paths = [p for p in paths if p.name in pinned_set]
 
+        # Build shard list — only open ParquetFile for NEW shards.
+        # Known shards use cached metadata (saves ~80µs/file × N).
+        current_names = {p.name for p in paths}
+
+        # Clean stale entries from metadata cache
+        stale = set(self._shard_meta) - current_names
+        for name in stale:
+            del self._shard_meta[name]
+
         shards = []
         cumulative = []
         total = 0
         for p in paths:
-            try:
-                pf = pq.ParquetFile(str(p))
-                n = pf.metadata.num_rows
-                shards.append((p, n))
-                total += n
-                cumulative.append(total)
-            except Exception:
-                continue
+            name = p.name
+            if name in self._shard_meta:
+                n = self._shard_meta[name][0]
+            else:
+                try:
+                    pf = pq.ParquetFile(str(p))
+                    n = pf.metadata.num_rows
+                    self._shard_meta[name] = (n, p.stat().st_size)
+                except Exception:
+                    continue
+            shards.append((p, n))
+            total += n
+            cumulative.append(total)
+
+        # Remap _shard_texts to new positional indices instead of
+        # clearing unconditionally — keeps cached text for stable shards.
+        old_name_to_idx = {path.name: idx for idx, (path, _) in enumerate(self._shards)}
+        new_texts: dict[int, list[str]] = {}
+        for new_idx, (path, _) in enumerate(shards):
+            old_idx = old_name_to_idx.get(path.name)
+            if old_idx is not None and old_idx in self._shard_texts:
+                new_texts[new_idx] = self._shard_texts[old_idx]
+        self._shard_texts = new_texts
 
         self._shards = shards
         self._cumulative_rows = cumulative
         self._total_rows = total
+
+    def _cached_file_size(self, path: Path) -> int:
+        """Return file size, preferring metadata cache over stat()."""
+        meta = self._shard_meta.get(path.name)
+        if meta and meta[1] > 0:
+            return meta[1]
+        try:
+            sz = path.stat().st_size
+            # Back-fill the size into the cache if row count is known
+            if meta:
+                self._shard_meta[path.name] = (meta[0], sz)
+            return sz
+        except (FileNotFoundError, OSError):
+            return 0
 
     def _maybe_refresh(self) -> None:
         if monotonic() - self._last_refresh >= self._refresh_interval:
@@ -270,7 +319,7 @@ class ShardStorage:
         """Quick eviction check — throttled to every 0.5 seconds.
 
         Evicts oldest shards when total cache size exceeds max_cache_gb.
-        Throttled because glob + stat costs ~1ms for 200 files.
+        Uses metadata cache to avoid stat() calls for known shards.
         """
         if self._frozen or self._max_cache_bytes is None:
             return
@@ -280,12 +329,13 @@ class ShardStorage:
         self._last_evict_check = now
 
         paths = sorted(self._dir.glob("*.parquet"))
-        total = sum(p.stat().st_size for p in paths)
+        total = sum(self._cached_file_size(p) for p in paths)
         while total > self._max_cache_bytes and paths:
             victim = paths.pop(0)
             try:
-                total -= victim.stat().st_size
+                total -= self._cached_file_size(victim)
                 victim.unlink()
+                self._shard_meta.pop(victim.name, None)
             except (FileNotFoundError, OSError):
                 pass
 
