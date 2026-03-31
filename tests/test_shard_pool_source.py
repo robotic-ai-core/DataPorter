@@ -67,8 +67,8 @@ class TestBasic:
 
         assert len(texts) == n, f"Expected {n} unique texts, got {len(texts)}"
 
-    def test_exhaustion_raises(self, tmp_path):
-        """Reading past the total should raise IndexError."""
+    def test_exhaustion_returns_empty(self, tmp_path):
+        """Reading past the total returns empty string (no crash)."""
         _write_shards(tmp_path, n=2, docs_per_shard=5)
         src = ShardPoolSource(tmp_path, pool_size=2)
         n = len(src)
@@ -77,8 +77,8 @@ class TestBasic:
         for i in range(n):
             src[i]
 
-        with pytest.raises(IndexError, match="exhausted"):
-            src[n]
+        # Past exhaustion: returns empty, doesn't crash
+        assert src[n] == {"text": ""}
 
     def test_pool_size_one(self, tmp_path):
         """N=1 should work — pure sequential."""
@@ -360,3 +360,97 @@ class TestMixingQuality:
 
         mean_run = sum(runs) / len(runs)
         assert mean_run < 3.0, f"Mean run length {mean_run:.1f} too high for N=3"
+
+
+# ---------------------------------------------------------------------------
+# Corner case: num_workers > shard_count
+# ---------------------------------------------------------------------------
+
+class TestExcessWorkers:
+
+    def test_more_workers_than_shards_no_crash(self, tmp_path):
+        """Workers with empty partitions return empty strings, not crash."""
+        _write_shards(tmp_path, n=2, docs_per_shard=5)
+        src = ShardPoolSource(tmp_path, pool_size=2, seed=42)
+
+        # Simulate 4 workers with only 2 shards
+        for worker_id in range(4):
+            src2 = ShardPoolSource(tmp_path, pool_size=2, seed=42)
+            info = type("Info", (), {"id": worker_id, "num_workers": 4})()
+            with patch("torch.utils.data.get_worker_info", return_value=info):
+                src2._init_worker()
+
+            if worker_id < 2:
+                # Workers 0-1 should have shards
+                assert not src2._empty_worker
+            else:
+                # Workers 2-3 should be marked empty
+                assert src2._empty_worker
+                # __getitem__ should return empty, not crash
+                assert src2[0] == {"text": ""}
+
+    def test_dataloader_survives_excess_workers(self, tmp_path):
+        """DataLoader with more workers than shards completes without crash."""
+        _write_shards(tmp_path, n=2, docs_per_shard=10)
+        src = ShardPoolSource(tmp_path, pool_size=2, seed=42)
+        ds = TransformableDataset(
+            src,
+            lambda source, idx: {"text": source[idx]["text"]},
+        )
+
+        loader = DataLoader(ds, batch_size=4, shuffle=False, num_workers=0)
+        all_texts = []
+        for batch in loader:
+            all_texts.extend(batch["text"])
+
+        # Non-empty texts should cover all 20 docs
+        non_empty = [t for t in all_texts if t]
+        assert len(non_empty) == 20
+
+
+# ---------------------------------------------------------------------------
+# Corner case: shard deleted between init and load
+# ---------------------------------------------------------------------------
+
+class TestMissingShard:
+
+    def test_load_shard_skips_missing_file(self, tmp_path):
+        """If a shard is deleted after init, _fill_pool skips it gracefully."""
+        _write_shards(tmp_path, n=5, docs_per_shard=10)
+        src = ShardPoolSource(tmp_path, pool_size=2, seed=42)
+
+        # Init to get the shard list
+        src._init_worker()
+
+        # Reset pool and delete a shard that's in the queue
+        src._pool = []
+        src._cursors = []
+        src._row_orders = []
+        if src._shard_queue:
+            shard_idx = src._shard_queue[0]
+            path = src._storage._shards[shard_idx][0]
+            path.unlink()
+
+        # _fill_pool should skip the missing shard and load the next one
+        src._fill_pool()
+        assert len(src._pool) > 0, "Pool should have loaded a shard despite one missing"
+
+    def test_all_assigned_shards_missing(self, tmp_path):
+        """If all assigned shards are deleted, pool is empty → returns empty."""
+        _write_shards(tmp_path, n=2, docs_per_shard=5)
+        src = ShardPoolSource(tmp_path, pool_size=2, seed=42)
+        src._init_worker()
+
+        # Delete all shard files
+        for p in tmp_path.glob("shard_*.parquet"):
+            p.unlink()
+
+        # Reset pool and try to refill
+        src._pool = []
+        src._cursors = []
+        src._row_orders = []
+        src._fill_pool()
+
+        assert len(src._pool) == 0
+        # __getitem__ should return empty, not crash
+        assert src[0] == {"text": ""}

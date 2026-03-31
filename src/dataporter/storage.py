@@ -255,6 +255,12 @@ class ShardStorage:
         if self._pinned_shards is not None:
             pinned_set = set(self._pinned_shards)
             paths = [p for p in paths if p.name in pinned_set]
+            missing = pinned_set - {p.name for p in paths}
+            if missing:
+                logger.warning(
+                    f"Resume: {len(missing)}/{len(pinned_set)} pinned shards "
+                    f"missing from disk (first 5: {sorted(missing)[:5]})"
+                )
 
         # Build shard list — only open ParquetFile for NEW shards.
         # Known shards use cached metadata (saves ~80µs/file × N).

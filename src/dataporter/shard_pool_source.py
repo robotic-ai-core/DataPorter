@@ -76,6 +76,7 @@ class ShardPoolSource:
 
         # Per-worker state — initialized lazily after fork
         self._initialized = False
+        self._empty_worker = False
         self._pool: list[list[str]] = []        # loaded shard texts
         self._cursors: list[int] = []            # read position per pool slot
         self._row_orders: list[list[int]] = []   # shuffled row indices per slot
@@ -90,10 +91,20 @@ class ShardPoolSource:
         return len(self._storage)
 
     def __getitem__(self, idx: int) -> dict[str, str]:
-        """Return next doc from pool. ``idx`` is ignored (progress only)."""
+        """Return next doc from pool. ``idx`` is ignored (progress only).
+
+        Workers with empty partitions (num_workers > shard_count) return
+        empty strings instead of crashing.
+        """
         if not self._initialized:
             self._init_worker()
-        return {"text": self._next_doc()}
+        if self._empty_worker:
+            return {"text": ""}
+        try:
+            return {"text": self._next_doc()}
+        except IndexError:
+            # All assigned shards consumed — return empty for remaining indices
+            return {"text": ""}
 
     # ------------------------------------------------------------------
     # Freeze / unfreeze / state_dict — delegates to ShardStorage
@@ -157,6 +168,16 @@ class ShardPoolSource:
         my_shards = [s for i, s in enumerate(shard_indices)
                      if i % num_workers == worker_id]
 
+        if not my_shards:
+            logger.warning(
+                f"Worker {worker_id}/{num_workers}: no shards assigned "
+                f"(only {n_shards} shards for {num_workers} workers)"
+            )
+            self._empty_worker = True
+            self._initialized = True
+            return
+
+        self._empty_worker = False
         self._shard_queue = deque(my_shards)
         self._rng = random.Random(self._seed + self._epoch * 1000 + worker_id)
         self._pool = []
@@ -175,17 +196,27 @@ class ShardPoolSource:
         while len(self._pool) < self._pool_size and self._shard_queue:
             shard_idx = self._shard_queue.popleft()
             texts = self._load_shard(shard_idx)
+            if texts is None:
+                continue  # shard missing from disk — skip
             row_order = list(range(len(texts)))
             self._rng.shuffle(row_order)
             self._pool.append(texts)
             self._cursors.append(0)
             self._row_orders.append(row_order)
 
-    def _load_shard(self, shard_idx: int) -> list[str]:
-        """Read an entire shard's text column into memory."""
+    def _load_shard(self, shard_idx: int) -> list[str] | None:
+        """Read an entire shard's text column into memory.
+
+        Returns None if the shard file is missing (e.g., evicted between
+        init and load).
+        """
         path, _ = self._storage._shards[shard_idx]
-        pf = pq.ParquetFile(str(path))
-        return pf.read().column(self._text_column).to_pylist()
+        try:
+            pf = pq.ParquetFile(str(path))
+            return pf.read().column(self._text_column).to_pylist()
+        except (FileNotFoundError, OSError) as e:
+            logger.warning(f"Shard {path.name} missing, skipping: {e}")
+            return None
 
     def _next_doc(self) -> str:
         """Sample one doc from the pool, replace exhausted shards."""
