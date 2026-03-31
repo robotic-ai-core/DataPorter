@@ -19,6 +19,7 @@ from .transforms import compose, get_tokenizer
 from .hf_client import hf_download, hf_snapshot, hf_load_dataset
 from .text_prefetcher import TextPrefetcher
 from .raw_text_source import RawTextSource
+from .shard_pool_source import ShardPoolSource
 from .storage import ShardStorage, MemoryStorage, SharedMemoryStorage
 from .prefetched_source import PrefetchedSource, priority_producer
 from .transformable_dataset import TransformableDataset
@@ -70,6 +71,7 @@ __all__ = [
     # Text streaming
     'TextPrefetcher',
     'RawTextSource',
+    'ShardPoolSource',
     'TransformableDataset',
     # HF rate-limited client
     'hf_download',
