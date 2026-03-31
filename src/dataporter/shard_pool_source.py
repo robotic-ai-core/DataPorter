@@ -140,16 +140,27 @@ class ShardPoolSource:
     # Worker initialization (after fork)
     # ------------------------------------------------------------------
 
+    # Max seconds to wait for shards during worker init. The prefetcher
+    # typically writes its first shard within 2-3 seconds.
+    _INIT_POLL_TIMEOUT = 30.0
+    _INIT_POLL_INTERVAL = 1.0
+
     def _init_worker(self) -> None:
         """Partition shards across workers and fill the initial pool.
 
         Called lazily on first ``__getitem__`` — after the DataLoader
         fork, so ``get_worker_info()`` returns the correct worker id.
 
+        If too few shards exist for the worker count, polls the disk
+        (via ``refresh()``) until enough shards appear or the timeout
+        expires. The prefetcher writes continuously, so shards typically
+        appear within a few seconds.
+
         Auto-increments the epoch counter so shard order changes on each
         DataLoader creation without requiring an explicit ``set_epoch()``
         call from the training loop.
         """
+        import time
         import torch.utils.data
 
         self._epoch += 1
@@ -158,20 +169,31 @@ class ShardPoolSource:
         worker_id = info.id if info else 0
         num_workers = info.num_workers if info else 1
 
-        # Deterministic shard order from (seed, epoch)
-        n_shards = self._storage.shard_count
-        shard_indices = list(range(n_shards))
-        rng = random.Random(self._seed + self._epoch)
-        rng.shuffle(shard_indices)
+        # Poll until this worker gets at least one shard
+        my_shards: list[int] = []
+        waited = 0.0
+        while not my_shards:
+            self._storage._last_refresh = 0.0
+            self._storage.refresh()
 
-        # Interleaved partition: worker k gets indices k, k+W, k+2W, ...
-        my_shards = [s for i, s in enumerate(shard_indices)
-                     if i % num_workers == worker_id]
+            n_shards = self._storage.shard_count
+            shard_indices = list(range(n_shards))
+            rng = random.Random(self._seed + self._epoch)
+            rng.shuffle(shard_indices)
+
+            my_shards = [s for i, s in enumerate(shard_indices)
+                         if i % num_workers == worker_id]
+
+            if my_shards or waited >= self._INIT_POLL_TIMEOUT:
+                break
+
+            time.sleep(self._INIT_POLL_INTERVAL)
+            waited += self._INIT_POLL_INTERVAL
 
         if not my_shards:
             logger.warning(
-                f"Worker {worker_id}/{num_workers}: no shards assigned "
-                f"(only {n_shards} shards for {num_workers} workers)"
+                f"Worker {worker_id}/{num_workers}: no shards after "
+                f"{waited:.0f}s (only {n_shards} shards for {num_workers} workers)"
             )
             self._empty_worker = True
             self._initialized = True
@@ -188,7 +210,8 @@ class ShardPoolSource:
 
         logger.debug(
             f"Worker {worker_id}/{num_workers}: "
-            f"{len(my_shards)} shards assigned, pool_size={self._pool_size}"
+            f"{len(my_shards)} shards assigned (waited {waited:.0f}s), "
+            f"pool_size={self._pool_size}"
         )
 
     def _fill_pool(self) -> None:

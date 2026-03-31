@@ -368,26 +368,55 @@ class TestMixingQuality:
 
 class TestExcessWorkers:
 
-    def test_more_workers_than_shards_no_crash(self, tmp_path):
-        """Workers with empty partitions return empty strings, not crash."""
-        _write_shards(tmp_path, n=2, docs_per_shard=5)
-        src = ShardPoolSource(tmp_path, pool_size=2, seed=42)
+    def test_workers_poll_for_shards(self, tmp_path):
+        """Workers with no shards at init time poll until shards appear."""
+        import threading
 
-        # Simulate 4 workers with only 2 shards
-        for worker_id in range(4):
-            src2 = ShardPoolSource(tmp_path, pool_size=2, seed=42)
+        # Start with 0 shards
+        src = ShardPoolSource(tmp_path, pool_size=2, seed=42)
+        # Override timeout for fast test
+        src._INIT_POLL_TIMEOUT = 5.0
+        src._INIT_POLL_INTERVAL = 0.1
+
+        results = {}
+
+        def worker_fn(worker_id):
             info = type("Info", (), {"id": worker_id, "num_workers": 4})()
             with patch("torch.utils.data.get_worker_info", return_value=info):
+                src2 = ShardPoolSource(tmp_path, pool_size=2, seed=42)
+                src2._INIT_POLL_TIMEOUT = 5.0
+                src2._INIT_POLL_INTERVAL = 0.1
                 src2._init_worker()
+                results[worker_id] = not src2._empty_worker
 
-            if worker_id < 2:
-                # Workers 0-1 should have shards
-                assert not src2._empty_worker
-            else:
-                # Workers 2-3 should be marked empty
-                assert src2._empty_worker
-                # __getitem__ should return empty, not crash
-                assert src2[0] == {"text": ""}
+        # Start workers in background — they'll poll for shards
+        threads = [threading.Thread(target=worker_fn, args=(i,)) for i in range(4)]
+        for t in threads:
+            t.start()
+
+        # After a short delay, write shards — workers should pick them up
+        import time
+        time.sleep(0.3)
+        _write_shards(tmp_path, n=8, docs_per_shard=5)
+
+        for t in threads:
+            t.join(timeout=10)
+
+        # All 4 workers should have gotten shards (8 shards / 4 workers = 2 each)
+        assert all(results.values()), f"Some workers still empty: {results}"
+
+    def test_truly_no_shards_returns_empty(self, tmp_path):
+        """If no shards appear even after timeout, worker returns empty."""
+        src = ShardPoolSource(tmp_path, pool_size=2, seed=42)
+        src._INIT_POLL_TIMEOUT = 0.2  # very short timeout
+        src._INIT_POLL_INTERVAL = 0.1
+
+        info = type("Info", (), {"id": 0, "num_workers": 1})()
+        with patch("torch.utils.data.get_worker_info", return_value=info):
+            src._init_worker()
+
+        assert src._empty_worker
+        assert src[0] == {"text": ""}
 
     def test_dataloader_survives_excess_workers(self, tmp_path):
         """DataLoader with more workers than shards completes without crash."""
