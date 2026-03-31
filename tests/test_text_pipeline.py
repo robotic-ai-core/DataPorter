@@ -774,7 +774,108 @@ class TestContinuousStreaming:
 
 
 # ---------------------------------------------------------------------------
-# 10. DualThresholdBuffer Tests
+# 10. Disk Flow Control Tests
+# ---------------------------------------------------------------------------
+
+
+class TestDiskFlowControl:
+    """Verify prefetcher pauses writing when cache_dir exceeds max_cache_gb."""
+
+    def test_prefetcher_pauses_at_disk_limit(self, tmp_path):
+        """Writer should stop producing new shards once disk limit is reached."""
+        docs = _make_text_docs(2000, word_count=200)
+
+        prefetcher = TextPrefetcher(
+            dataset="test",
+            cache_dir=tmp_path,
+            min_shards=2,
+            max_rows_per_shard=50,
+            offsets=[0],
+            max_restarts=5,
+            _dataset_factory=_make_factory(docs),
+            max_cache_gb=0.001,  # ~1MB — will be hit after a few shards
+        )
+        prefetcher.start()
+        prefetcher.wait_for_min(timeout=30)
+
+        # Let it run — should pause once disk limit is hit
+        time.sleep(1.0)
+
+        shard_count_at_pause = prefetcher.shard_count
+        total_bytes = sum(
+            p.stat().st_size for p in tmp_path.glob("shard_*.parquet")
+        )
+
+        prefetcher.stop()
+
+        # Should have written some shards but not unlimited
+        assert shard_count_at_pause >= 2
+        # Total should be near the limit (1MB) — not 10x over
+        assert total_bytes < 5 * 1_073_741_824 * 0.001, (
+            f"Wrote {total_bytes / 1e6:.1f}MB, expected ≤ ~5MB"
+        )
+
+    def test_prefetcher_resumes_after_eviction(self, tmp_path):
+        """After shards are deleted (simulating reader eviction), writer resumes."""
+        # Large doc set + unlimited restarts so producers stay alive
+        docs = _make_text_docs(5000, word_count=200)
+
+        prefetcher = TextPrefetcher(
+            dataset="test",
+            cache_dir=tmp_path,
+            min_shards=2,
+            max_rows_per_shard=50,
+            offsets=[0],
+            max_restarts=None,  # unlimited — producers never exit
+            _dataset_factory=_make_factory(docs),
+            max_cache_gb=0.001,  # ~1MB
+        )
+        prefetcher.start()
+        prefetcher.wait_for_min(timeout=30)
+        time.sleep(1.0)
+
+        # Simulate eviction — delete oldest shards
+        shards = sorted(tmp_path.glob("shard_*.parquet"))
+        for s in shards[:max(1, len(shards) // 2)]:
+            s.unlink()
+
+        count_after_eviction = prefetcher.shard_count
+
+        # Wait for prefetcher to notice and resume (polls every 5s)
+        time.sleep(7.0)
+        count_after_resume = prefetcher.shard_count
+        prefetcher.stop()
+
+        assert count_after_resume > count_after_eviction, (
+            f"Prefetcher didn't resume after eviction: "
+            f"{count_after_eviction} → {count_after_resume}"
+        )
+
+    def test_no_limit_writes_freely(self, tmp_path):
+        """Without max_cache_gb, prefetcher writes without pausing."""
+        docs = _make_text_docs(500)
+
+        prefetcher = TextPrefetcher(
+            dataset="test",
+            cache_dir=tmp_path,
+            min_shards=2,
+            max_rows_per_shard=50,
+            offsets=[0],
+            max_restarts=0,
+            _dataset_factory=_make_factory(docs),
+            # No max_cache_gb
+        )
+        prefetcher.start()
+        prefetcher.wait_for_min(timeout=30)
+        time.sleep(0.5)
+        prefetcher.stop()
+
+        # Should have written all docs without pausing
+        assert prefetcher.shard_count >= 4
+
+
+# ---------------------------------------------------------------------------
+# 11. DualThresholdBuffer Tests
 # ---------------------------------------------------------------------------
 
 class TestDualThresholdBuffer:

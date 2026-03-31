@@ -141,13 +141,21 @@ class TextPrefetcher(BasePrefetcher):
             Default: 1 × max_rows_per_shard (at least one full shard buffered).
         max_restarts: Max times a stream restarts after exhaustion.
             None = unlimited (stream until stop).
+        max_cache_gb: Disk-level flow control. Writer pauses when cache_dir
+            exceeds this size and resumes when it drops to 80%.
+            None = no limit (write until stop).
         _dataset_factory: Override dataset loading (for testing).
             Forces thread mode (lambdas aren't picklable).
 
     Note:
-        The prefetcher only writes shards — it never deletes them.
-        Eviction is the reader's responsibility (RawTextSource.max_cache_gb).
+        When ``max_cache_gb`` is set, the prefetcher pauses writing (and
+        back-pressures producers) when disk is full, saving bandwidth.
+        The reader (ShardPoolSource) evicts consumed shards, which
+        eventually brings disk usage below the resume threshold.
     """
+
+    # Disk flow control: resume at 80% of max_cache_gb
+    _DISK_LOW_WATER_RATIO = 0.8
 
     def __init__(
         self,
@@ -163,6 +171,7 @@ class TextPrefetcher(BasePrefetcher):
         high_water: int | None = None,
         low_water: int | None = None,
         max_restarts: int | None = None,
+        max_cache_gb: float | None = None,
         _dataset_factory: Callable | None = None,
     ):
         super().__init__(
@@ -182,6 +191,13 @@ class TextPrefetcher(BasePrefetcher):
         self._high_water = high_water if high_water is not None else max_rows_per_shard * 3
         self._low_water = low_water if low_water is not None else max_rows_per_shard
         self._max_restarts = max_restarts
+        self._max_cache_bytes = (
+            int(max_cache_gb * 1_073_741_824) if max_cache_gb else None
+        )
+        self._disk_low_water_bytes = (
+            int(self._max_cache_bytes * self._DISK_LOW_WATER_RATIO)
+            if self._max_cache_bytes else None
+        )
 
     def _get_init_kwargs(self) -> dict[str, Any]:
         return dict(
@@ -197,6 +213,10 @@ class TextPrefetcher(BasePrefetcher):
             high_water=self._high_water,
             low_water=self._low_water,
             max_restarts=self._max_restarts,
+            max_cache_gb=(
+                self._max_cache_bytes / 1_073_741_824
+                if self._max_cache_bytes else None
+            ),
         )
 
     def _load_dataset(self, offset: int) -> Any:
@@ -326,6 +346,9 @@ class TextPrefetcher(BasePrefetcher):
                 shard_buf.append(item)
 
             if len(shard_buf) >= self._max_rows_per_shard:
+                self._wait_for_disk_space()
+                if self._stop_event.is_set():
+                    break
                 self._write_shard(shard_buf, schema)
                 shard_buf.clear()
 
@@ -333,6 +356,42 @@ class TextPrefetcher(BasePrefetcher):
         if shard_buf and not self._stop_event.is_set():
             self._write_shard(shard_buf, schema)
             self._maybe_evict(rng)
+
+    def _cache_dir_bytes(self) -> int:
+        """Total size of parquet files in cache_dir."""
+        return sum(
+            p.stat().st_size for p in self._cache_dir.glob("*.parquet")
+            if p.suffix == ".parquet"
+        )
+
+    def _wait_for_disk_space(self) -> None:
+        """Block until cache_dir is below max_cache_gb (disk flow control).
+
+        Pauses at max_cache_gb, resumes at 80%. Back-pressures the
+        in-memory DualThresholdBuffer, which back-pressures the HF
+        stream producers. Net effect: no bandwidth wasted when disk is full.
+        """
+        if self._max_cache_bytes is None:
+            return
+
+        usage = self._cache_dir_bytes()
+        if usage < self._max_cache_bytes:
+            return
+
+        logger.info(
+            f"Disk full ({usage / 1e9:.1f}GB >= "
+            f"{self._max_cache_bytes / 1e9:.1f}GB) — pausing prefetcher"
+        )
+        while usage > self._disk_low_water_bytes:
+            if self._stop_event.is_set():
+                return
+            self._stop_event.wait(timeout=5.0)
+            usage = self._cache_dir_bytes()
+
+        logger.info(
+            f"Disk below low water ({usage / 1e9:.1f}GB <= "
+            f"{self._disk_low_water_bytes / 1e9:.1f}GB) — resuming prefetcher"
+        )
 
     def _write_shard(self, texts: list[str], schema: pa.Schema) -> None:
         tmp_path, final_path = self._next_shard_tmp_path()
