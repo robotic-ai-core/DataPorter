@@ -90,25 +90,27 @@ class ShardStorage:
             None = no limit (cache grows until disk is full).
     """
 
+    # Max in-memory shard text caches per instance. Each shard is ~15MB of
+    # text strings; 200 × 15MB = ~3GB — safe for forked DataLoader workers.
+    _TEXT_CACHE_CAPACITY = 200
+
     def __init__(
         self,
         data_dir: str | Path,
         text_column: str = "text",
         refresh_interval: float = 30.0,
         max_cache_gb: float | None = None,
-        max_cached_shards: int = 200,
     ):
         self._dir = Path(data_dir)
         self._text_column = text_column
         self._refresh_interval = refresh_interval
         self._max_cache_bytes = int(max_cache_gb * 1_073_741_824) if max_cache_gb else None
-        self._max_cached_shards = max_cached_shards
         self._last_refresh = 0.0
 
         self._shards: list[tuple[Path, int]] = []
         self._cumulative_rows: list[int] = []
         self._total_rows = 0
-        # LRU text cache: shard_idx → list[str]. Bounded by max_cached_shards
+        # LRU text cache: shard_idx → list[str]. Bounded by _TEXT_CACHE_CAPACITY
         # to prevent OOM in forked DataLoader workers.
         self._shard_texts: OrderedDict[int, list[str]] = OrderedDict()
         self._pending_evictions: set[Path] = set()
@@ -290,8 +292,8 @@ class ShardStorage:
             old_idx = old_name_to_idx.get(path.name)
             if old_idx is not None and old_idx in self._shard_texts:
                 new_texts[new_idx] = self._shard_texts[old_idx]
-        # Cap to max_cached_shards (drop oldest)
-        while len(new_texts) > self._max_cached_shards:
+        # Cap to _TEXT_CACHE_CAPACITY (drop oldest)
+        while len(new_texts) > self._TEXT_CACHE_CAPACITY:
             new_texts.popitem(last=False)
         self._shard_texts = new_texts
 
@@ -308,7 +310,7 @@ class ShardStorage:
             col = pf.read().column(self._text_column)
             self._shard_texts[shard_idx] = col.to_pylist()
             # Evict oldest entries if over limit
-            while len(self._shard_texts) > self._max_cached_shards:
+            while len(self._shard_texts) > self._TEXT_CACHE_CAPACITY:
                 self._shard_texts.popitem(last=False)
         return self._shard_texts[shard_idx][local_row]
 
