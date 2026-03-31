@@ -96,15 +96,6 @@ class ShardPoolSource:
         return {"text": self._next_doc()}
 
     # ------------------------------------------------------------------
-    # Epoch management
-    # ------------------------------------------------------------------
-
-    def set_epoch(self, epoch: int) -> None:
-        """Re-shuffle shard assignments for the new epoch."""
-        self._epoch = epoch
-        self._initialized = False
-
-    # ------------------------------------------------------------------
     # Freeze / unfreeze / state_dict — delegates to ShardStorage
     # ------------------------------------------------------------------
 
@@ -143,8 +134,14 @@ class ShardPoolSource:
 
         Called lazily on first ``__getitem__`` — after the DataLoader
         fork, so ``get_worker_info()`` returns the correct worker id.
+
+        Auto-increments the epoch counter so shard order changes on each
+        DataLoader creation without requiring an explicit ``set_epoch()``
+        call from the training loop.
         """
         import torch.utils.data
+
+        self._epoch += 1
 
         info = torch.utils.data.get_worker_info()
         worker_id = info.id if info else 0

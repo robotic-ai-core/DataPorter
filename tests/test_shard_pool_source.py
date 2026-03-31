@@ -191,18 +191,20 @@ class TestShardReplacement:
 
 class TestEpochManagement:
 
-    def test_set_epoch_changes_order(self, tmp_path):
+    def test_reinit_changes_order(self, tmp_path):
+        """Each _init_worker() auto-increments epoch → different shard order."""
         _write_shards(tmp_path, n=6, docs_per_shard=5)
 
         src = ShardPoolSource(tmp_path, pool_size=2, seed=42)
         texts_e0 = [src[i]["text"] for i in range(30)]
 
-        src.set_epoch(1)
+        # Simulate new epoch: reset and let _init_worker run again
+        src._initialized = False
         texts_e1 = [src[i]["text"] for i in range(30)]
 
         # Same content, different order
         assert set(texts_e0) == set(texts_e1)
-        assert texts_e0 != texts_e1, "Different epoch should produce different order"
+        assert texts_e0 != texts_e1, "Re-init should produce different order"
 
 
 # ---------------------------------------------------------------------------
