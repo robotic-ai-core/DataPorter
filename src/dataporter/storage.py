@@ -96,17 +96,21 @@ class ShardStorage:
         text_column: str = "text",
         refresh_interval: float = 30.0,
         max_cache_gb: float | None = None,
+        max_cached_shards: int = 200,
     ):
         self._dir = Path(data_dir)
         self._text_column = text_column
         self._refresh_interval = refresh_interval
         self._max_cache_bytes = int(max_cache_gb * 1_073_741_824) if max_cache_gb else None
+        self._max_cached_shards = max_cached_shards
         self._last_refresh = 0.0
 
         self._shards: list[tuple[Path, int]] = []
         self._cumulative_rows: list[int] = []
         self._total_rows = 0
-        self._shard_texts: dict[int, list[str]] = {}
+        # LRU text cache: shard_idx → list[str]. Bounded by max_cached_shards
+        # to prevent OOM in forked DataLoader workers.
+        self._shard_texts: OrderedDict[int, list[str]] = OrderedDict()
         self._pending_evictions: set[Path] = set()
 
         # Metadata cache: shard_name → (num_rows, file_size_bytes)
@@ -129,11 +133,8 @@ class ShardStorage:
         shard_idx, local_row = self._locate(idx)
 
         try:
-            if shard_idx not in self._shard_texts:
-                pf = pq.ParquetFile(str(self._shards[shard_idx][0]))
-                col = pf.read().column(self._text_column)
-                self._shard_texts[shard_idx] = col.to_pylist()
-            return {"text": self._shard_texts[shard_idx][local_row]}
+            text = self._get_shard_text(shard_idx, local_row)
+            return {"text": text}
         except (FileNotFoundError, KeyError, IndexError):
             self._last_refresh = 0.0
             self.refresh()
@@ -141,11 +142,8 @@ class ShardStorage:
                 return None
             idx = idx % self._total_rows
             shard_idx, local_row = self._locate(idx)
-            if shard_idx not in self._shard_texts:
-                pf = pq.ParquetFile(str(self._shards[shard_idx][0]))
-                col = pf.read().column(self._text_column)
-                self._shard_texts[shard_idx] = col.to_pylist()
-            return {"text": self._shard_texts[shard_idx][local_row]}
+            text = self._get_shard_text(shard_idx, local_row)
+            return {"text": text}
 
     def __len__(self) -> int:
         self._maybe_refresh()
@@ -285,17 +283,34 @@ class ShardStorage:
 
         # Remap _shard_texts to new positional indices instead of
         # clearing unconditionally — keeps cached text for stable shards.
+        # Preserves LRU order from the old cache.
         old_name_to_idx = {path.name: idx for idx, (path, _) in enumerate(self._shards)}
-        new_texts: dict[int, list[str]] = {}
+        new_texts: OrderedDict[int, list[str]] = OrderedDict()
         for new_idx, (path, _) in enumerate(shards):
             old_idx = old_name_to_idx.get(path.name)
             if old_idx is not None and old_idx in self._shard_texts:
                 new_texts[new_idx] = self._shard_texts[old_idx]
+        # Cap to max_cached_shards (drop oldest)
+        while len(new_texts) > self._max_cached_shards:
+            new_texts.popitem(last=False)
         self._shard_texts = new_texts
 
         self._shards = shards
         self._cumulative_rows = cumulative
         self._total_rows = total
+
+    def _get_shard_text(self, shard_idx: int, local_row: int) -> str:
+        """Read text from shard, with bounded LRU caching."""
+        if shard_idx in self._shard_texts:
+            self._shard_texts.move_to_end(shard_idx)
+        else:
+            pf = pq.ParquetFile(str(self._shards[shard_idx][0]))
+            col = pf.read().column(self._text_column)
+            self._shard_texts[shard_idx] = col.to_pylist()
+            # Evict oldest entries if over limit
+            while len(self._shard_texts) > self._max_cached_shards:
+                self._shard_texts.popitem(last=False)
+        return self._shard_texts[shard_idx][local_row]
 
     def _cached_file_size(self, path: Path) -> int:
         """Return file size, preferring metadata cache over stat()."""
