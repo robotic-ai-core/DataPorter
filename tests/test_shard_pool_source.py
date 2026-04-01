@@ -368,73 +368,37 @@ class TestMixingQuality:
 
 class TestExcessWorkers:
 
-    def test_workers_poll_for_shards(self, tmp_path):
-        """Workers with no shards at init time poll until shards appear."""
-        import threading
-
-        # Start with 0 shards
+    def test_fewer_shards_than_workers_raises(self, tmp_path):
+        """Workers fail fast when shard_count < num_workers."""
+        _write_shards(tmp_path, n=2, docs_per_shard=5)
         src = ShardPoolSource(tmp_path, pool_size=2, seed=42)
-        # Override timeout for fast test
-        src._INIT_POLL_TIMEOUT = 5.0
-        src._INIT_POLL_INTERVAL = 0.1
 
-        results = {}
+        # Simulate 4 workers with only 2 shards → should raise
+        info = type("Info", (), {"id": 3, "num_workers": 4})()
+        with patch("torch.utils.data.get_worker_info", return_value=info):
+            with pytest.raises(RuntimeError, match="only 2 shards"):
+                src._init_worker()
 
-        def worker_fn(worker_id):
-            info = type("Info", (), {"id": worker_id, "num_workers": 4})()
-            with patch("torch.utils.data.get_worker_info", return_value=info):
-                src2 = ShardPoolSource(tmp_path, pool_size=2, seed=42)
-                src2._INIT_POLL_TIMEOUT = 5.0
-                src2._INIT_POLL_INTERVAL = 0.1
-                src2._init_worker()
-                results[worker_id] = not src2._empty_worker
-
-        # Start workers in background — they'll poll for shards
-        threads = [threading.Thread(target=worker_fn, args=(i,)) for i in range(4)]
-        for t in threads:
-            t.start()
-
-        # After a short delay, write shards — workers should pick them up
-        import time
-        time.sleep(0.3)
+    def test_enough_shards_all_workers_init(self, tmp_path):
+        """With enough shards, all workers initialize successfully."""
         _write_shards(tmp_path, n=8, docs_per_shard=5)
 
-        for t in threads:
-            t.join(timeout=10)
+        for worker_id in range(4):
+            src = ShardPoolSource(tmp_path, pool_size=2, seed=42)
+            info = type("Info", (), {"id": worker_id, "num_workers": 4})()
+            with patch("torch.utils.data.get_worker_info", return_value=info):
+                src._init_worker()  # should not raise
+            assert not src._empty_worker
 
-        # All 4 workers should have gotten shards (8 shards / 4 workers = 2 each)
-        assert all(results.values()), f"Some workers still empty: {results}"
+    def test_error_message_includes_fix_hint(self, tmp_path):
+        """Error message tells the user how to fix it."""
+        _write_shards(tmp_path, n=1, docs_per_shard=5)
+        src = ShardPoolSource(tmp_path, pool_size=3, seed=42)
 
-    def test_truly_no_shards_returns_empty(self, tmp_path):
-        """If no shards appear even after timeout, worker returns empty."""
-        src = ShardPoolSource(tmp_path, pool_size=2, seed=42)
-        src._INIT_POLL_TIMEOUT = 0.2  # very short timeout
-        src._INIT_POLL_INTERVAL = 0.1
-
-        info = type("Info", (), {"id": 0, "num_workers": 1})()
+        info = type("Info", (), {"id": 0, "num_workers": 4})()
         with patch("torch.utils.data.get_worker_info", return_value=info):
-            src._init_worker()
-
-        assert src._empty_worker
-        assert src[0] == {"text": ""}
-
-    def test_dataloader_survives_excess_workers(self, tmp_path):
-        """DataLoader with more workers than shards completes without crash."""
-        _write_shards(tmp_path, n=2, docs_per_shard=10)
-        src = ShardPoolSource(tmp_path, pool_size=2, seed=42)
-        ds = TransformableDataset(
-            src,
-            lambda source, idx: {"text": source[idx]["text"]},
-        )
-
-        loader = DataLoader(ds, batch_size=4, shuffle=False, num_workers=0)
-        all_texts = []
-        for batch in loader:
-            all_texts.extend(batch["text"])
-
-        # Non-empty texts should cover all 20 docs
-        non_empty = [t for t in all_texts if t]
-        assert len(non_empty) == 20
+            with pytest.raises(RuntimeError, match="wait_for_min.*4 × 3 = 12"):
+                src._init_worker()
 
 
 # ---------------------------------------------------------------------------
@@ -465,7 +429,7 @@ class TestMissingShard:
         assert len(src._pool) > 0, "Pool should have loaded a shard despite one missing"
 
     def test_all_assigned_shards_missing(self, tmp_path):
-        """If all assigned shards are deleted, pool is empty → returns empty."""
+        """If all assigned shards are deleted mid-epoch, returns empty."""
         _write_shards(tmp_path, n=2, docs_per_shard=5)
         src = ShardPoolSource(tmp_path, pool_size=2, seed=42)
         src._init_worker()
@@ -474,12 +438,12 @@ class TestMissingShard:
         for p in tmp_path.glob("shard_*.parquet"):
             p.unlink()
 
-        # Reset pool and try to refill
+        # Reset pool and try to refill — all shards missing
         src._pool = []
         src._cursors = []
         src._row_orders = []
         src._fill_pool()
 
         assert len(src._pool) == 0
-        # __getitem__ should return empty, not crash
+        # __getitem__ returns empty for exhausted pool (end-of-epoch)
         assert src[0] == {"text": ""}

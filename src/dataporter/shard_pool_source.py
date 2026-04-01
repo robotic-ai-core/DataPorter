@@ -93,17 +93,16 @@ class ShardPoolSource:
     def __getitem__(self, idx: int) -> dict[str, str]:
         """Return next doc from pool. ``idx`` is ignored (progress only).
 
-        Workers with empty partitions (num_workers > shard_count) return
-        empty strings instead of crashing.
+        Raises RuntimeError if not enough shards for all workers — this
+        means ``wait_for_min`` wasn't called with a high enough threshold.
         """
         if not self._initialized:
             self._init_worker()
-        if self._empty_worker:
-            return {"text": ""}
         try:
             return {"text": self._next_doc()}
         except IndexError:
             # All assigned shards consumed — return empty for remaining indices
+            # (only happens near the end of an epoch due to uneven partitions)
             return {"text": ""}
 
     # ------------------------------------------------------------------
@@ -140,10 +139,16 @@ class ShardPoolSource:
     # Worker initialization (after fork)
     # ------------------------------------------------------------------
 
-    # Max seconds to wait for shards during worker init. The prefetcher
-    # typically writes its first shard within 2-3 seconds.
-    _INIT_POLL_TIMEOUT = 30.0
-    _INIT_POLL_INTERVAL = 1.0
+    @property
+    def min_shards_required(self) -> int:
+        """Minimum shards needed before workers can initialize.
+
+        Equal to ``num_workers × pool_size`` so every worker gets a full
+        pool.  Pass this to ``TextPrefetcher.wait_for_min()`` at startup.
+        """
+        # num_workers isn't known until fork; use pool_size as the
+        # per-worker floor so callers can compute the total.
+        return self._pool_size
 
     def _init_worker(self) -> None:
         """Partition shards across workers and fill the initial pool.
@@ -151,16 +156,15 @@ class ShardPoolSource:
         Called lazily on first ``__getitem__`` — after the DataLoader
         fork, so ``get_worker_info()`` returns the correct worker id.
 
-        If too few shards exist for the worker count, polls the disk
-        (via ``refresh()``) until enough shards appear or the timeout
-        expires. The prefetcher writes continuously, so shards typically
-        appear within a few seconds.
+        Fails fast if there aren't enough shards for all workers.
+        The caller (TextDataModule) must ensure enough shards exist
+        before creating the DataLoader via ``wait_for_min(num_workers *
+        pool_size)``.
 
         Auto-increments the epoch counter so shard order changes on each
         DataLoader creation without requiring an explicit ``set_epoch()``
         call from the training loop.
         """
-        import time
         import torch.utils.data
 
         self._epoch += 1
@@ -169,35 +173,31 @@ class ShardPoolSource:
         worker_id = info.id if info else 0
         num_workers = info.num_workers if info else 1
 
-        # Poll until this worker gets at least one shard
-        my_shards: list[int] = []
-        waited = 0.0
-        while not my_shards:
-            self._storage._last_refresh = 0.0
-            self._storage.refresh()
+        # Refresh to pick up latest shards from prefetcher
+        self._storage._last_refresh = 0.0
+        self._storage.refresh()
 
-            n_shards = self._storage.shard_count
-            shard_indices = list(range(n_shards))
-            rng = random.Random(self._seed + self._epoch)
-            rng.shuffle(shard_indices)
+        n_shards = self._storage.shard_count
+        min_needed = num_workers  # at least 1 shard per worker
 
-            my_shards = [s for i, s in enumerate(shard_indices)
-                         if i % num_workers == worker_id]
-
-            if my_shards or waited >= self._INIT_POLL_TIMEOUT:
-                break
-
-            time.sleep(self._INIT_POLL_INTERVAL)
-            waited += self._INIT_POLL_INTERVAL
-
-        if not my_shards:
-            logger.warning(
-                f"Worker {worker_id}/{num_workers}: no shards after "
-                f"{waited:.0f}s (only {n_shards} shards for {num_workers} workers)"
+        if n_shards < min_needed:
+            raise RuntimeError(
+                f"ShardPoolSource: only {n_shards} shards available but "
+                f"{num_workers} workers need at least {min_needed}. "
+                f"Increase wait_for_min to num_workers × pool_size "
+                f"({num_workers} × {self._pool_size} = "
+                f"{num_workers * self._pool_size}) before creating "
+                f"the DataLoader."
             )
-            self._empty_worker = True
-            self._initialized = True
-            return
+
+        # Deterministic shard order from (seed, epoch)
+        shard_indices = list(range(n_shards))
+        rng = random.Random(self._seed + self._epoch)
+        rng.shuffle(shard_indices)
+
+        # Interleaved partition: worker k gets indices k, k+W, k+2W, ...
+        my_shards = [s for i, s in enumerate(shard_indices)
+                     if i % num_workers == worker_id]
 
         self._empty_worker = False
         self._shard_queue = deque(my_shards)
@@ -210,8 +210,7 @@ class ShardPoolSource:
 
         logger.debug(
             f"Worker {worker_id}/{num_workers}: "
-            f"{len(my_shards)} shards assigned (waited {waited:.0f}s), "
-            f"pool_size={self._pool_size}"
+            f"{len(my_shards)} shards assigned, pool_size={self._pool_size}"
         )
 
     def _fill_pool(self) -> None:
