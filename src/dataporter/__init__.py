@@ -38,6 +38,9 @@ def __getattr__(name):
     if name == "BlendedLeRobotDataModule":
         from .blended_lerobot_datamodule import BlendedLeRobotDataModule
         return BlendedLeRobotDataModule
+    if name == "scan_available_episodes":
+        from .blended_lerobot_datamodule import scan_available_episodes
+        return scan_available_episodes
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 __all__ = [
@@ -83,6 +86,7 @@ __all__ = [
     # LeRobot integration (lazy — requires lerobot)
     'FastLeRobotDataset',
     'BlendedLeRobotDataModule',
+    'scan_available_episodes',
     # Shuffle buffer (video pipeline)
     'ShuffleBuffer',
     'ProducerPool',

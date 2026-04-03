@@ -28,6 +28,30 @@ from .resumable import ResumableDataLoader, resolve_num_workers
 logger = logging.getLogger(__name__)
 
 
+def scan_available_episodes(local_dir: Path) -> list[int]:
+    """Scan a prefetch directory for available episode parquet files.
+
+    Uses ``rglob`` to find all ``episode_*.parquet`` files, extracts the
+    episode index from each filename, and returns a **deduplicated**,
+    sorted list of episode indices.
+
+    Deduplication is critical: stale nested directories (e.g.
+    ``data/data/chunk-000/``) can cause ``rglob`` to return the same
+    episode index from multiple paths, inflating the dataset.
+
+    Args:
+        local_dir: Root directory to scan (the prefetch cache directory).
+
+    Returns:
+        Sorted list of unique episode indices found on disk.
+    """
+    return sorted(set(
+        int(m.group(1))
+        for p in local_dir.rglob("episode_*.parquet")
+        if (m := re.search(r"episode_(\d+)", p.stem))
+    ))
+
+
 class BlendedLeRobotDataModule(L.LightningDataModule):
     """Multi-source LeRobot DataModule with weighted blending.
 
@@ -218,11 +242,7 @@ class BlendedLeRobotDataModule(L.LightningDataModule):
         self._prefetchers.append(prefetcher)
         source["root"] = str(local_dir)
 
-        available_episodes = sorted(set(
-            int(re.search(r"episode_(\d+)", p.stem).group(1))
-            for p in local_dir.rglob("episode_*.parquet")
-            if re.search(r"episode_(\d+)", p.stem)
-        ))
+        available_episodes = scan_available_episodes(local_dir)
         source["_available_episodes"] = available_episodes
         logger.info(
             f"Prefetcher started for {repo_id} → {local_dir} "
