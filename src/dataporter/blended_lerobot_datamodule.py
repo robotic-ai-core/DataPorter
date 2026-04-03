@@ -81,14 +81,23 @@ class BlendedLeRobotDataModule(L.LightningDataModule):
         frame_buffer_capacity: int | None = None,
         shuffle_buffer_capacity: int | None = None,
         train_split_ratio: float = 0.9,
+        tolerance_s: float | None = None,
     ):
         super().__init__()
 
         # Normalize to list of source dicts
         if isinstance(repo_id, str):
-            self._sources = [{"repo_id": repo_id, "weight": 1.0}]
+            source = {"repo_id": repo_id, "weight": 1.0}
+            if tolerance_s is not None:
+                source["tolerance_s"] = tolerance_s
+            self._sources = [source]
         else:
-            self._sources = [{"weight": 1.0, **src} for src in repo_id]
+            # Per-source tolerance_s in dicts takes precedence over global
+            self._sources = [
+                {"weight": 1.0, **src}
+                | ({"tolerance_s": tolerance_s} if tolerance_s is not None and "tolerance_s" not in src else {})
+                for src in repo_id
+            ]
 
         self.repo_id = self._sources[0]["repo_id"]  # backward compat
         self._prefetchers: list = []
