@@ -218,11 +218,11 @@ class BlendedLeRobotDataModule(L.LightningDataModule):
         self._prefetchers.append(prefetcher)
         source["root"] = str(local_dir)
 
-        available_episodes = sorted(
+        available_episodes = sorted(set(
             int(re.search(r"episode_(\d+)", p.stem).group(1))
             for p in local_dir.rglob("episode_*.parquet")
             if re.search(r"episode_(\d+)", p.stem)
-        )
+        ))
         source["_available_episodes"] = available_episodes
         logger.info(
             f"Prefetcher started for {repo_id} → {local_dir} "
