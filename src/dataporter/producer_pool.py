@@ -41,6 +41,11 @@ class ProducerConfig:
 
     All fields are primitives — no dataset objects, no closures.
     The spawned child process creates its own dataset from these params.
+
+    ``episode_offset`` shifts raw episode indices into a source-unique
+    namespace before writing to the ShuffleBuffer.  This prevents key
+    collisions when multiple sources share the same raw episode indices
+    (e.g. both start at 0).
     """
     source_name: str
     repo_id: str
@@ -49,6 +54,7 @@ class ProducerConfig:
     weight: float = 1.0
     seed: int = 42
     tolerance_s: float | None = None
+    episode_offset: int = 0
 
 
 # Keep AsyncProducer as a convenience wrapper for thread-based usage
@@ -73,12 +79,14 @@ class AsyncProducer:
         episode_indices: list[int],
         weight: float = 1.0,
         seed: int = 42,
+        episode_offset: int = 0,
     ):
         self.source_name = source_name
         self.decode_fn = decode_fn
         self.episode_indices = episode_indices
         self.weight = weight
         self.seed = seed
+        self.episode_offset = episode_offset
 
 
 # ---------------------------------------------------------------------------
@@ -194,6 +202,7 @@ async def _run_spawn_pool(
         iterators[cfg.source_name] = _episode_iterator(cfg.episode_indices, rng)
 
     weight_map = {cfg.source_name: cfg.weight for cfg in configs}
+    offset_map = {cfg.source_name: cfg.episode_offset for cfg in configs}
 
     async def _decode_one(source_name: str, ep_idx: int) -> tuple[str, int, torch.Tensor | None]:
         """Dispatch one decode to the source's executor."""
@@ -235,7 +244,7 @@ async def _run_spawn_pool(
         for task in done:
             source_name, ep_idx, frames = task.result()
             if frames is not None:
-                buffer.put(ep_idx, frames)
+                buffer.put(offset_map[source_name] + ep_idx, frames)
 
             # Check warmup
             if not warmup_event.is_set() and len(buffer) >= warmup_target:
@@ -284,6 +293,7 @@ def _run_thread_pool(
     tokens = {p.source_name: 0.0 for p in producers}
     weight_map = {p.source_name: p.weight for p in producers}
     decode_map = {p.source_name: p.decode_fn for p in producers}
+    offset_map = {p.source_name: p.episode_offset for p in producers}
 
     while not stop_event.is_set():
         name = max(tokens, key=lambda n: weight_map[n] - tokens[n])
@@ -295,7 +305,7 @@ def _run_thread_pool(
             logger.warning(f"Decode failed for {name} ep {ep_idx}: {e}")
             continue
 
-        buffer.put(ep_idx, frames)
+        buffer.put(offset_map[name] + ep_idx, frames)
 
         tokens[name] += 1
         if all(t >= weight_map[n] for n, t in tokens.items()):

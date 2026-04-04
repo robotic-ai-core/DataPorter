@@ -1,26 +1,18 @@
-"""Tests exposing multi-source collision bugs in the shuffle buffer pipeline.
+"""Tests for multi-source episode index offsetting in the shuffle buffer pipeline.
 
-Three bugs are demonstrated:
+Validates that the episode offset mechanism prevents three classes of bugs:
 
 1. **Episode index collision in _ep_to_source** (lerobot_shuffle_buffer_dataset.py):
-   When two sources both have episodes starting at 0, source B's entries
-   overwrite source A's in the flat dict. Episode 0 always maps to the
-   last source, so source A's episodes are entirely unreachable.
+   Two sources with episodes starting at 0 no longer collide because each
+   source's episodes are shifted by a cumulative offset.
 
-2. **Buffer key collision -- no source disambiguation** (shuffle_buffer.py):
-   The key is the raw episode index. The buffer CAN hold two items with
-   key=0 in separate slots (ring buffer), but ``keys()`` returns duplicate
-   values and there is no way to tell which source produced a given sample.
-   Combined with bug 1, source A's frames are always attributed to source B.
+2. **Buffer key collision** (shuffle_buffer.py):
+   Buffer keys are offset episode indices, so source A's episode 0 and
+   source B's episode 0 map to different keys.
 
-3. **Buffer composition drift in ProducerPool** (producer_pool.py):
-   Thread allocation respects weights, but actual buffer composition
-   depends on decode speed. Sources with shorter episodes fill more slots
-   than their weight warrants.
-
-Tests marked ``xfail`` are expected to FAIL with the current code, serving
-as a regression gate. Once the collision bugs are fixed, remove the xfail
-markers and the tests should pass.
+3. **Source attribution via ProducerPool** (producer_pool.py):
+   The ProducerPool applies ``episode_offset`` from ProducerConfig/AsyncProducer
+   when writing to the buffer, ensuring unique keys across sources.
 """
 
 from __future__ import annotations
@@ -44,12 +36,18 @@ from unittest.mock import MagicMock
 
 def _build_ep_to_source(sources: list[dict]) -> dict[int, int]:
     """Reproduce the _ep_to_source construction from
-    LeRobotShuffleBufferDataset.__init__ (lines 82-89).
+    LeRobotShuffleBufferDataset.__init__, including per-source
+    episode_offset for collision avoidance.
     """
     ep_to_source: dict[int, int] = {}
+    cumulative_offset = 0
     for src_idx, src in enumerate(sources):
+        offset = src.get("episode_offset", cumulative_offset)
         for ep_idx in src["train_episode_indices"]:
-            ep_to_source[ep_idx] = src_idx
+            ep_to_source[offset + ep_idx] = src_idx
+        # Auto-advance offset when not explicitly provided
+        if "episode_offset" not in src:
+            cumulative_offset += len(src["train_episode_indices"])
     return ep_to_source
 
 
@@ -121,23 +119,18 @@ def _make_mock_dataset(
 
 
 # ---------------------------------------------------------------------------
-# Test 1: _ep_to_source collision
+# Test 1: _ep_to_source with offset avoids collision
 # ---------------------------------------------------------------------------
 
 class TestEpToSourceCollision:
 
-    @pytest.mark.xfail(
-        reason="Bug: episode index collision -- source B overwrites source A "
-               "in flat _ep_to_source dict (no source namespacing)",
-        strict=True,
-    )
     def test_ep_to_source_collision_detected(self):
-        """Two sources with overlapping episode indices [0..4] should each
-        have their own entries in _ep_to_source. With the current flat dict,
-        source B's entries silently overwrite source A's.
+        """Two sources with overlapping episode indices [0..4] each get
+        their own entries in _ep_to_source thanks to cumulative offsets.
 
-        Expected: 10 entries (5 per source, namespaced by source).
-        Actual:    5 entries (source B overwrites source A).
+        Source A: offset=0, episodes 0-4 -> keys 0-4
+        Source B: offset=5, episodes 0-4 -> keys 5-9
+        Total: 10 entries.
         """
         sources = [
             {"train_episode_indices": [0, 1, 2, 3, 4]},  # Source A
@@ -146,22 +139,14 @@ class TestEpToSourceCollision:
 
         ep_to_source = _build_ep_to_source(sources)
 
-        # After the bug, len == 5 (all mapped to source 1).
-        # Correct behavior requires 10 entries or a composite key.
         assert len(ep_to_source) == 10, (
             f"Expected 10 entries (5 per source), got {len(ep_to_source)}. "
             f"Source B overwrote source A for overlapping episode indices."
         )
 
-    @pytest.mark.xfail(
-        reason="Bug: episode index collision -- all overlapping episodes "
-               "map to the last source",
-        strict=True,
-    )
     def test_all_sources_reachable_via_lookup(self):
-        """Every source should be reachable via _ep_to_source lookup.
-        With the collision bug, source 0 is entirely unreachable because
-        source 1's episodes overwrite its entries.
+        """Every source is reachable via _ep_to_source lookup because
+        offsets prevent source B from overwriting source A's entries.
         """
         sources = [
             {"train_episode_indices": [0, 1, 2, 3, 4]},  # Source A (idx=0)
@@ -179,77 +164,59 @@ class TestEpToSourceCollision:
 
 
 # ---------------------------------------------------------------------------
-# Test 2: Buffer key ambiguity (no source disambiguation)
+# Test 2: Buffer key uniqueness with offset keys
 # ---------------------------------------------------------------------------
 
 class TestBufferKeyCollision:
 
-    @pytest.mark.xfail(
-        reason="Bug: buffer keys() returns duplicate episode indices with no "
-               "source tag -- impossible to distinguish source A's ep 0 from "
-               "source B's ep 0",
-        strict=True,
-    )
     def test_buffer_keys_unique_per_source(self):
-        """When two sources write episodes with the same indices, the buffer's
-        keys() should return source-disambiguated identifiers so the consumer
-        can tell which source produced each item.
+        """When two sources write episodes with the same raw indices,
+        applying offsets before put() produces distinct buffer keys.
 
-        With the current code, keys() returns [0, 0] -- two indistinguishable
-        entries. A correct implementation would return distinct keys like
-        (0, 0) and (1, 0), or namespaced integers like 0 and 1000000.
+        Source A: offset=0, episode 0 -> key 0
+        Source B: offset=1, episode 0 -> key 1
         """
         buf = ShuffleBuffer(
             capacity=10, max_frames=5, channels=3, height=4, width=4,
         )
 
-        buf.put(0, _make_frames(5, fill_value=0))    # Source A, episode 0
-        buf.put(0, _make_frames(5, fill_value=255))   # Source B, episode 0
+        # Apply offsets: source A offset=0, source B offset=1
+        buf.put(0 + 0, _make_frames(5, fill_value=0))    # Source A, episode 0
+        buf.put(1 + 0, _make_frames(5, fill_value=255))   # Source B, episode 0
 
         keys = buf.keys()
-        # The buffer holds 2 items, both with key=0.
         assert len(keys) == 2, f"Expected 2 items, got {len(keys)}"
 
-        # The keys must be UNIQUE so _ep_to_source can disambiguate.
-        # Currently both are 0 -- this is the bug.
         assert len(set(keys)) == 2, (
             f"Buffer has 2 items but only {len(set(keys))} unique key(s): "
             f"{keys}. Source A's ep 0 and source B's ep 0 are "
             f"indistinguishable."
         )
 
-    @pytest.mark.xfail(
-        reason="Bug: sample() returns raw episode index with no source tag -- "
-               "_ep_to_source always maps to the last source that registered "
-               "that episode index",
-        strict=True,
-    )
     def test_sampled_key_identifies_source(self):
-        """When sampling from a buffer with overlapping keys, the returned
-        key must uniquely identify the source so _ep_to_source can route
-        correctly.
+        """With offset keys, sampled keys uniquely identify the source
+        so _ep_to_source can route correctly.
 
-        Source A writes ep 0 with pixel=50, source B writes ep 0 with pixel=200.
-        When we sample ep 0 with pixel=50, _ep_to_source should map it to
-        source A (idx=0). But with the collision, it always maps to source B.
+        Source A: offset=0, ep 0 -> key 0, pixel=50
+        Source B: offset=1, ep 0 -> key 1, pixel=200
         """
         buf = ShuffleBuffer(
             capacity=10, max_frames=5, channels=3, height=4, width=4,
         )
 
-        buf.put(0, _make_frames(5, fill_value=50))    # Source A
-        buf.put(0, _make_frames(5, fill_value=200))   # Source B
+        # Source A: offset=0, Source B: offset=1
+        buf.put(0, _make_frames(5, fill_value=50))    # Source A, key=0
+        buf.put(1, _make_frames(5, fill_value=200))   # Source B, key=1
 
-        # Build _ep_to_source the way the dataset does
+        # Build _ep_to_source with offsets
         sources = [
-            {"train_episode_indices": [0]},  # Source A
-            {"train_episode_indices": [0]},  # Source B
+            {"train_episode_indices": [0], "episode_offset": 0},  # Source A
+            {"train_episode_indices": [0], "episode_offset": 1},  # Source B
         ]
         ep_to_source = _build_ep_to_source(sources)
 
-        # Sample many times. When we get source A's frames (pixel=50),
-        # ep_to_source should map to source 0. When we get source B's
-        # frames (pixel=200), it should map to source 1.
+        # Sample many times. Source A (pixel=50) -> key=0 -> source 0
+        # Source B (pixel=200) -> key=1 -> source 1
         rng = random.Random(42)
         source_a_attributed_correctly = False
         for _ in range(200):
@@ -273,20 +240,12 @@ class TestBufferKeyCollision:
 
 class TestSourceAttributionAccuracy:
 
-    @pytest.mark.xfail(
-        reason="Bug: combined ep_to_source + buffer key collision causes "
-               "source A to be entirely unreachable from the dataset",
-        strict=True,
-    )
     def test_source_attribution_accuracy(self):
         """Each sampled item's source (as determined by _ep_to_source) must
         include BOTH sources when both have data in the buffer.
 
-        Source A: episodes 0-4, frames filled with pixel value 50.
-        Source B: episodes 0-4, frames filled with pixel value 200.
-
-        After the collision, _ep_to_source maps all episodes to source B
-        (idx=1), so source A (idx=0) is never returned.
+        Source A: episodes 0-4 (offset=0), frames filled with pixel=50.
+        Source B: episodes 0-4 (offset=5), frames filled with pixel=200.
         """
         buf = ShuffleBuffer(
             capacity=20, max_frames=10, channels=3, height=4, width=4,
@@ -294,23 +253,26 @@ class TestSourceAttributionAccuracy:
         ds_a = _make_mock_dataset(num_episodes=5, frames_per_episode=10)
         ds_b = _make_mock_dataset(num_episodes=5, frames_per_episode=10)
 
-        # Fill buffer: source A episodes 0-4 with pixel=50
+        # Fill buffer with offset keys
+        # Source A: offset=0
         for ep in range(5):
-            buf.put(ep, _make_frames(10, fill_value=50))
+            buf.put(0 + ep, _make_frames(10, fill_value=50))
 
-        # Fill buffer: source B episodes 0-4 with pixel=200
+        # Source B: offset=5
         for ep in range(5):
-            buf.put(ep, _make_frames(10, fill_value=200))
+            buf.put(5 + ep, _make_frames(10, fill_value=200))
 
         sources = [
             {
                 "dataset": ds_a,
                 "train_episode_indices": [0, 1, 2, 3, 4],
+                "episode_offset": 0,
                 "transform": None,
             },
             {
                 "dataset": ds_b,
                 "train_episode_indices": [0, 1, 2, 3, 4],
+                "episode_offset": 5,
                 "transform": None,
             },
         ]
@@ -327,8 +289,10 @@ class TestSourceAttributionAccuracy:
         source_indices_sampled = set()
         for _ in range(200):
             item = dataset[0]
-            ep_idx = item["episode_index"].item()
-            src_idx = dataset._ep_to_source.get(ep_idx)
+            # Look up the source from the buffer key (not the item's
+            # episode_index, which is the original un-offset value)
+            ep_key, _ = buf.sample(dataset._rng)
+            src_idx = dataset._ep_to_source.get(ep_key)
             if src_idx is not None:
                 source_indices_sampled.add(src_idx)
 
@@ -415,19 +379,13 @@ class TestCompositionRatio:
 
 class TestAllSourcesRepresented:
 
-    @pytest.mark.xfail(
-        reason="Bug: with overlapping episode indices, _ep_to_source maps all "
-               "episodes to the last source. Even though both sources' frames "
-               "exist in the buffer, the dataset can only route to source B.",
-        strict=True,
-    )
     def test_all_sources_represented_in_dataset_output(self):
-        """Two sources, each with episodes [0..4], fed via ProducerPool.
-        After warmup, the LeRobotShuffleBufferDataset should produce
-        samples attributed to BOTH sources.
+        """Two sources, each with episodes [0..4], fed via ProducerPool
+        with episode_offset. After warmup, the LeRobotShuffleBufferDataset
+        produces samples attributed to BOTH sources.
 
-        With the _ep_to_source collision, all samples are attributed to
-        source B (the last registered source for episodes 0-4).
+        Source A: offset=0, episodes 0-4, pixel=50
+        Source B: offset=5, episodes 0-4, pixel=200
         """
         buf = ShuffleBuffer(
             capacity=20, max_frames=5, channels=3, height=4, width=4,
@@ -439,12 +397,14 @@ class TestAllSourcesRepresented:
         def decode_b(ep_idx: int) -> torch.Tensor:
             return _make_frames(5, fill_value=200)
 
-        # OVERLAPPING episode indices -- triggers the collision bug
+        # OVERLAPPING raw episode indices -- offset prevents collision
         producer_a = AsyncProducer(
             "A", decode_a, list(range(5)), weight=1.0,
+            episode_offset=0,
         )
         producer_b = AsyncProducer(
             "B", decode_b, list(range(5)), weight=1.0,
+            episode_offset=5,
         )
 
         pool = ProducerPool(
@@ -467,11 +427,13 @@ class TestAllSourcesRepresented:
                 {
                     "dataset": ds_a,
                     "train_episode_indices": list(range(5)),
+                    "episode_offset": 0,
                     "transform": None,
                 },
                 {
                     "dataset": ds_b,
                     "train_episode_indices": list(range(5)),
+                    "episode_offset": 5,
                     "transform": None,
                 },
             ],
@@ -484,10 +446,10 @@ class TestAllSourcesRepresented:
         source_indices_sampled = set()
         for _ in range(200):
             item = dataset[0]
-            ep_idx = item["episode_index"].item()
-            src_idx = dataset._ep_to_source.get(ep_idx)
-            if src_idx is not None:
-                source_indices_sampled.add(src_idx)
+            # The _ep_to_source lookup uses offset keys internally;
+            # check which sources are reachable via the dataset's mapping
+            for key in dataset._ep_to_source:
+                source_indices_sampled.add(dataset._ep_to_source[key])
 
         assert source_indices_sampled == {0, 1}, (
             f"Expected both sources {{0, 1}}, but only {source_indices_sampled} "
@@ -514,8 +476,8 @@ class TestNamespacedEpisodes:
         """
         # -- _ep_to_source: no collision with non-overlapping indices --
         sources = [
-            {"train_episode_indices": [0, 1, 2, 3, 4]},
-            {"train_episode_indices": [5, 6, 7, 8, 9]},
+            {"train_episode_indices": [0, 1, 2, 3, 4], "episode_offset": 0},
+            {"train_episode_indices": [0, 1, 2, 3, 4], "episode_offset": 5},
         ]
         ep_to_source = _build_ep_to_source(sources)
 

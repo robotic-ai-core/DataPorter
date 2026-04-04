@@ -79,14 +79,18 @@ class LeRobotShuffleBufferDataset(Dataset):
         self._seed = seed
         self._rng = random.Random(seed)
 
-        # Build episode -> source lookup table
-        # Each source's train_episode_indices are the episode indices from
-        # the original dataset. We build a flat sorted list of
-        # (episode_idx, source_idx) for O(log n) lookup.
+        # Build episode -> source lookup table with per-source offsets.
+        # Each source may have an ``episode_offset`` that shifts its raw
+        # episode indices into a non-overlapping namespace.  This prevents
+        # collisions when multiple sources share the same raw episode
+        # indices (e.g. both start at 0).
         self._ep_to_source: dict[int, int] = {}
+        self._ep_offsets: list[int] = []
         for src_idx, src in enumerate(self._sources):
+            offset = src.get("episode_offset", 0)
+            self._ep_offsets.append(offset)
             for ep_idx in src["train_episode_indices"]:
-                self._ep_to_source[ep_idx] = src_idx
+                self._ep_to_source[offset + ep_idx] = src_idx
 
         # Pre-compute delta_indices (frame offsets from delta_timestamps)
         # Same logic as lerobot's get_delta_indices
@@ -136,9 +140,12 @@ class LeRobotShuffleBufferDataset(Dataset):
         dataset = source["dataset"]
 
         # 3. Pick random sample index within episode
+        # Subtract the source's offset to recover the original episode
+        # index used by the dataset's episode_data_index.
+        original_ep_idx = ep_idx - self._ep_offsets[src_idx]
         ep_data_index = dataset.episode_data_index
-        ep_start = int(ep_data_index["from"][ep_idx])
-        ep_end = int(ep_data_index["to"][ep_idx])
+        ep_start = int(ep_data_index["from"][original_ep_idx])
+        ep_end = int(ep_data_index["to"][original_ep_idx])
         num_frames_in_ep = ep_end - ep_start
 
         sample_idx = ep_start + self._rng.randint(0, num_frames_in_ep - 1)

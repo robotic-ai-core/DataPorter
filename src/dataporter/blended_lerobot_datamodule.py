@@ -340,6 +340,7 @@ class BlendedLeRobotDataModule(L.LightningDataModule):
             height, width, channels = 96, 96, 3
         producers = []
         sources_for_dataset = []
+        cumulative_offset = 0
 
         for source, val_idx, full_ds in full_datasets:
             ep_data_index = full_ds.episode_data_index
@@ -356,6 +357,8 @@ class BlendedLeRobotDataModule(L.LightningDataModule):
                 max_frames = max(max_frames, ep_len)
 
             # Build ProducerConfig (picklable, for spawn mode)
+            # episode_offset shifts raw indices so multiple sources
+            # don't collide in the ShuffleBuffer key space.
             config = ProducerConfig(
                 source_name=source["repo_id"],
                 repo_id=source["repo_id"],
@@ -363,6 +366,7 @@ class BlendedLeRobotDataModule(L.LightningDataModule):
                 episode_indices=train_ep_indices,
                 weight=source["weight"],
                 tolerance_s=source.get("tolerance_s"),
+                episode_offset=cumulative_offset,
             )
             producers.append(config)
 
@@ -371,8 +375,12 @@ class BlendedLeRobotDataModule(L.LightningDataModule):
             sources_for_dataset.append({
                 "dataset": full_ds,
                 "train_episode_indices": train_ep_indices,
+                "episode_offset": cumulative_offset,
                 "transform": transform,
             })
+
+            # Advance offset past this source's episodes
+            cumulative_offset += train_episodes
 
         # Create buffer + pool
         buffer = ShuffleBuffer(
