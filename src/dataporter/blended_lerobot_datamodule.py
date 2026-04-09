@@ -225,6 +225,18 @@ class BlendedLeRobotDataModule(L.LightningDataModule):
         repo_id = source["repo_id"]
         local_dir = Path(f"/tmp/prefetch/{repo_id.replace('/', '_')}")
 
+        # Clean stale nested data directories from previous runs.
+        # snapshot_download can leave data/data/ alongside data/ which
+        # causes load_dataset(data_dir=) to load duplicate parquets,
+        # breaking episode boundaries and timestamp validation.
+        stale_nested = local_dir / "data" / "data"
+        if stale_nested.exists():
+            import shutil
+            logger.warning(
+                f"Removing stale nested directory: {stale_nested}"
+            )
+            shutil.rmtree(stale_nested, ignore_errors=True)
+
         prefetcher = LeRobotPrefetcher(
             repo_id=repo_id,
             cache_dir=local_dir,

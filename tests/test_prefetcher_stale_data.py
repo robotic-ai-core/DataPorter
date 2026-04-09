@@ -711,3 +711,60 @@ class TestEdgeCases:
         for p in root.rglob("episode_*.parquet"):
             chunk_dirs.add(p.parent.name)
         assert len(chunk_dirs) == 3  # chunk-000, chunk-001, chunk-002
+
+
+# ---------------------------------------------------------------------------
+# Stale nested data/data/ directory cleanup
+# ---------------------------------------------------------------------------
+
+class TestStaleNestedDirCleanup:
+    """Validate that _start_prefetcher cleans up stale nested data/data/ dirs.
+
+    snapshot_download can leave data/data/chunk-000/ alongside data/chunk-000/.
+    When load_dataset(data_dir="data/") sees both, it loads duplicate parquets
+    (36k rows instead of 25k), breaking episode_data_index boundaries.
+    """
+
+    def test_nested_data_dir_detected_as_stale(self, tmp_path):
+        """data/data/ is a stale artifact — should not exist in a clean download."""
+        root = tmp_path / "prefetch"
+        root.mkdir()
+
+        # Create normal structure via helper (writes to root/data/chunk-000/)
+        _write_episode_parquet(root, ep_idx=0)
+
+        # Create stale nested copy (data/data/chunk-000/)
+        stale_dir = root / "data" / "data" / "chunk-000"
+        stale_dir.mkdir(parents=True)
+        # Copy the parquet from the correct location
+        import shutil as sh
+        src = root / "data" / "chunk-000" / "episode_000000.parquet"
+        sh.copy2(src, stale_dir / "episode_000000.parquet")
+
+        stale = root / "data" / "data"
+        assert stale.exists()
+
+        # Before cleanup: rglob finds the file in both places
+        all_parquets = list(root.rglob("episode_*.parquet"))
+        assert len(all_parquets) == 2
+
+        # After cleanup (simulating what _start_prefetcher does)
+        shutil.rmtree(stale)
+        assert not stale.exists()
+
+        # scan_available_episodes should now see only 1 episode
+        episodes = scan_available_episodes(root)
+        assert episodes == [0]
+
+    def test_no_stale_dir_is_noop(self, tmp_path):
+        """When no data/data/ exists, cleanup is a no-op."""
+        root = tmp_path / "prefetch"
+        root.mkdir()
+        _write_episode_parquet(root, ep_idx=0)
+
+        stale = root / "data" / "data"
+        assert not stale.exists()
+
+        # scan still works
+        episodes = scan_available_episodes(root)
+        assert episodes == [0]
