@@ -52,6 +52,63 @@ def scan_available_episodes(local_dir: Path) -> list[int]:
     ))
 
 
+# Sentinel file written after a successful dataset load. sparkinstance's
+# `hf_cache_source.skip_if_present` feature can check for this to decide
+# whether to re-run rsync at job startup.
+_CACHE_SENTINEL = ".dataporter_cache_complete"
+
+
+def hf_cache_repo_path(repo_id: str) -> Path:
+    """Return the canonical HF hub cache directory for a dataset repo_id.
+
+    Uses ``HF_HOME`` if set, else ``~/.cache/huggingface``.
+
+    Example:
+        >>> hf_cache_repo_path("lerobot/pusht")
+        PosixPath('~/.cache/huggingface/hub/datasets--lerobot--pusht')
+    """
+    import os
+    hf_home = Path(os.environ.get("HF_HOME", Path.home() / ".cache" / "huggingface"))
+    safe_name = f"datasets--{repo_id.replace('/', '--')}"
+    return hf_home / "hub" / safe_name
+
+
+def check_hf_cache_populated(repo_id: str) -> tuple[bool, str]:
+    """Check if a dataset is present in the HF cache.
+
+    Returns (is_populated, reason) where is_populated is True if the
+    cache contains at least one parquet file for this repo.
+
+    This is a pre-flight check — when it returns False on a repo with
+    many files (>500), the runtime download is very likely to hit the
+    HF XET 500-req/5min per-IP rate limit on Vast shared IPs.
+    """
+    cache_dir = hf_cache_repo_path(repo_id)
+    if not cache_dir.exists():
+        return False, f"cache dir does not exist: {cache_dir}"
+    snapshots = cache_dir / "snapshots"
+    if not snapshots.exists():
+        return False, f"no snapshots dir in {cache_dir}"
+    parquets = list(snapshots.rglob("*.parquet"))
+    if not parquets:
+        return False, f"no parquet files under {snapshots}"
+    return True, f"{len(parquets)} parquet files in {snapshots}"
+
+
+def write_cache_sentinel(cache_dir: Path) -> None:
+    """Write the DataPorter cache-complete sentinel file.
+
+    Called after a successful dataset load so sparkinstance's
+    ``hf_cache_source.skip_if_present`` can detect a healthy cache
+    and skip the pre-sync rsync step on subsequent runs.
+    """
+    try:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        (cache_dir / _CACHE_SENTINEL).touch()
+    except OSError as e:
+        logger.debug(f"Could not write cache sentinel in {cache_dir}: {e}")
+
+
 class BlendedLeRobotDataModule(L.LightningDataModule):
     """Multi-source LeRobot DataModule with weighted blending.
 
@@ -456,6 +513,25 @@ class BlendedLeRobotDataModule(L.LightningDataModule):
         val_ts = self._val_delta_timestamps or self.delta_timestamps
         val_ts = self._common_delta_timestamps(val_ts)
 
+        # Pre-flight HF cache check — warn loudly if the dataset isn't
+        # cached, because the runtime download is likely to hit HF's XET
+        # 500-req/5min per-IP rate limit on Vast shared IPs.
+        for source in self._sources:
+            if "root" in source:
+                continue  # Using local root, no HF download
+            repo_id = source["repo_id"]
+            populated, reason = check_hf_cache_populated(repo_id)
+            if not populated:
+                cache_dir = hf_cache_repo_path(repo_id)
+                logger.warning(
+                    f"HF cache empty for {repo_id} ({reason}). "
+                    f"Runtime download may hit HF XET 500-req/5min per-IP "
+                    f"rate limit for repos with >500 files. "
+                    f"Recommended: pre-sync the cache via "
+                    f"`rsync -az <source>:{cache_dir.parent}/ {cache_dir.parent}/` "
+                    f"or configure sparkinstance hf_cache_source in the job config."
+                )
+
         # Start background prefetchers AFTER metadata probe
         for source in self._sources:
             if "root" not in source and source.get("prefetch", True):
@@ -469,6 +545,8 @@ class BlendedLeRobotDataModule(L.LightningDataModule):
                 source, self.delta_timestamps
             )
             full_datasets.append((source, val_idx, full_ds))
+            # Write sentinel so sparkinstance skip_if_present sees a clean cache
+            write_cache_sentinel(hf_cache_repo_path(source["repo_id"]))
 
         # ---- Training dataset ----
         if self.shuffle_buffer_capacity is not None:

@@ -41,6 +41,15 @@ def __getattr__(name):
     if name == "scan_available_episodes":
         from .blended_lerobot_datamodule import scan_available_episodes
         return scan_available_episodes
+    if name == "check_hf_cache_populated":
+        from .blended_lerobot_datamodule import check_hf_cache_populated
+        return check_hf_cache_populated
+    if name == "hf_cache_repo_path":
+        from .blended_lerobot_datamodule import hf_cache_repo_path
+        return hf_cache_repo_path
+    if name == "write_cache_sentinel":
+        from .blended_lerobot_datamodule import write_cache_sentinel
+        return write_cache_sentinel
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 __all__ = [
@@ -87,6 +96,9 @@ __all__ = [
     'FastLeRobotDataset',
     'BlendedLeRobotDataModule',
     'scan_available_episodes',
+    'check_hf_cache_populated',
+    'hf_cache_repo_path',
+    'write_cache_sentinel',
     # Shuffle buffer (video pipeline)
     'ShuffleBuffer',
     'ProducerPool',
