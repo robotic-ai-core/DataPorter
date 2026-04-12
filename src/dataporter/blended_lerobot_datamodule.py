@@ -431,6 +431,20 @@ class BlendedLeRobotDataModule(L.LightningDataModule):
             # Resolve symlinks in root — hub-cache mode creates symlink
             # chains that may not resolve in spawned child processes.
             resolved_root = str(Path(full_ds.root).resolve())
+
+            # Extract the parent's Arrow IPC cache path so the spawned
+            # child can load it directly (instant) instead of rebuilding
+            # from 10k parquet files (300s).
+            arrow_cache_path = None
+            cache_files = getattr(full_ds.hf_dataset, "cache_files", None)
+            if cache_files and len(cache_files) > 0:
+                arrow_cache_path = cache_files[0].get("filename")
+                if arrow_cache_path:
+                    logger.info(
+                        f"Arrow cache for {source['repo_id']}: "
+                        f"{arrow_cache_path}"
+                    )
+
             config = ProducerConfig(
                 source_name=source["repo_id"],
                 repo_id=source["repo_id"],
@@ -439,6 +453,7 @@ class BlendedLeRobotDataModule(L.LightningDataModule):
                 weight=source["weight"],
                 tolerance_s=source.get("tolerance_s"),
                 episode_offset=cumulative_offset,
+                arrow_cache_path=arrow_cache_path,
             )
             producers.append(config)
 

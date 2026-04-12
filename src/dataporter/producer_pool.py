@@ -46,6 +46,10 @@ class ProducerConfig:
     namespace before writing to the ShuffleBuffer.  This prevents key
     collisions when multiple sources share the same raw episode indices
     (e.g. both start at 0).
+
+    ``arrow_cache_path`` is the path to the parent's pre-built Arrow IPC
+    cache file.  When set, the spawned child loads this file directly via
+    ``Dataset.from_file()`` — instant, no 10k-parquet rebuild.
     """
     source_name: str
     repo_id: str
@@ -55,6 +59,7 @@ class ProducerConfig:
     seed: int = 42
     tolerance_s: float | None = None
     episode_offset: int = 0
+    arrow_cache_path: str | None = None
 
 
 # Keep AsyncProducer as a convenience wrapper for thread-based usage
@@ -136,14 +141,34 @@ def _make_child_decode_fn(config: ProducerConfig) -> Callable[[int], torch.Tenso
             kwargs = {"root": root}
             if config.tolerance_s is not None:
                 kwargs["tolerance_s"] = config.tolerance_s
-            _state["ds"] = FastLeRobotDataset(
+
+            ds = FastLeRobotDataset(
                 config.repo_id,
                 delta_timestamps={"observation.image": [0.0]},
                 **kwargs,
             )
-            logger.info(
-                f"[child] Loaded {config.source_name} from {root}"
-            )
+
+            # Hot-swap the HF dataset with the parent's pre-built Arrow
+            # cache if available.  Avoids the 300s rebuild from 10k
+            # parquet files that the spawned child would otherwise do.
+            if config.arrow_cache_path is not None:
+                from datasets import Dataset
+                from lerobot.common.datasets.lerobot_dataset import (
+                    hf_transform_to_torch,
+                )
+                arrow_ds = Dataset.from_file(config.arrow_cache_path)
+                arrow_ds.set_transform(hf_transform_to_torch)
+                ds.hf_dataset = arrow_ds
+                logger.info(
+                    f"[child] Loaded {config.source_name} from Arrow cache "
+                    f"({len(arrow_ds)} rows)"
+                )
+            else:
+                logger.info(
+                    f"[child] Loaded {config.source_name} from {root}"
+                )
+
+            _state["ds"] = ds
         ds = _state["ds"]
 
         from lerobot.common.datasets.video_utils import decode_video_frames
