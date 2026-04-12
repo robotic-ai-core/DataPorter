@@ -222,6 +222,10 @@ def _make_child_decode_fn(config: ProducerConfig) -> Callable[[int], torch.Tenso
         num_frames = ep_end - ep_start
         all_ts = [i / ds.fps for i in range(num_frames)]
         video_path = ds.root / ds.meta.get_video_file_path(ep_idx, vid_key)
+        # Resolve symlinks — HF hub-cache stores video files as
+        # symlinks to ../../blobs/<hash>. pyav/ffmpeg may hang on
+        # symlinked paths in spawned process contexts.
+        video_path = video_path.resolve()
         all_frames = decode_video_frames(
             video_path, all_ts, ds.tolerance_s, ds.video_backend,
         )
