@@ -118,6 +118,10 @@ def _make_child_decode_fn(config: ProducerConfig) -> Callable[[int], torch.Tenso
 
     Lazily initializes a fresh FastLeRobotDataset on first call —
     the child gets its own Arrow mmap, independent of the parent.
+
+    Resolves symlinks in ``config.root`` so the child process sees
+    real paths (symlink chains from hub-cache mode may not resolve
+    correctly in spawned contexts).
     """
     from pathlib import Path
 
@@ -126,7 +130,10 @@ def _make_child_decode_fn(config: ProducerConfig) -> Callable[[int], torch.Tenso
     def decode(ep_idx: int) -> torch.Tensor:
         if "ds" not in _state:
             from .fast_lerobot_dataset import FastLeRobotDataset
-            kwargs = {"root": Path(config.root)}
+            # Resolve symlinks — hub-cache mode creates symlink chains
+            # that may not resolve in spawned child contexts.
+            root = Path(config.root).resolve()
+            kwargs = {"root": root}
             if config.tolerance_s is not None:
                 kwargs["tolerance_s"] = config.tolerance_s
             _state["ds"] = FastLeRobotDataset(
@@ -135,7 +142,7 @@ def _make_child_decode_fn(config: ProducerConfig) -> Callable[[int], torch.Tenso
                 **kwargs,
             )
             logger.info(
-                f"[child] Loaded {config.source_name} from {config.root}"
+                f"[child] Loaded {config.source_name} from {root}"
             )
         ds = _state["ds"]
 
@@ -204,15 +211,33 @@ async def _run_spawn_pool(
     weight_map = {cfg.source_name: cfg.weight for cfg in configs}
     offset_map = {cfg.source_name: cfg.episode_offset for cfg in configs}
 
+    # Consecutive failure tracking — escalate after _MAX_CONSECUTIVE_FAILURES
+    _MAX_CONSECUTIVE_FAILURES = 50
+    _consecutive_failures = 0
+    _last_failure_msg = ""
+
     async def _decode_one(source_name: str, ep_idx: int) -> tuple[str, int, torch.Tensor | None]:
         """Dispatch one decode to the source's executor."""
+        nonlocal _consecutive_failures, _last_failure_msg
         try:
             frames = await loop.run_in_executor(
                 executors[source_name], decode_fns[source_name], ep_idx,
             )
+            _consecutive_failures = 0  # reset on success
             return source_name, ep_idx, frames
         except Exception as e:
-            logger.warning(f"Decode failed for {source_name} ep {ep_idx}: {e}")
+            _consecutive_failures += 1
+            _last_failure_msg = f"{source_name} ep {ep_idx}: {e}"
+            if _consecutive_failures >= _MAX_CONSECUTIVE_FAILURES:
+                raise RuntimeError(
+                    f"ProducerPool: {_consecutive_failures} consecutive decode "
+                    f"failures — all episodes are failing. Last error: "
+                    f"{_last_failure_msg}"
+                ) from e
+            logger.warning(
+                f"Decode failed ({_consecutive_failures}/{_MAX_CONSECUTIVE_FAILURES}): "
+                f"{_last_failure_msg}"
+            )
             return source_name, ep_idx, None
 
     # Weighted dispatch: fill the pipeline with total_workers tasks
@@ -295,6 +320,9 @@ def _run_thread_pool(
     decode_map = {p.source_name: p.decode_fn for p in producers}
     offset_map = {p.source_name: p.episode_offset for p in producers}
 
+    consecutive_failures = 0
+    max_consecutive = 50
+
     while not stop_event.is_set():
         name = max(tokens, key=lambda n: weight_map[n] - tokens[n])
         ep_idx = next(iterators[name])
@@ -302,9 +330,19 @@ def _run_thread_pool(
         try:
             frames = decode_map[name](ep_idx)
         except Exception as e:
-            logger.warning(f"Decode failed for {name} ep {ep_idx}: {e}")
+            consecutive_failures += 1
+            if consecutive_failures >= max_consecutive:
+                raise RuntimeError(
+                    f"ProducerPool: {consecutive_failures} consecutive decode "
+                    f"failures. Last: {name} ep {ep_idx}: {e}"
+                ) from e
+            logger.warning(
+                f"Decode failed ({consecutive_failures}/{max_consecutive}): "
+                f"{name} ep {ep_idx}: {e}"
+            )
             continue
 
+        consecutive_failures = 0  # reset on success
         buffer.put(offset_map[name] + ep_idx, frames)
 
         tokens[name] += 1

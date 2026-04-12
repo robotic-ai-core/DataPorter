@@ -428,10 +428,13 @@ class BlendedLeRobotDataModule(L.LightningDataModule):
             # Build ProducerConfig (picklable, for spawn mode)
             # episode_offset shifts raw indices so multiple sources
             # don't collide in the ShuffleBuffer key space.
+            # Resolve symlinks in root — hub-cache mode creates symlink
+            # chains that may not resolve in spawned child processes.
+            resolved_root = str(Path(full_ds.root).resolve())
             config = ProducerConfig(
                 source_name=source["repo_id"],
                 repo_id=source["repo_id"],
-                root=str(full_ds.root),
+                root=resolved_root,
                 episode_indices=train_ep_indices,
                 weight=source["weight"],
                 tolerance_s=source.get("tolerance_s"),
