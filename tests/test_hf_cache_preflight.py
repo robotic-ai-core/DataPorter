@@ -163,3 +163,84 @@ def test_preflight_sentinel_round_trip(tmp_path, monkeypatch):
     # DataPorter writes sentinel
     write_cache_sentinel(cache)
     assert (cache / ".dataporter_cache_complete").exists()
+
+
+# ---------------------------------------------------------------------------
+# Arrow cache short-circuit (spawned child bypass)
+# ---------------------------------------------------------------------------
+
+class TestArrowCacheShortCircuit:
+    """Verify that arrow_cache_path bypasses load_dataset entirely.
+
+    The spawned ProducerPool child must NOT call load_dataset("parquet", ...)
+    when an Arrow cache is available — that call rebuilds the Arrow table
+    from 10k parquet files (300s). The short-circuit must happen inside
+    load_hf_dataset(), which is called from __init__().
+    """
+
+    def test_load_dataset_not_called_with_arrow_cache(self):
+        """load_dataset("parquet", ...) must not be called when
+        arrow_cache_path is set — the short-circuit in load_hf_dataset
+        should return Dataset.from_file() before reaching load_dataset."""
+        from dataporter import FastLeRobotDataset
+
+        # First, build the cache the normal way
+        ds = FastLeRobotDataset(
+            "lerobot/pusht",
+            delta_timestamps={"observation.image": [0.0]},
+        )
+        cache_path = ds.hf_dataset.cache_files[0]["filename"]
+
+        # Now load with arrow_cache_path — load_dataset must NOT be called
+        call_count = 0
+        _real_load = None
+
+        import datasets
+        _real_load = datasets.load_dataset
+
+        def counting_load(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            return _real_load(*args, **kwargs)
+
+        with patch("datasets.load_dataset", counting_load):
+            # If the short-circuit is broken (hot-swap after __init__),
+            # load_dataset gets called from __init__ → this fails.
+            ds2 = FastLeRobotDataset(
+                "lerobot/pusht",
+                delta_timestamps={"observation.image": [0.0]},
+                arrow_cache_path=cache_path,
+            )
+
+        assert call_count == 0, (
+            f"load_dataset was called {call_count} time(s) despite "
+            f"arrow_cache_path being set — short-circuit is broken. "
+            f"The spawned child will hang for 300s rebuilding the Arrow table."
+        )
+
+        # Verify data is correct
+        import torch
+        s1 = ds[100]
+        s2 = ds2[100]
+        assert torch.equal(s1["observation.state"], s2["observation.state"])
+
+    def test_arrow_cache_path_none_uses_load_dataset(self):
+        """Without arrow_cache_path, normal load_dataset path is used."""
+        from dataporter import FastLeRobotDataset
+
+        call_count = 0
+        import datasets
+        _real_load = datasets.load_dataset
+
+        def counting_load(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            return _real_load(*args, **kwargs)
+
+        with patch("datasets.load_dataset", counting_load):
+            ds = FastLeRobotDataset(
+                "lerobot/pusht",
+                delta_timestamps={"observation.image": [0.0]},
+            )
+
+        assert call_count >= 1, "load_dataset should be called in normal path"
