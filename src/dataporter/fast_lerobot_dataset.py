@@ -156,6 +156,41 @@ class FastLeRobotDataset(LeRobotDataset):
 
         logger.info("FastLeRobotDataset initialized with optimized HF access")
 
+    def load_hf_dataset(self):
+        """Override to force memory-mapped Arrow IPC (no in-memory copy).
+
+        The parent class loads parquet into an in-memory Arrow table.
+        When DataLoader workers fork, each gets a COW copy — for v3's
+        1M rows this inflates to ~5 GB Private_Dirty per worker (×4
+        workers = 20+ GB wasted).
+
+        ``keep_in_memory=False`` forces HF datasets to mmap the Arrow
+        IPC cache file on disk. All workers share the same physical
+        pages — zero COW fragmentation, ~200 MB RSS per worker instead
+        of ~8.6 GB.
+        """
+        from datasets import load_dataset
+        from lerobot.common.datasets.lerobot_dataset import hf_transform_to_torch
+
+        if self.episodes is None:
+            path = str(self.root / "data")
+            hf_dataset = load_dataset(
+                "parquet", data_dir=path, split="train",
+                keep_in_memory=False,
+            )
+        else:
+            files = [
+                str(self.root / self.meta.get_data_file_path(ep_idx))
+                for ep_idx in self.episodes
+            ]
+            hf_dataset = load_dataset(
+                "parquet", data_files=files, split="train",
+                keep_in_memory=False,
+            )
+
+        hf_dataset.set_transform(hf_transform_to_torch)
+        return hf_dataset
+
     def _decode_episode_fallback(self, ep_idx: int) -> torch.Tensor:
         """On-demand fallback: decode frames for an episode."""
         for vid_key in self.meta.video_keys:
