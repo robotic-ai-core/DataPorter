@@ -98,6 +98,11 @@ class AsyncProducer:
 # Spawn-based producer pool (primary path)
 # ---------------------------------------------------------------------------
 
+# Per-decode timeout. If a single video decode takes longer than this,
+# it's treated as a failure (likely ffmpeg hanging on symlinked blobs).
+_DECODE_TIMEOUT_S = 30.0
+
+
 def _spawn_pool_entry(
     buffer: ShuffleBuffer,
     configs: list[ProducerConfig],
@@ -106,8 +111,42 @@ def _spawn_pool_entry(
     warmup_event,
     stop_event,
 ) -> None:
-    """Entry point for the spawned producer process."""
+    """Entry point for the spawned producer process.
+
+    Runs a smoke test (one decode per source) before starting the async
+    loop. If the first decode hangs or fails, the error is raised
+    immediately — don't wait 300s for warmup timeout.
+    """
     try:
+        # Smoke test: verify each source can decode at least one episode
+        decode_fns = {}
+        for cfg in configs:
+            fn = _make_child_decode_fn(cfg)
+            decode_fns[cfg.source_name] = fn
+
+            first_ep = cfg.episode_indices[0] if cfg.episode_indices else 0
+            logger.info(
+                f"[child] Smoke test: {cfg.source_name} ep {first_ep}..."
+            )
+            import concurrent.futures
+            with concurrent.futures.ThreadPoolExecutor(1) as ex:
+                future = ex.submit(fn, first_ep)
+                try:
+                    frames = future.result(timeout=_DECODE_TIMEOUT_S)
+                    if frames is None:
+                        raise RuntimeError("decode returned None")
+                    logger.info(
+                        f"[child] Smoke test OK: {cfg.source_name} "
+                        f"ep {first_ep} → {frames.shape}"
+                    )
+                except concurrent.futures.TimeoutError:
+                    raise RuntimeError(
+                        f"Smoke test: decode of {cfg.source_name} "
+                        f"ep {first_ep} hung for {_DECODE_TIMEOUT_S}s. "
+                        f"Video decode may be blocked on symlinked blobs. "
+                        f"root={cfg.root}"
+                    )
+
         asyncio.run(_run_spawn_pool(
             buffer, configs, total_workers,
             warmup_target, warmup_event, stop_event,
@@ -197,7 +236,9 @@ async def _run_spawn_pool(
     """
     loop = asyncio.get_event_loop()
 
-    # Build decode functions (fresh datasets in this process)
+    # Build decode functions — reuse from smoke test if available
+    # (smoke test in _spawn_pool_entry already called _make_child_decode_fn
+    # which lazily initializes the dataset on first decode call)
     decode_fns = {}
     for cfg in configs:
         decode_fns[cfg.source_name] = _make_child_decode_fn(cfg)
@@ -228,14 +269,34 @@ async def _run_spawn_pool(
     _last_failure_msg = ""
 
     async def _decode_one(source_name: str, ep_idx: int) -> tuple[str, int, torch.Tensor | None]:
-        """Dispatch one decode to the source's executor."""
+        """Dispatch one decode with timeout to catch hanging ffmpeg."""
         nonlocal _consecutive_failures, _last_failure_msg
         try:
-            frames = await loop.run_in_executor(
-                executors[source_name], decode_fns[source_name], ep_idx,
+            frames = await asyncio.wait_for(
+                loop.run_in_executor(
+                    executors[source_name], decode_fns[source_name], ep_idx,
+                ),
+                timeout=_DECODE_TIMEOUT_S,
             )
             _consecutive_failures = 0  # reset on success
             return source_name, ep_idx, frames
+        except asyncio.TimeoutError:
+            _consecutive_failures += 1
+            _last_failure_msg = (
+                f"{source_name} ep {ep_idx}: decode hung for "
+                f"{_DECODE_TIMEOUT_S}s (ffmpeg blocked on video file?)"
+            )
+            if _consecutive_failures >= _MAX_CONSECUTIVE_FAILURES:
+                raise RuntimeError(
+                    f"ProducerPool: {_consecutive_failures} consecutive decode "
+                    f"timeouts — video decode is hanging. Last: "
+                    f"{_last_failure_msg}"
+                )
+            logger.warning(
+                f"Decode timeout ({_consecutive_failures}/{_MAX_CONSECUTIVE_FAILURES}): "
+                f"{_last_failure_msg}"
+            )
+            return source_name, ep_idx, None
         except Exception as e:
             _consecutive_failures += 1
             _last_failure_msg = f"{source_name} ep {ep_idx}: {e}"
