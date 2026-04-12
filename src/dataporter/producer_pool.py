@@ -110,13 +110,26 @@ def _spawn_pool_entry(
     warmup_target: int,
     warmup_event,
     stop_event,
+    error_queue=None,
 ) -> None:
     """Entry point for the spawned producer process.
 
     Runs a smoke test (one decode per source) before starting the async
     loop. If the first decode hangs or fails, the error is raised
     immediately — don't wait 300s for warmup timeout.
+
+    Errors are sent to ``error_queue`` (if provided) so the parent
+    process can surface them in the training log — child-process
+    logger output may not reach the parent's log handler.
     """
+    def _report_error(msg: str) -> None:
+        logger.error(msg)
+        if error_queue is not None:
+            try:
+                error_queue.put_nowait(msg)
+            except Exception:
+                pass
+
     try:
         # Smoke test: verify each source can decode at least one episode
         decode_fns = {}
@@ -152,7 +165,7 @@ def _spawn_pool_entry(
             warmup_target, warmup_event, stop_event,
         ))
     except Exception as e:
-        logger.error(f"ProducerPool error: {e}", exc_info=True)
+        _report_error(f"ProducerPool child error: {e}")
     finally:
         warmup_event.set()
 
@@ -494,10 +507,12 @@ class ProducerPool:
             ctx = mp.get_context("spawn")
             self._warmup_event = ctx.Event()
             self._stop_event = ctx.Event()
+            self._error_queue = ctx.Queue()
         else:
             import threading
             self._warmup_event = threading.Event()
             self._stop_event = threading.Event()
+            self._error_queue = None
 
     def start(self) -> None:
         """Start the producer (spawn process or daemon thread)."""
@@ -520,6 +535,7 @@ class ProducerPool:
                     self._warmup_target,
                     self._warmup_event,
                     self._stop_event,
+                    self._error_queue,
                 ),
                 daemon=True,
                 name="producer-pool",
@@ -542,12 +558,40 @@ class ProducerPool:
         self._worker.start()
 
     def wait_for_warmup(self, timeout: float = 300.0) -> None:
-        """Block until warmup_target items are in the buffer."""
+        """Block until warmup_target items are in the buffer.
+
+        If the child process reported an error (via the error queue),
+        raises RuntimeError with the child's message so it appears in
+        the parent's training log — child-process logger output often
+        goes to stderr and doesn't reach the parent's log handler.
+        """
         if not self._warmup_event.wait(timeout=timeout):
+            # Check for child errors before raising generic timeout
+            child_error = self._drain_error_queue()
+            if child_error:
+                raise RuntimeError(
+                    f"ProducerPool child failed: {child_error}"
+                )
             raise TimeoutError(
                 f"ProducerPool didn't fill {self._warmup_target} items "
                 f"in {timeout}s (have {len(self._buffer)})"
             )
+        # Even on success, check for errors (child may have set warmup
+        # event in its finally block after an error)
+        child_error = self._drain_error_queue()
+        if child_error:
+            raise RuntimeError(
+                f"ProducerPool child failed: {child_error}"
+            )
+
+    def _drain_error_queue(self) -> str | None:
+        """Read the first error from the child's error queue, if any."""
+        if self._error_queue is None:
+            return None
+        try:
+            return self._error_queue.get_nowait()
+        except Exception:
+            return None
 
     def stop(self) -> None:
         """Stop the producer."""
