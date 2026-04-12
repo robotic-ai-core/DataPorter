@@ -141,34 +141,20 @@ def _make_child_decode_fn(config: ProducerConfig) -> Callable[[int], torch.Tenso
             kwargs = {"root": root}
             if config.tolerance_s is not None:
                 kwargs["tolerance_s"] = config.tolerance_s
+            # Pass Arrow cache path so load_hf_dataset() short-circuits
+            # instead of rebuilding from 10k parquet files (300s).
+            if config.arrow_cache_path is not None:
+                kwargs["arrow_cache_path"] = config.arrow_cache_path
 
-            ds = FastLeRobotDataset(
+            _state["ds"] = FastLeRobotDataset(
                 config.repo_id,
                 delta_timestamps={"observation.image": [0.0]},
                 **kwargs,
             )
-
-            # Hot-swap the HF dataset with the parent's pre-built Arrow
-            # cache if available.  Avoids the 300s rebuild from 10k
-            # parquet files that the spawned child would otherwise do.
-            if config.arrow_cache_path is not None:
-                from datasets import Dataset
-                from lerobot.common.datasets.lerobot_dataset import (
-                    hf_transform_to_torch,
-                )
-                arrow_ds = Dataset.from_file(config.arrow_cache_path)
-                arrow_ds.set_transform(hf_transform_to_torch)
-                ds.hf_dataset = arrow_ds
-                logger.info(
-                    f"[child] Loaded {config.source_name} from Arrow cache "
-                    f"({len(arrow_ds)} rows)"
-                )
-            else:
-                logger.info(
-                    f"[child] Loaded {config.source_name} from {root}"
-                )
-
-            _state["ds"] = ds
+            logger.info(
+                f"[child] Loaded {config.source_name} "
+                f"({'Arrow cache' if config.arrow_cache_path else root})"
+            )
         ds = _state["ds"]
 
         from lerobot.common.datasets.video_utils import decode_video_frames

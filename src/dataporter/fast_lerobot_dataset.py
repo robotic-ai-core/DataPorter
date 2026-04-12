@@ -88,7 +88,10 @@ class FastLeRobotDataset(LeRobotDataset):
                  cache_budget_gb: float = 2.0,
                  frame_buffer_capacity: int | None = None,
                  return_uint8: bool = False,
+                 arrow_cache_path: str | None = None,
                  **kwargs):
+        # Stash before super().__init__ — load_hf_dataset() reads this.
+        self._arrow_cache_path = arrow_cache_path
         super().__init__(*args, **kwargs)
         self._cache_frames = cache_frames
         self._return_uint8 = return_uint8
@@ -157,20 +160,30 @@ class FastLeRobotDataset(LeRobotDataset):
         logger.info("FastLeRobotDataset initialized with optimized HF access")
 
     def load_hf_dataset(self):
-        """Override to force memory-mapped Arrow IPC (no in-memory copy).
+        """Override with two optimizations:
 
-        The parent class loads parquet into an in-memory Arrow table.
-        When DataLoader workers fork, each gets a COW copy — for v3's
-        1M rows this inflates to ~5 GB Private_Dirty per worker (×4
-        workers = 20+ GB wasted).
+        1. **Arrow cache short-circuit**: when ``arrow_cache_path`` is set
+           (spawned ProducerPool child), loads the parent's pre-built Arrow
+           IPC file directly via ``Dataset.from_file()``.  Instant — skips
+           the 300s rebuild from 10k parquet files.
 
-        ``keep_in_memory=False`` forces HF datasets to mmap the Arrow
-        IPC cache file on disk. All workers share the same physical
-        pages — zero COW fragmentation, ~200 MB RSS per worker instead
-        of ~8.6 GB.
+        2. **Memory-mapped mode**: ``keep_in_memory=False`` forces HF
+           datasets to mmap the Arrow IPC cache.  Workers share physical
+           pages — zero COW fragmentation (~200 MB vs ~8.6 GB per worker).
         """
-        from datasets import load_dataset
         from lerobot.common.datasets.lerobot_dataset import hf_transform_to_torch
+
+        # Fast path: load pre-built Arrow cache from parent process
+        arrow_path = getattr(self, "_arrow_cache_path", None)
+        if arrow_path is not None:
+            from datasets import Dataset
+            logger.info(f"Loading Arrow cache: {arrow_path}")
+            hf_dataset = Dataset.from_file(arrow_path)
+            hf_dataset.set_transform(hf_transform_to_torch)
+            return hf_dataset
+
+        # Standard path: load from parquet with mmap
+        from datasets import load_dataset
 
         if self.episodes is None:
             path = str(self.root / "data")
