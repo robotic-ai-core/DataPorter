@@ -206,3 +206,81 @@ class TestDevShmCapacity:
             capacity=2, max_frames=1, channels=3, height=4, width=4,
         )
         assert buf.capacity == 2
+
+
+class TestVideoPathResolution:
+    """Verify that _make_child_decode_fn resolves video file symlinks.
+
+    pyav/ffmpeg can hang on symlinked blob paths in spawned processes.
+    The decode function must call .resolve() on the video path before
+    passing it to decode_video_frames.
+    """
+
+    def test_decode_fn_resolves_video_path(self, tmp_path):
+        """decode_video_frames receives a resolved (non-symlink) path."""
+        from unittest.mock import patch, MagicMock
+        from dataporter.producer_pool import _make_child_decode_fn, ProducerConfig
+
+        # Create a symlink chain like HF hub-cache:
+        # tmp_path/blobs/abc123 (real file)
+        # tmp_path/videos/chunk-000/observation.image/episode_000000.mp4 → ../../../blobs/abc123
+        blobs = tmp_path / "blobs"
+        blobs.mkdir()
+        real_video = blobs / "abc123"
+        real_video.write_bytes(b"fake mp4")
+
+        vid_dir = tmp_path / "videos" / "chunk-000" / "observation.image"
+        vid_dir.mkdir(parents=True)
+        symlink = vid_dir / "episode_000000.mp4"
+        symlink.symlink_to(real_video)
+
+        assert symlink.is_symlink()
+        assert symlink.resolve() == real_video.resolve()
+
+        # Mock FastLeRobotDataset and decode_video_frames
+        mock_ds = MagicMock()
+        mock_ds.meta.video_keys = ["observation.image"]
+        mock_ds.meta.get_video_file_path.return_value = (
+            "videos/chunk-000/observation.image/episode_000000.mp4"
+        )
+        mock_ds.episode_data_index = {
+            "from": torch.tensor([0]),
+            "to": torch.tensor([10]),
+        }
+        mock_ds.fps = 10
+        mock_ds.tolerance_s = 1e-4
+        mock_ds.video_backend = "pyav"
+        mock_ds.root = tmp_path  # NOT resolved — contains symlinks
+
+        captured_paths = []
+
+        def fake_decode(video_path, *args, **kwargs):
+            captured_paths.append(str(video_path))
+            return torch.zeros(10, 3, 96, 96)
+
+        config = ProducerConfig(
+            source_name="test",
+            repo_id="test/repo",
+            root=str(tmp_path),
+            episode_indices=[0],
+        )
+
+        decode_fn = _make_child_decode_fn(config)
+
+        # Patch at import source — the closure imports locally
+        with patch(
+            "dataporter.fast_lerobot_dataset.FastLeRobotDataset",
+            return_value=mock_ds,
+        ), patch(
+            "lerobot.common.datasets.video_utils.decode_video_frames",
+            side_effect=fake_decode,
+        ):
+            decode_fn(0)
+
+        assert len(captured_paths) == 1
+        decoded_path = captured_paths[0]
+        from pathlib import Path
+        assert not Path(decoded_path).is_symlink(), (
+            f"decode_video_frames received a symlink: {decoded_path}. "
+            f"Should be resolved to: {real_video.resolve()}"
+        )
