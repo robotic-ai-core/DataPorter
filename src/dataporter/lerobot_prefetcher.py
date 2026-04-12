@@ -16,7 +16,9 @@ On-disk layout mirrors HuggingFace Hub:
 from __future__ import annotations
 
 import logging
+import os
 import random
+import shutil
 import time
 from pathlib import Path
 from typing import Any, Callable
@@ -37,20 +39,58 @@ def _snapshot_with_retry(
     allow_patterns: list[str] | str | None = None,
     ignore_patterns: list[str] | str | None = None,
     max_retries: int = 3,
+    use_hub_cache: bool = False,
 ) -> None:
-    """snapshot_download with retry on 429."""
+    """snapshot_download with retry on 429.
+
+    Two modes controlled by ``use_hub_cache``:
+
+    - **Hub-cache mode** (``use_hub_cache=True``): downloads to HF's
+      shared cache dir (no ``local_dir`` kwarg), then symlinks
+      ``local_dir`` → snapshot path. Avoids a huggingface_hub issue
+      where ``local_dir`` mode issues a HEAD call per file and raises
+      ``LocalEntryNotFoundError`` under rate limiting. Safe only when
+      the caller does NOT modify files through ``local_dir`` (e.g.
+      bulk download without eviction).
+
+    - **Local-dir mode** (``use_hub_cache=False``, default): downloads
+      directly into ``local_dir``. Files are owned by the caller and
+      safe to evict/delete. Required for incremental download with
+      shard eviction.
+    """
     from huggingface_hub import snapshot_download
 
+    local_dir = Path(local_dir)
     for attempt in range(max_retries):
         try:
-            snapshot_download(
-                repo_id,
-                repo_type="dataset",
-                revision=revision,
-                local_dir=str(local_dir),
-                allow_patterns=allow_patterns,
-                ignore_patterns=ignore_patterns,
-            )
+            if use_hub_cache:
+                snapshot_path = Path(
+                    snapshot_download(
+                        repo_id,
+                        repo_type="dataset",
+                        revision=revision,
+                        allow_patterns=allow_patterns,
+                        ignore_patterns=ignore_patterns,
+                    )
+                )
+                # Symlink local_dir → hub snapshot (idempotent).
+                local_dir.parent.mkdir(parents=True, exist_ok=True)
+                if local_dir.is_symlink():
+                    if os.readlink(local_dir) == str(snapshot_path):
+                        return
+                    local_dir.unlink()
+                elif local_dir.exists() and local_dir.is_dir():
+                    shutil.rmtree(local_dir)
+                local_dir.symlink_to(snapshot_path, target_is_directory=True)
+            else:
+                snapshot_download(
+                    repo_id,
+                    repo_type="dataset",
+                    revision=revision,
+                    local_dir=str(local_dir),
+                    allow_patterns=allow_patterns,
+                    ignore_patterns=ignore_patterns,
+                )
             return
         except Exception as e:
             if "429" in str(e) and attempt < max_retries - 1:
@@ -219,8 +259,16 @@ class LeRobotPrefetcher(BasePrefetcher):
         self,
         allow_patterns: list[str] | str | None = None,
         ignore_patterns: list[str] | str | None = None,
+        use_hub_cache: bool = False,
     ) -> None:
-        """Run snapshot_download (or test mock)."""
+        """Run snapshot_download (or test mock).
+
+        Args:
+            use_hub_cache: If True, download to HF's shared cache and
+                symlink ``cache_dir`` to it. Only safe for bulk downloads
+                where the caller won't evict/delete files through the
+                symlink. Incremental mode must use False (the default).
+        """
         if self._snapshot_fn is not None:
             self._snapshot_fn(
                 self._repo_id,
@@ -235,6 +283,7 @@ class LeRobotPrefetcher(BasePrefetcher):
                 self._cache_dir,
                 allow_patterns=allow_patterns,
                 ignore_patterns=ignore_patterns,
+                use_hub_cache=use_hub_cache,
             )
 
     # ------------------------------------------------------------------
@@ -256,14 +305,19 @@ class LeRobotPrefetcher(BasePrefetcher):
             self._download_incremental(episodes)
 
     def _download_bulk(self, episodes: list[int]) -> None:
-        """Download all episodes in one snapshot_download call."""
+        """Download all episodes in one snapshot_download call.
+
+        Uses hub-cache mode (symlink) to avoid per-file HEAD calls that
+        trigger HF XET rate limits. Safe here because bulk mode never
+        evicts — the entire dataset is downloaded and kept.
+        """
         if self._episode_indices is not None:
             # Specific episodes — use patterns
             patterns = ["meta/*"] + self._episode_patterns(episodes)
-            self._do_snapshot(allow_patterns=patterns)
+            self._do_snapshot(allow_patterns=patterns, use_hub_cache=True)
         else:
             # All episodes — download everything
-            self._do_snapshot()
+            self._do_snapshot(use_hub_cache=True)
 
         self._check_min_ready()
         logger.info(f"Bulk download complete: {len(episodes)} episodes")
