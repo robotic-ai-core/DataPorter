@@ -183,3 +183,26 @@ class TestDevShmCapacity:
         expected_bytes = 10 * 5 * 3 * 8 * 8  # uint8
         actual_bytes = buf._buffer.nelement() * buf._buffer.element_size()
         assert actual_bytes == expected_bytes
+
+    def test_fail_fast_on_insufficient_shm(self):
+        """ShuffleBuffer raises RuntimeError if /dev/shm is too small."""
+        from collections import namedtuple
+        from unittest.mock import patch
+
+        # Mock /dev/shm with only 1 MB free
+        DiskUsage = namedtuple("usage", ["total", "used", "free"])
+        fake_usage = DiskUsage(total=1_000_000, used=0, free=1_000_000)
+        with patch("shutil.disk_usage", return_value=fake_usage):
+            with pytest.raises(RuntimeError, match="shared memory"):
+                ShuffleBuffer(
+                    capacity=100, max_frames=50, channels=3,
+                    height=96, width=96,
+                )
+
+    def test_no_error_when_shm_sufficient(self):
+        """No error when /dev/shm has enough space."""
+        # Small buffer — should always fit
+        buf = ShuffleBuffer(
+            capacity=2, max_frames=1, channels=3, height=4, width=4,
+        )
+        assert buf.capacity == 2

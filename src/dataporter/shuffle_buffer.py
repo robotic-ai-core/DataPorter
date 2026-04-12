@@ -51,7 +51,18 @@ class ShuffleBuffer:
         self._capacity = capacity
         self._max_frames = max_frames
 
-        # Shared memory tensors — survive fork()
+        # Pre-flight: verify /dev/shm can hold the buffer
+        buffer_bytes = capacity * max_frames * channels * height * width
+        overhead_bytes = (
+            capacity * 4          # _lengths (int32)
+            + capacity * 8        # _keys (int64)
+            + 8                   # _write_head (int64)
+            + 8                   # _count (int64)
+        )
+        total_bytes = buffer_bytes + overhead_bytes
+        self._check_shm_capacity(total_bytes)
+
+        # Shared memory tensors — visible across fork() and spawn()
         self._buffer = torch.zeros(
             capacity, max_frames, channels, height, width, dtype=torch.uint8
         ).share_memory_()
@@ -59,6 +70,33 @@ class ShuffleBuffer:
         self._keys = torch.full((capacity,), -1, dtype=torch.int64).share_memory_()
         self._write_head = torch.zeros(1, dtype=torch.int64).share_memory_()
         self._count = torch.zeros(1, dtype=torch.int64).share_memory_()
+
+    @staticmethod
+    def _check_shm_capacity(required_bytes: int) -> None:
+        """Fail fast if /dev/shm can't hold the buffer.
+
+        Docker defaults to 64 MB /dev/shm which silently causes
+        share_memory_() to fail for large buffers. On Vast.ai,
+        set ``--shm-size=8g`` in the Docker run command.
+        """
+        import shutil
+        from pathlib import Path
+
+        shm = Path("/dev/shm")
+        if not shm.exists():
+            return  # non-Linux (macOS, Windows) — skip check
+
+        usage = shutil.disk_usage(shm)
+        required_gb = required_bytes / 1e9
+        free_gb = usage.free / 1e9
+
+        if required_bytes > usage.free:
+            raise RuntimeError(
+                f"ShuffleBuffer needs {required_gb:.1f} GB shared memory "
+                f"but /dev/shm has only {free_gb:.1f} GB free. "
+                f"Set --shm-size={max(2, int(required_gb * 1.5))}g in your "
+                f"Docker run command (Vast.ai: set SHM size in template)."
+            )
 
     @property
     def capacity(self) -> int:
