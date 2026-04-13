@@ -629,6 +629,11 @@ class BlendedLeRobotDataModule(L.LightningDataModule):
                     kwargs["root"] = source["root"]
                 if "tolerance_s" in source:
                     kwargs["tolerance_s"] = source["tolerance_s"]
+                # Pass episodes so download_episodes() uses allow_patterns
+                # instead of a full repo download. Without this, a symlinked
+                # root (hub-cache mode) causes SameFileError.
+                if "_available_episodes" in source:
+                    kwargs["episodes"] = source["_available_episodes"]
                 val_ds = FastLeRobotDataset(
                     source["repo_id"],
                     cache_frames=self.cache_frames,
