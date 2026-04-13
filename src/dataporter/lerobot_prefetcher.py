@@ -310,17 +310,54 @@ class LeRobotPrefetcher(BasePrefetcher):
         Uses hub-cache mode (symlink) to avoid per-file HEAD calls that
         trigger HF XET rate limits. Safe here because bulk mode never
         evicts — the entire dataset is downloaded and kept.
+
+        After the initial download, verifies all episode files exist
+        and retries missing ones. HF 429 rate limits can interrupt
+        snapshot_download mid-flight, leaving an incomplete cache.
         """
         if self._episode_indices is not None:
-            # Specific episodes — use patterns
             patterns = ["meta/*"] + self._episode_patterns(episodes)
             self._do_snapshot(allow_patterns=patterns, use_hub_cache=True)
         else:
-            # All episodes — download everything
             self._do_snapshot(use_hub_cache=True)
 
+        # Verify and retry missing episodes
+        missing = self._find_missing_episodes(episodes)
+        retries = 0
+        while missing and retries < 3:
+            retries += 1
+            logger.warning(
+                f"Bulk download incomplete: {len(missing)} episodes missing "
+                f"(retry {retries}/3). Likely caused by HF 429 rate limit."
+            )
+            patterns = ["meta/*"] + self._episode_patterns(missing)
+            self._do_snapshot(allow_patterns=patterns, use_hub_cache=True)
+            missing = self._find_missing_episodes(episodes)
+
+        if missing:
+            logger.warning(
+                f"Still missing {len(missing)} episodes after 3 retries: "
+                f"{missing[:10]}..."
+            )
+        else:
+            logger.info(f"Bulk download verified: all {len(episodes)} episodes present")
+
         self._check_min_ready()
-        logger.info(f"Bulk download complete: {len(episodes)} episodes")
+
+    def _find_missing_episodes(self, episodes: list[int]) -> list[int]:
+        """Check which episodes are missing from the cache directory.
+
+        Skipped when ``_snapshot_fn`` is set (test mode — mock downloads
+        don't create real files on disk).
+        """
+        if self._snapshot_fn is not None:
+            return []
+        missing = []
+        for ep_idx in episodes:
+            parquet = self._cache_dir / self._episode_parquet_path(ep_idx)
+            if not parquet.is_file():
+                missing.append(ep_idx)
+        return missing
 
     def _download_incremental(self, episodes: list[int]) -> None:
         """Download episodes in batches with eviction."""
