@@ -12,7 +12,6 @@ Requires lerobot: pip install -e external/lerobot
 
 import logging
 import random
-import threading
 from collections import OrderedDict
 from pathlib import Path
 from typing import Iterator
@@ -28,8 +27,6 @@ except ImportError:
     )
 
 logger = logging.getLogger(__name__)
-
-_check_ts_lock = threading.Lock()
 
 
 def decode_episode_frames(
@@ -110,30 +107,7 @@ class FastLeRobotDataset(LeRobotDataset):
                  **kwargs):
         # Stash before super().__init__ — load_hf_dataset() reads this.
         self._arrow_cache_path = arrow_cache_path
-
-        # Replace check_timestamps_sync with a version that reads
-        # directly from the Arrow table (0.004s) instead of using the
-        # pre-extracted torch.stack(list(...)) arguments (71s for 1M rows).
-        # The slow extraction on lines 487-488 still runs, but the patched
-        # function ignores those arguments and re-reads from Arrow.
-        import lerobot.common.datasets.lerobot_dataset as _ld
-        from lerobot.common.datasets.utils import check_timestamps_sync as _real_check
-        _orig = _ld.check_timestamps_sync
-
-        def _fast_check(_timestamps, _episode_indices, _ep_data_index,
-                        fps, tolerance_s, *args, **kwargs):
-            # Ignore the slow pre-extracted args — read Arrow directly
-            ts = self.hf_dataset._data.column("timestamp").to_numpy()
-            ep = self.hf_dataset._data.column("episode_index").to_numpy()
-            ep_idx = {k: t.numpy() for k, t in self.episode_data_index.items()}
-            return _real_check(ts, ep, ep_idx, fps, tolerance_s, *args, **kwargs)
-
-        with _check_ts_lock:
-            _ld.check_timestamps_sync = _fast_check
-            try:
-                super().__init__(*args, **kwargs)
-            finally:
-                _ld.check_timestamps_sync = _orig
+        super().__init__(*args, **kwargs)
         self._cache_frames = cache_frames
         self._return_uint8 = return_uint8
         self._frame_source = None

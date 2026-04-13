@@ -158,68 +158,64 @@ class TestFastLeRobotDatasetInit:
     """Verify FastLeRobotDataset uses the fast path and produces
     correct results."""
 
-    def test_validation_uses_arrow_not_slow_extraction(self):
-        """The patched check_timestamps_sync reads Arrow directly,
-        ignoring the slow torch.stack(list(...)) pre-extraction.
+    def test_validation_uses_arrow_not_torch_stack(self):
+        """Upstream lerobot fix reads Arrow directly in __init__.
 
-        We verify by checking that check_timestamps_sync receives
-        numpy arrays from Arrow (float64) not from torch (float32).
+        Verify by checking that check_timestamps_sync receives numpy
+        arrays (from Arrow .to_numpy()) not torch-converted float32.
         """
         from dataporter import FastLeRobotDataset
-        from lerobot.common.datasets import utils as _utils
+        import lerobot.common.datasets.lerobot_dataset as _ld
 
         received_dtypes = []
-        _orig = _utils.check_timestamps_sync
+        _orig = _ld.check_timestamps_sync
 
         def spy_check(timestamps, episode_indices, *args, **kwargs):
             received_dtypes.append(timestamps.dtype)
             return _orig(timestamps, episode_indices, *args, **kwargs)
 
-        _utils.check_timestamps_sync = spy_check
+        _ld.check_timestamps_sync = spy_check
         try:
             ds = FastLeRobotDataset(
                 "lerobot/pusht",
                 delta_timestamps={"observation.image": [0.0]},
             )
         finally:
-            _utils.check_timestamps_sync = _orig
+            _ld.check_timestamps_sync = _orig
 
         assert len(received_dtypes) > 0
-        # Arrow .to_numpy() returns float64; torch path returns float32
+        # Arrow .to_numpy() on float32 column returns float32
         import numpy as np
-        assert received_dtypes[0] == np.float32, (
-            f"Expected float32 from Arrow .to_numpy() on float column, "
-            f"got {received_dtypes[0]}"
-        )
+        assert received_dtypes[0] == np.float32
 
     def test_init_still_validates(self):
         """Validation runs during init (not skipped)."""
         from dataporter import FastLeRobotDataset
-        from lerobot.common.datasets import utils as _utils
+        import lerobot.common.datasets.lerobot_dataset as _ld
 
         validation_ran = False
-        _orig = _utils.check_timestamps_sync
+        _orig = _ld.check_timestamps_sync
 
         def tracking_check(*args, **kwargs):
             nonlocal validation_ran
             validation_ran = True
             return _orig(*args, **kwargs)
 
-        _utils.check_timestamps_sync = tracking_check
+        _ld.check_timestamps_sync = tracking_check
         try:
             ds = FastLeRobotDataset(
                 "lerobot/pusht",
                 delta_timestamps={"observation.image": [0.0]},
             )
         finally:
-            _utils.check_timestamps_sync = _orig
+            _ld.check_timestamps_sync = _orig
 
         assert validation_ran, "check_timestamps_sync was never called"
 
     def test_arrow_cache_path_also_validates(self):
         """Even with arrow_cache_path, validation runs."""
         from dataporter import FastLeRobotDataset
-        from lerobot.common.datasets import utils as _utils
+        import lerobot.common.datasets.lerobot_dataset as _ld
 
         ds1 = FastLeRobotDataset(
             "lerobot/pusht",
@@ -228,14 +224,14 @@ class TestFastLeRobotDatasetInit:
         cache_path = ds1.hf_dataset.cache_files[0]["filename"]
 
         validation_ran = False
-        _orig = _utils.check_timestamps_sync
+        _orig = _ld.check_timestamps_sync
 
         def tracking_check(*args, **kwargs):
             nonlocal validation_ran
             validation_ran = True
             return _orig(*args, **kwargs)
 
-        _utils.check_timestamps_sync = tracking_check
+        _ld.check_timestamps_sync = tracking_check
         try:
             ds2 = FastLeRobotDataset(
                 "lerobot/pusht",
@@ -243,7 +239,7 @@ class TestFastLeRobotDatasetInit:
                 arrow_cache_path=cache_path,
             )
         finally:
-            _utils.check_timestamps_sync = _orig
+            _ld.check_timestamps_sync = _orig
 
         assert validation_ran
 
