@@ -304,51 +304,59 @@ class LeRobotPrefetcher(BasePrefetcher):
         else:
             self._download_incremental(episodes)
 
+    # HF XET rate limit: 500 requests / 5 min per IP. Each episode
+    # has ~2 files (parquet + video), so ~200 episodes per batch stays
+    # under the limit with headroom.
+    _EPISODES_PER_BATCH = 200
+    _BATCH_COOLDOWN_S = 310  # 5 min + 10s buffer
+
     def _download_bulk(self, episodes: list[int]) -> None:
-        """Download all episodes in one snapshot_download call.
+        """Download episodes in rate-limited batches.
 
-        Uses hub-cache mode (symlink) to avoid per-file HEAD calls that
-        trigger HF XET rate limits. Safe here because bulk mode never
-        evicts — the entire dataset is downloaded and kept.
-
-        After the initial download, verifies all episode files exist
-        and retries missing ones. HF 429 rate limits can interrupt
-        snapshot_download mid-flight, leaving an incomplete cache.
+        Uses hub-cache mode (symlink) to avoid per-file HEAD calls.
+        Batches requests to stay under HF's XET 500-req/5min per-IP
+        limit. Signals min_ready as soon as enough episodes are
+        available — training can start while the rest downloads.
         """
-        if self._episode_indices is not None:
-            patterns = ["meta/*"] + self._episode_patterns(episodes)
-            self._do_snapshot(allow_patterns=patterns, use_hub_cache=True)
-        else:
-            self._do_snapshot(use_hub_cache=True)
+        # Download metadata first
+        self._do_snapshot(allow_patterns=["meta/*"], use_hub_cache=True)
 
-        # Verify and retry missing episodes. HF's XET rate limit
-        # (500 req/5min per IP) causes partial downloads — each retry
-        # picks up ~500 more files. Wait 5 min between retries for the
-        # rate limit window to reset.
-        missing = self._find_missing_episodes(episodes)
-        while missing and not self._stop_event.is_set():
-            logger.warning(
-                f"Bulk download incomplete: {len(missing)}/{len(episodes)} "
-                f"episodes missing. Waiting 5 min for HF rate limit reset..."
-            )
-            self._stop_event.wait(timeout=310)  # 5 min + 10s buffer
+        # Batch episodes to stay under rate limit
+        total = len(episodes)
+        for batch_start in range(0, total, self._EPISODES_PER_BATCH):
             if self._stop_event.is_set():
                 break
-            patterns = ["meta/*"] + self._episode_patterns(missing)
-            self._do_snapshot(allow_patterns=patterns, use_hub_cache=True)
-            missing = self._find_missing_episodes(episodes)
 
+            batch = episodes[batch_start:batch_start + self._EPISODES_PER_BATCH]
+            batch_end = min(batch_start + self._EPISODES_PER_BATCH, total)
+            logger.info(
+                f"Downloading episodes {batch_start}-{batch_end - 1} "
+                f"of {total} ({batch_end * 100 // total}%)"
+            )
+
+            patterns = self._episode_patterns(batch)
+            self._do_snapshot(allow_patterns=patterns, use_hub_cache=True)
+            self._check_min_ready()
+
+            # Cooldown between batches (skip after last batch)
+            if batch_end < total and not self._stop_event.is_set():
+                logger.info(
+                    f"Rate limit cooldown: waiting "
+                    f"{self._BATCH_COOLDOWN_S}s before next batch..."
+                )
+                self._stop_event.wait(timeout=self._BATCH_COOLDOWN_S)
+
+        # Verify completeness
+        missing = self._find_missing_episodes(episodes)
         if missing:
             logger.warning(
-                f"Still missing {len(missing)} episodes at shutdown: "
-                f"{missing[:10]}..."
+                f"Download incomplete: {len(missing)}/{total} episodes "
+                f"missing after batched download: {missing[:10]}..."
             )
         else:
             logger.info(
-                f"Bulk download verified: all {len(episodes)} episodes present"
+                f"Bulk download complete: all {total} episodes verified"
             )
-
-        self._check_min_ready()
 
     def _find_missing_episodes(self, episodes: list[int]) -> list[int]:
         """Check which episodes are missing from the cache directory.

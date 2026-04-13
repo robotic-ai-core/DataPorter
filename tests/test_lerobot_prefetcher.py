@@ -330,14 +330,18 @@ class TestLeRobotPrefetcher:
         prefetcher.wait_for_min(timeout=30)
         prefetcher.stop()
 
-        assert len(calls) == 1
-        patterns = calls[0]["allow_patterns"]
-        assert "meta/*" in patterns
-        assert "data/chunk-000/episode_000000.parquet" in patterns
-        assert "data/chunk-000/episode_000003.parquet" in patterns
+        assert len(calls) >= 2  # meta/* + at least one episode batch
+        # Batched download: first call is meta/*, subsequent are episode batches
+        all_patterns = []
+        for call in calls:
+            if call["allow_patterns"]:
+                all_patterns.extend(call["allow_patterns"])
+        assert "meta/*" in all_patterns
+        assert "data/chunk-000/episode_000000.parquet" in all_patterns
+        assert "data/chunk-000/episode_000003.parquet" in all_patterns
 
-    def test_snapshot_fn_none_patterns_for_all(self, tmp_path):
-        """Without episode_indices, snapshot_download gets no allow_patterns."""
+    def test_snapshot_fn_batched_for_all(self, tmp_path):
+        """Without episode_indices, downloads in batches (rate-limited)."""
         calls = []
 
         def tracking_snapshot(repo_id, cache_dir, allow_patterns=None, ignore_patterns=None):
@@ -356,6 +360,7 @@ class TestLeRobotPrefetcher:
         time.sleep(0.5)
         prefetcher.stop()
 
-        assert len(calls) == 1
-        # No patterns = download everything
-        assert calls[0]["allow_patterns"] is None
+        # At least 2 calls: meta/* + one episode batch
+        assert len(calls) >= 2
+        # First call is metadata
+        assert calls[0]["allow_patterns"] == ["meta/*"]
