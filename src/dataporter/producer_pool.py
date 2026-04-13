@@ -61,6 +61,24 @@ class ProducerConfig:
     episode_offset: int = 0
     arrow_cache_path: str | None = None
 
+    def dataset_kwargs(self) -> dict:
+        """Build FastLeRobotDataset kwargs from this config.
+
+        Single source of truth for the root/tolerance_s/episodes/
+        arrow_cache_path extraction — prevents the SameFileError bug
+        class where a new kwarg is added in one place but missed in
+        another.
+        """
+        from pathlib import Path
+        kwargs = {"root": Path(self.root)}
+        if self.tolerance_s is not None:
+            kwargs["tolerance_s"] = self.tolerance_s
+        if self.arrow_cache_path is not None:
+            kwargs["arrow_cache_path"] = self.arrow_cache_path
+        if self.episode_indices:
+            kwargs["episodes"] = self.episode_indices
+        return kwargs
+
 
 # Keep AsyncProducer as a convenience wrapper for thread-based usage
 class AsyncProducer:
@@ -188,34 +206,15 @@ def _make_child_decode_fn(config: ProducerConfig) -> Callable[[int], torch.Tenso
     def decode(ep_idx: int) -> torch.Tensor:
         if "ds" not in _state:
             from .fast_lerobot_dataset import FastLeRobotDataset
-            # Use config.root as-is — do NOT resolve(). If root is a
-            # symlink to the hub cache snapshot, resolving it causes
-            # snapshot_download to try copying files onto themselves
-            # (SameFileError). The symlink path works correctly.
-            root = Path(config.root)
-            kwargs = {"root": root}
-            if config.tolerance_s is not None:
-                kwargs["tolerance_s"] = config.tolerance_s
-            # Pass Arrow cache path so load_hf_dataset() short-circuits
-            # instead of rebuilding from 10k parquet files (300s).
-            if config.arrow_cache_path is not None:
-                kwargs["arrow_cache_path"] = config.arrow_cache_path
-
-            # Pass episodes so LeRobotDataset.download_episodes() uses
-            # allow_patterns (episode files only), not a full repo download.
-            # Without this, a symlinked root triggers SameFileError when
-            # snapshot_download tries to copy .gitattributes onto itself.
-            if config.episode_indices:
-                kwargs["episodes"] = config.episode_indices
 
             _state["ds"] = FastLeRobotDataset(
                 config.repo_id,
                 delta_timestamps={"observation.image": [0.0]},
-                **kwargs,
+                **config.dataset_kwargs(),
             )
             logger.info(
                 f"[child] Loaded {config.source_name} "
-                f"({'Arrow cache' if config.arrow_cache_path else root})"
+                f"({'Arrow cache' if config.arrow_cache_path else config.root})"
             )
         ds = _state["ds"]
 

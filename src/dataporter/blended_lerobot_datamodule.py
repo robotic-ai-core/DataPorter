@@ -325,6 +325,27 @@ class BlendedLeRobotDataModule(L.LightningDataModule):
         )
 
     # ------------------------------------------------------------------
+    # Source kwargs (single source of truth)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _source_to_dataset_kwargs(source: dict) -> dict:
+        """Extract FastLeRobotDataset kwargs from a source dict.
+
+        Centralizes the root/tolerance_s/episodes extraction so the
+        SameFileError-prevention logic (passing episodes to restrict
+        download_episodes' allow_patterns) lives in one place.
+        """
+        kwargs = {}
+        if "root" in source:
+            kwargs["root"] = source["root"]
+        if "tolerance_s" in source:
+            kwargs["tolerance_s"] = source["tolerance_s"]
+        if "_available_episodes" in source:
+            kwargs["episodes"] = source["_available_episodes"]
+        return kwargs
+
+    # ------------------------------------------------------------------
     # Source loading
     # ------------------------------------------------------------------
 
@@ -336,13 +357,7 @@ class BlendedLeRobotDataModule(L.LightningDataModule):
         Returns:
             (train_episode_indices, val_sample_indices, full_dataset)
         """
-        kwargs = {}
-        if "root" in source:
-            kwargs["root"] = source["root"]
-        if "tolerance_s" in source:
-            kwargs["tolerance_s"] = source["tolerance_s"]
-        if "_available_episodes" in source:
-            kwargs["episodes"] = source["_available_episodes"]
+        kwargs = self._source_to_dataset_kwargs(source)
 
         # Retry on HF rate limit (429)
         for attempt in range(3):
@@ -625,15 +640,7 @@ class BlendedLeRobotDataModule(L.LightningDataModule):
         for source, train_ep_idx, val_idx, full_ds in full_datasets:
             if val_ts is not self.delta_timestamps:
                 kwargs = {"delta_timestamps": val_ts}
-                if "root" in source:
-                    kwargs["root"] = source["root"]
-                if "tolerance_s" in source:
-                    kwargs["tolerance_s"] = source["tolerance_s"]
-                # Pass episodes so download_episodes() uses allow_patterns
-                # instead of a full repo download. Without this, a symlinked
-                # root (hub-cache mode) causes SameFileError.
-                if "_available_episodes" in source:
-                    kwargs["episodes"] = source["_available_episodes"]
+                kwargs.update(self._source_to_dataset_kwargs(source))
                 val_ds = FastLeRobotDataset(
                     source["repo_id"],
                     cache_frames=self.cache_frames,
