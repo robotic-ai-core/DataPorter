@@ -201,6 +201,13 @@ def _make_child_decode_fn(config: ProducerConfig) -> Callable[[int], torch.Tenso
             if config.arrow_cache_path is not None:
                 kwargs["arrow_cache_path"] = config.arrow_cache_path
 
+            # Pass episodes so LeRobotDataset.download_episodes() uses
+            # allow_patterns (episode files only), not a full repo download.
+            # Without this, a symlinked root triggers SameFileError when
+            # snapshot_download tries to copy .gitattributes onto itself.
+            if config.episode_indices:
+                kwargs["episodes"] = config.episode_indices
+
             _state["ds"] = FastLeRobotDataset(
                 config.repo_id,
                 delta_timestamps={"observation.image": [0.0]},
