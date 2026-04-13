@@ -93,19 +93,28 @@ class FastLeRobotDataset(LeRobotDataset):
         # Stash before super().__init__ — load_hf_dataset() reads this.
         self._arrow_cache_path = arrow_cache_path
 
-        if arrow_cache_path is not None:
-            # Skip timestamp validation — the parent already validated
-            # this dataset. Re-validating in a spawned child materializes
-            # 1M+ rows via torch.tensor() per row, which hangs for minutes.
-            import lerobot.common.datasets.lerobot_dataset as _ld
-            _orig_check = _ld.check_timestamps_sync
-            _ld.check_timestamps_sync = lambda *a, **kw: True
-            try:
-                super().__init__(*args, **kwargs)
-            finally:
-                _ld.check_timestamps_sync = _orig_check
-        else:
+        # Replace check_timestamps_sync with a version that reads
+        # directly from the Arrow table (0.004s) instead of using the
+        # pre-extracted torch.stack(list(...)) arguments (71s for 1M rows).
+        # The slow extraction on lines 487-488 still runs, but the patched
+        # function ignores those arguments and re-reads from Arrow.
+        import lerobot.common.datasets.lerobot_dataset as _ld
+        from lerobot.common.datasets.utils import check_timestamps_sync as _real_check
+        _orig = _ld.check_timestamps_sync
+
+        def _fast_check(_timestamps, _episode_indices, _ep_data_index,
+                        fps, tolerance_s, *args, **kwargs):
+            # Ignore the slow pre-extracted args — read Arrow directly
+            ts = self.hf_dataset._data.column("timestamp").to_numpy()
+            ep = self.hf_dataset._data.column("episode_index").to_numpy()
+            ep_idx = {k: t.numpy() for k, t in self.episode_data_index.items()}
+            return _real_check(ts, ep, ep_idx, fps, tolerance_s, *args, **kwargs)
+
+        _ld.check_timestamps_sync = _fast_check
+        try:
             super().__init__(*args, **kwargs)
+        finally:
+            _ld.check_timestamps_sync = _orig
         self._cache_frames = cache_frames
         self._return_uint8 = return_uint8
         self._frame_source = None
@@ -184,37 +193,35 @@ class FastLeRobotDataset(LeRobotDataset):
            datasets to mmap the Arrow IPC cache.  Workers share physical
            pages — zero COW fragmentation (~200 MB vs ~8.6 GB per worker).
         """
-        from lerobot.common.datasets.lerobot_dataset import hf_transform_to_torch
-
         # Fast path: load pre-built Arrow cache from parent process
         arrow_path = getattr(self, "_arrow_cache_path", None)
         if arrow_path is not None:
             from datasets import Dataset
             logger.info(f"Loading Arrow cache: {arrow_path}")
             hf_dataset = Dataset.from_file(arrow_path)
-            hf_dataset.set_transform(hf_transform_to_torch)
-            return hf_dataset
-
-        # Standard path: load from parquet with mmap
-        from datasets import load_dataset
-
-        if self.episodes is None:
-            path = str(self.root / "data")
-            hf_dataset = load_dataset(
-                "parquet", data_dir=path, split="train",
-                keep_in_memory=False,
-            )
         else:
-            files = [
-                str(self.root / self.meta.get_data_file_path(ep_idx))
-                for ep_idx in self.episodes
-            ]
-            hf_dataset = load_dataset(
-                "parquet", data_files=files, split="train",
-                keep_in_memory=False,
-            )
+            # Standard path: load from parquet with mmap
+            from datasets import load_dataset
 
+            if self.episodes is None:
+                path = str(self.root / "data")
+                hf_dataset = load_dataset(
+                    "parquet", data_dir=path, split="train",
+                    keep_in_memory=False,
+                )
+            else:
+                files = [
+                    str(self.root / self.meta.get_data_file_path(ep_idx))
+                    for ep_idx in self.episodes
+                ]
+                hf_dataset = load_dataset(
+                    "parquet", data_files=files, split="train",
+                    keep_in_memory=False,
+                )
+
+        from lerobot.common.datasets.lerobot_dataset import hf_transform_to_torch
         hf_dataset.set_transform(hf_transform_to_torch)
+
         return hf_dataset
 
     def _decode_episode_fallback(self, ep_idx: int) -> torch.Tensor:
