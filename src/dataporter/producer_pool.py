@@ -138,8 +138,16 @@ def _spawn_pool_entry(
             decode_fns[cfg.source_name] = fn
 
             first_ep = cfg.episode_indices[0] if cfg.episode_indices else 0
+
+            # Log environment details for debugging Vast-specific hangs
+            try:
+                import av
+                av_version = av.__version__
+            except Exception:
+                av_version = "unknown"
             logger.info(
-                f"[child] Smoke test: {cfg.source_name} ep {first_ep}..."
+                f"[child] Smoke test: {cfg.source_name} ep {first_ep} "
+                f"(pyav={av_version}, root={cfg.root})"
             )
             import concurrent.futures
             with concurrent.futures.ThreadPoolExecutor(1) as ex:
@@ -222,10 +230,9 @@ def _make_child_decode_fn(config: ProducerConfig) -> Callable[[int], torch.Tenso
         num_frames = ep_end - ep_start
         all_ts = [i / ds.fps for i in range(num_frames)]
         video_path = ds.root / ds.meta.get_video_file_path(ep_idx, vid_key)
-        # Resolve symlinks — HF hub-cache stores video files as
-        # symlinks to ../../blobs/<hash>. pyav/ffmpeg may hang on
-        # symlinked paths in spawned process contexts.
-        video_path = video_path.resolve()
+        # Keep the symlink path (has .mp4 extension) — do NOT resolve.
+        # Resolved blob paths lose the extension, which may cause pyav
+        # to fall back to content probing that hangs in some environments.
         all_frames = decode_video_frames(
             video_path, all_ts, ds.tolerance_s, ds.video_backend,
         )

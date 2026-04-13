@@ -208,25 +208,30 @@ class TestDevShmCapacity:
         assert buf.capacity == 2
 
 
-class TestVideoPathResolution:
-    """Verify that _make_child_decode_fn resolves video file symlinks.
+class TestVideoPathExtension:
+    """Verify that _make_child_decode_fn preserves the .mp4 extension.
 
-    pyav/ffmpeg can hang on symlinked blob paths in spawned processes.
-    The decode function must call .resolve() on the video path before
-    passing it to decode_video_frames.
+    HF hub-cache stores video files as symlinks:
+      videos/.../episode_000000.mp4 → ../../blobs/<hash>
+
+    The symlink has .mp4 extension; the blob does not. pyav/ffmpeg uses
+    the extension for format detection. Resolving the symlink loses the
+    extension, potentially causing ffmpeg to probe content (which can
+    hang in spawned processes on some environments).
+
+    The decode function must pass the symlink path (with .mp4) to
+    decode_video_frames, NOT the resolved blob path.
     """
 
-    def test_decode_fn_resolves_video_path(self, tmp_path):
-        """decode_video_frames receives a resolved (non-symlink) path."""
+    def test_decode_fn_preserves_mp4_extension(self, tmp_path):
+        """decode_video_frames receives a path with .mp4 extension."""
         from unittest.mock import patch, MagicMock
         from dataporter.producer_pool import _make_child_decode_fn, ProducerConfig
 
-        # Create a symlink chain like HF hub-cache:
-        # tmp_path/blobs/abc123 (real file)
-        # tmp_path/videos/chunk-000/observation.image/episode_000000.mp4 → ../../../blobs/abc123
+        # Create a symlink chain like HF hub-cache
         blobs = tmp_path / "blobs"
         blobs.mkdir()
-        real_video = blobs / "abc123"
+        real_video = blobs / "abc123"  # no extension
         real_video.write_bytes(b"fake mp4")
 
         vid_dir = tmp_path / "videos" / "chunk-000" / "observation.image"
@@ -234,10 +239,7 @@ class TestVideoPathResolution:
         symlink = vid_dir / "episode_000000.mp4"
         symlink.symlink_to(real_video)
 
-        assert symlink.is_symlink()
-        assert symlink.resolve() == real_video.resolve()
-
-        # Mock FastLeRobotDataset and decode_video_frames
+        # Mock FastLeRobotDataset
         mock_ds = MagicMock()
         mock_ds.meta.video_keys = ["observation.image"]
         mock_ds.meta.get_video_file_path.return_value = (
@@ -250,7 +252,7 @@ class TestVideoPathResolution:
         mock_ds.fps = 10
         mock_ds.tolerance_s = 1e-4
         mock_ds.video_backend = "pyav"
-        mock_ds.root = tmp_path  # NOT resolved — contains symlinks
+        mock_ds.root = tmp_path
 
         captured_paths = []
 
@@ -267,7 +269,6 @@ class TestVideoPathResolution:
 
         decode_fn = _make_child_decode_fn(config)
 
-        # Patch at import source — the closure imports locally
         with patch(
             "dataporter.fast_lerobot_dataset.FastLeRobotDataset",
             return_value=mock_ds,
@@ -278,9 +279,10 @@ class TestVideoPathResolution:
             decode_fn(0)
 
         assert len(captured_paths) == 1
-        decoded_path = captured_paths[0]
         from pathlib import Path
-        assert not Path(decoded_path).is_symlink(), (
-            f"decode_video_frames received a symlink: {decoded_path}. "
-            f"Should be resolved to: {real_video.resolve()}"
+        decoded_path = Path(captured_paths[0])
+        assert decoded_path.suffix == ".mp4", (
+            f"decode_video_frames received path without .mp4 extension: "
+            f"{decoded_path.name}. pyav needs the extension for format "
+            f"detection — resolved blob paths lose it."
         )
