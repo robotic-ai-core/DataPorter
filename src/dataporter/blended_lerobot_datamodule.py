@@ -431,9 +431,9 @@ class BlendedLeRobotDataModule(L.LightningDataModule):
             # Build ProducerConfig (picklable, for spawn mode)
             # episode_offset shifts raw indices so multiple sources
             # don't collide in the ShuffleBuffer key space.
-            # Resolve symlinks in root — hub-cache mode creates symlink
-            # chains that may not resolve in spawned child processes.
-            resolved_root = str(Path(full_ds.root).resolve())
+            # Pass root as-is — do NOT resolve(). Resolving a symlink
+            # to the hub cache snapshot causes SameFileError when the
+            # child's LeRobotDataset tries snapshot_download into it.
 
             # Extract the parent's Arrow IPC cache path so the spawned
             # child can load it directly (instant) instead of rebuilding
@@ -448,7 +448,7 @@ class BlendedLeRobotDataModule(L.LightningDataModule):
             config = ProducerConfig(
                 source_name=source["repo_id"],
                 repo_id=source["repo_id"],
-                root=resolved_root,
+                root=str(full_ds.root),
                 episode_indices=train_ep_indices,
                 weight=source["weight"],
                 tolerance_s=source.get("tolerance_s"),

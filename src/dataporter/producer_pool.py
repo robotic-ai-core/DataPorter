@@ -188,9 +188,11 @@ def _make_child_decode_fn(config: ProducerConfig) -> Callable[[int], torch.Tenso
     def decode(ep_idx: int) -> torch.Tensor:
         if "ds" not in _state:
             from .fast_lerobot_dataset import FastLeRobotDataset
-            # Resolve symlinks — hub-cache mode creates symlink chains
-            # that may not resolve in spawned child contexts.
-            root = Path(config.root).resolve()
+            # Use config.root as-is — do NOT resolve(). If root is a
+            # symlink to the hub cache snapshot, resolving it causes
+            # snapshot_download to try copying files onto themselves
+            # (SameFileError). The symlink path works correctly.
+            root = Path(config.root)
             kwargs = {"root": root}
             if config.tolerance_s is not None:
                 kwargs["tolerance_s"] = config.tolerance_s
