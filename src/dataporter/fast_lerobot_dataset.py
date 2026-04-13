@@ -12,14 +12,15 @@ Requires lerobot: pip install -e external/lerobot
 
 import logging
 import random
+import threading
 from collections import OrderedDict
+from pathlib import Path
 from typing import Iterator
 
 import torch
 
 try:
     from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
-    from lerobot.common.datasets.video_utils import decode_video_frames
 except ImportError:
     raise ImportError(
         "FastLeRobotDataset requires lerobot. "
@@ -27,6 +28,26 @@ except ImportError:
     )
 
 logger = logging.getLogger(__name__)
+
+_check_ts_lock = threading.Lock()
+
+
+def decode_episode_frames(
+    video_path: Path,
+    num_frames: int,
+    fps: float,
+    tolerance_s: float,
+    video_backend: str,
+) -> torch.Tensor:
+    """Decode all frames for an episode as uint8 [T, C, H, W]."""
+    # Local import so mock patches at the canonical location
+    # (lerobot.common.datasets.video_utils.decode_video_frames) take effect.
+    from lerobot.common.datasets.video_utils import decode_video_frames as _decode
+    all_ts = [i / fps for i in range(num_frames)]
+    all_frames = _decode(video_path, all_ts, tolerance_s, video_backend)
+    if all_frames.dim() == 5:
+        all_frames = all_frames.squeeze(0)
+    return (all_frames * 255).to(torch.uint8)
 
 
 def _make_frame_producer(
@@ -50,24 +71,21 @@ def _make_frame_producer(
                     ep_start = dataset.episode_data_index["from"][ep_idx].item()
                     ep_end = dataset.episode_data_index["to"][ep_idx].item()
                     num_frames = ep_end - ep_start
-                    all_ts = [i / dataset.fps for i in range(num_frames)]
 
                     video_path = (
                         dataset.root
                         / dataset.meta.get_video_file_path(ep_idx, vid_key)
                     )
                     try:
-                        all_frames = decode_video_frames(
-                            video_path, all_ts,
-                            dataset.tolerance_s, dataset.video_backend,
+                        frames_uint8 = decode_episode_frames(
+                            video_path, num_frames,
+                            dataset.fps, dataset.tolerance_s,
+                            dataset.video_backend,
                         )
                     except Exception as e:
                         logger.warning(f"Failed to decode ep {ep_idx}/{vid_key}: {e}")
                         break
-                    if all_frames.dim() == 5:
-                        all_frames = all_frames.squeeze(0)
-                    # Yield single video key frames as uint8
-                    yield ep_idx, (all_frames * 255).to(torch.uint8)
+                    yield ep_idx, frames_uint8
                     break  # Only first video key for now (PushT has one)
 
     return producer
@@ -110,11 +128,12 @@ class FastLeRobotDataset(LeRobotDataset):
             ep_idx = {k: t.numpy() for k, t in self.episode_data_index.items()}
             return _real_check(ts, ep, ep_idx, fps, tolerance_s, *args, **kwargs)
 
-        _ld.check_timestamps_sync = _fast_check
-        try:
-            super().__init__(*args, **kwargs)
-        finally:
-            _ld.check_timestamps_sync = _orig
+        with _check_ts_lock:
+            _ld.check_timestamps_sync = _fast_check
+            try:
+                super().__init__(*args, **kwargs)
+            finally:
+                _ld.check_timestamps_sync = _orig
         self._cache_frames = cache_frames
         self._return_uint8 = return_uint8
         self._frame_source = None
@@ -181,6 +200,14 @@ class FastLeRobotDataset(LeRobotDataset):
 
         logger.info("FastLeRobotDataset initialized with optimized HF access")
 
+    @property
+    def arrow_cache_path(self) -> str | None:
+        """Return the Arrow IPC cache file path, if available."""
+        cache_files = getattr(self.hf_dataset, "cache_files", None)
+        if cache_files and len(cache_files) > 0:
+            return cache_files[0].get("filename")
+        return None
+
     def load_hf_dataset(self):
         """Override with two optimizations:
 
@@ -230,14 +257,11 @@ class FastLeRobotDataset(LeRobotDataset):
             ep_start = self.episode_data_index["from"][ep_idx].item()
             ep_end = self.episode_data_index["to"][ep_idx].item()
             num_frames = ep_end - ep_start
-            all_ts = [i / self.fps for i in range(num_frames)]
             video_path = self.root / self.meta.get_video_file_path(ep_idx, vid_key)
-            all_frames = decode_video_frames(
-                video_path, all_ts, self.tolerance_s, self.video_backend,
+            return decode_episode_frames(
+                video_path, num_frames,
+                self.fps, self.tolerance_s, self.video_backend,
             )
-            if all_frames.dim() == 5:
-                all_frames = all_frames.squeeze(0)
-            return (all_frames * 255).to(torch.uint8)
 
     def __del__(self):
         if self._frame_source is not None:
@@ -368,15 +392,12 @@ class FastLeRobotDataset(LeRobotDataset):
         ep_start = self.episode_data_index["from"][ep_idx].item()
         ep_end = self.episode_data_index["to"][ep_idx].item()
         num_frames = ep_end - ep_start
-        all_ts = [i / self.fps for i in range(num_frames)]
 
         video_path = self.root / self.meta.get_video_file_path(ep_idx, vid_key)
-        all_frames = decode_video_frames(
-            video_path, all_ts, self.tolerance_s, self.video_backend,
+        frames_uint8 = decode_episode_frames(
+            video_path, num_frames,
+            self.fps, self.tolerance_s, self.video_backend,
         )
-        if all_frames.dim() == 5:
-            all_frames = all_frames.squeeze(0)
-        frames_uint8 = (all_frames * 255).to(torch.uint8)
         entry_bytes = frames_uint8.nelement() * frames_uint8.element_size()
 
         while (

@@ -113,28 +113,17 @@ class LeRobotShuffleBufferDataset(Dataset):
         ``idx`` is ignored -- every call samples uniformly from the buffer.
         """
         # 1. Sample random episode from buffer
-        ep_idx, frames_uint8 = self._buffer.sample(self._rng)
-
         # 2. Map to source dataset (retry up to 10 times on miss)
-        src_idx = self._ep_to_source.get(ep_idx)
-        _retries = getattr(self, "_retry_count", 0)
-        if src_idx is None:
-            if _retries >= 10:
-                self._retry_count = 0
-                raise RuntimeError(
-                    f"Episode {ep_idx} not in any source after 10 retries. "
-                    f"Buffer may contain stale episodes."
-                )
-            self._retry_count = _retries + 1
+        for attempt in range(10):
             ep_idx, frames_uint8 = self._buffer.sample(self._rng)
             src_idx = self._ep_to_source.get(ep_idx)
-            if src_idx is None:
-                self._retry_count = 0
-                raise RuntimeError(
-                    f"Episode {ep_idx} not in any source. "
-                    f"Known episodes: {sorted(self._ep_to_source.keys())[:10]}..."
-                )
-        self._retry_count = 0
+            if src_idx is not None:
+                break
+        else:
+            raise RuntimeError(
+                f"No valid episode after 10 samples from buffer. "
+                f"Known episodes: {sorted(self._ep_to_source.keys())[:10]}..."
+            )
 
         source = self._sources[src_idx]
         dataset = source["dataset"]

@@ -138,16 +138,8 @@ def _spawn_pool_entry(
             decode_fns[cfg.source_name] = fn
 
             first_ep = cfg.episode_indices[0] if cfg.episode_indices else 0
-
-            # Log environment details for debugging Vast-specific hangs
-            try:
-                import av
-                av_version = av.__version__
-            except Exception:
-                av_version = "unknown"
             logger.info(
-                f"[child] Smoke test: {cfg.source_name} ep {first_ep} "
-                f"(pyav={av_version}, root={cfg.root})"
+                f"[child] Smoke test: {cfg.source_name} ep {first_ep}..."
             )
             import concurrent.futures
             with concurrent.futures.ThreadPoolExecutor(1) as ex:
@@ -171,6 +163,7 @@ def _spawn_pool_entry(
         asyncio.run(_run_spawn_pool(
             buffer, configs, total_workers,
             warmup_target, warmup_event, stop_event,
+            decode_fns=decode_fns,
         ))
     except Exception as e:
         _report_error(f"ProducerPool child error: {e}")
@@ -217,8 +210,6 @@ def _make_child_decode_fn(config: ProducerConfig) -> Callable[[int], torch.Tenso
             )
         ds = _state["ds"]
 
-        from lerobot.common.datasets.video_utils import decode_video_frames
-
         if not ds.meta.video_keys:
             raise RuntimeError(
                 f"Dataset {config.source_name} has no video keys — "
@@ -228,17 +219,17 @@ def _make_child_decode_fn(config: ProducerConfig) -> Callable[[int], torch.Tenso
         ep_start = ds.episode_data_index["from"][ep_idx].item()
         ep_end = ds.episode_data_index["to"][ep_idx].item()
         num_frames = ep_end - ep_start
-        all_ts = [i / ds.fps for i in range(num_frames)]
         video_path = ds.root / ds.meta.get_video_file_path(ep_idx, vid_key)
-        # Keep the symlink path (has .mp4 extension) — do NOT resolve.
-        # Resolved blob paths lose the extension, which may cause pyav
-        # to fall back to content probing that hangs in some environments.
-        all_frames = decode_video_frames(
-            video_path, all_ts, ds.tolerance_s, ds.video_backend,
+        # Resolve symlinks — HF hub-cache stores video files as
+        # symlinks to ../../blobs/<hash>. pyav/ffmpeg may hang on
+        # symlinked paths in spawned process contexts.
+        video_path = video_path.resolve()
+
+        from .fast_lerobot_dataset import decode_episode_frames
+        return decode_episode_frames(
+            video_path, num_frames,
+            ds.fps, ds.tolerance_s, ds.video_backend,
         )
-        if all_frames.dim() == 5:
-            all_frames = all_frames.squeeze(0)
-        return (all_frames * 255).to(torch.uint8)
 
     return decode
 
@@ -250,6 +241,7 @@ async def _run_spawn_pool(
     warmup_target: int,
     warmup_event,
     stop_event,
+    decode_fns: dict[str, Callable] | None = None,
 ) -> None:
     """Async event loop in spawned child: parallel decode via executors.
 
@@ -260,12 +252,12 @@ async def _run_spawn_pool(
     """
     loop = asyncio.get_event_loop()
 
-    # Build decode functions — reuse from smoke test if available
-    # (smoke test in _spawn_pool_entry already called _make_child_decode_fn
-    # which lazily initializes the dataset on first decode call)
-    decode_fns = {}
-    for cfg in configs:
-        decode_fns[cfg.source_name] = _make_child_decode_fn(cfg)
+    # Reuse smoke-tested decode functions if provided (dataset already
+    # lazily initialized from the smoke test call). Otherwise create new.
+    if decode_fns is None:
+        decode_fns = {}
+        for cfg in configs:
+            decode_fns[cfg.source_name] = _make_child_decode_fn(cfg)
 
     # Distribute thread workers by weight
     total_weight = sum(cfg.weight for cfg in configs)

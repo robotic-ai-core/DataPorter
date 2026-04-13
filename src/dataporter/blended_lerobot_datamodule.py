@@ -225,6 +225,12 @@ class BlendedLeRobotDataModule(L.LightningDataModule):
         """Return image/video keys used in the dataset. Override in subclass."""
         return ["observation.image"]
 
+    def _common_sample_keys(self) -> set[str]:
+        """Return keys common to all samples (for collation compatibility)."""
+        keys = set(self.delta_timestamps.keys())
+        keys.update(["episode_index", "frame_index", "timestamp", "index", "task_index"])
+        return keys
+
     # ------------------------------------------------------------------
     # Key intersection
     # ------------------------------------------------------------------
@@ -324,8 +330,12 @@ class BlendedLeRobotDataModule(L.LightningDataModule):
 
     def _load_and_split_source(
         self, source: dict, delta_timestamps: dict,
-    ) -> tuple[Subset, list[int], FastLeRobotDataset]:
-        """Load a single source dataset and split into train/val."""
+    ) -> tuple[list[int], list[int], FastLeRobotDataset]:
+        """Load a single source dataset and split into train/val.
+
+        Returns:
+            (train_episode_indices, val_sample_indices, full_dataset)
+        """
         kwargs = {}
         if "root" in source:
             kwargs["root"] = source["root"]
@@ -365,18 +375,14 @@ class BlendedLeRobotDataModule(L.LightningDataModule):
         num_episodes = len(episode_index["from"])
         train_episodes = int(self.train_split_ratio * num_episodes)
 
-        train_indices = []
+        train_ep_indices = list(range(train_episodes))
         val_indices = []
-        for ep_idx in range(num_episodes):
+        for ep_idx in range(train_episodes, num_episodes):
             start = int(episode_index["from"][ep_idx])
             end = int(episode_index["to"][ep_idx])
-            if ep_idx < train_episodes:
-                train_indices.extend(range(start, end))
-            else:
-                val_indices.extend(range(start, end))
+            val_indices.extend(range(start, end))
 
-        train_subset = Subset(dataset, train_indices)
-        return train_subset, val_indices, dataset
+        return train_ep_indices, val_indices, dataset
 
     # ------------------------------------------------------------------
     # Shuffle buffer setup
@@ -399,7 +405,7 @@ class BlendedLeRobotDataModule(L.LightningDataModule):
         # Determine max_frames and frame dimensions across all sources
         max_frames = 0
         # Probe frame shape from first source's metadata
-        first_ds = full_datasets[0][2]
+        first_ds = full_datasets[0][3]
         vid_keys = first_ds.meta.video_keys
         if vid_keys:
             # LeRobot metadata stores shape as (H, W, C)
@@ -411,11 +417,8 @@ class BlendedLeRobotDataModule(L.LightningDataModule):
         sources_for_dataset = []
         cumulative_offset = 0
 
-        for source, val_idx, full_ds in full_datasets:
+        for source, train_ep_indices, val_idx, full_ds in full_datasets:
             ep_data_index = full_ds.episode_data_index
-            num_episodes = len(ep_data_index["from"])
-            train_episodes = int(self.train_split_ratio * num_episodes)
-            train_ep_indices = list(range(train_episodes))
 
             # Max frames per episode across this source
             for ep_idx in train_ep_indices:
@@ -435,15 +438,12 @@ class BlendedLeRobotDataModule(L.LightningDataModule):
             # Extract the parent's Arrow IPC cache path so the spawned
             # child can load it directly (instant) instead of rebuilding
             # from 10k parquet files (300s).
-            arrow_cache_path = None
-            cache_files = getattr(full_ds.hf_dataset, "cache_files", None)
-            if cache_files and len(cache_files) > 0:
-                arrow_cache_path = cache_files[0].get("filename")
-                if arrow_cache_path:
-                    logger.info(
-                        f"Arrow cache for {source['repo_id']}: "
-                        f"{arrow_cache_path}"
-                    )
+            arrow_cache_path = full_ds.arrow_cache_path
+            if arrow_cache_path:
+                logger.info(
+                    f"Arrow cache for {source['repo_id']}: "
+                    f"{arrow_cache_path}"
+                )
 
             config = ProducerConfig(
                 source_name=source["repo_id"],
@@ -467,7 +467,7 @@ class BlendedLeRobotDataModule(L.LightningDataModule):
             })
 
             # Advance offset past this source's episodes
-            cumulative_offset += train_episodes
+            cumulative_offset += len(train_ep_indices)
 
         # Create buffer + pool
         buffer = ShuffleBuffer(
@@ -491,11 +491,9 @@ class BlendedLeRobotDataModule(L.LightningDataModule):
         # epoch_length: use total training samples across all sources
         # as a reasonable epoch size
         total_train_samples = 0
-        for source, val_idx, full_ds in full_datasets:
+        for source, train_ep_indices, val_idx, full_ds in full_datasets:
             ep_data_index = full_ds.episode_data_index
-            num_episodes = len(ep_data_index["from"])
-            train_episodes = int(self.train_split_ratio * num_episodes)
-            for ep_idx in range(train_episodes):
+            for ep_idx in train_ep_indices:
                 total_train_samples += int(
                     ep_data_index["to"][ep_idx]
                     - ep_data_index["from"][ep_idx]
@@ -559,10 +557,10 @@ class BlendedLeRobotDataModule(L.LightningDataModule):
         full_datasets = []
 
         for source in self._sources:
-            train_sub, val_idx, full_ds = self._load_and_split_source(
+            train_ep_idx, val_idx, full_ds = self._load_and_split_source(
                 source, self.delta_timestamps
             )
-            full_datasets.append((source, val_idx, full_ds))
+            full_datasets.append((source, train_ep_idx, val_idx, full_ds))
             # Write sentinel so sparkinstance skip_if_present sees a clean cache
             write_cache_sentinel(hf_cache_repo_path(source["repo_id"]))
 
@@ -578,14 +576,11 @@ class BlendedLeRobotDataModule(L.LightningDataModule):
             train_subsets = []
             train_weights = []
 
-            for source, val_idx, full_ds in full_datasets:
-                # Rebuild train subset (same split as _load_and_split_source)
+            for source, train_ep_idx, val_idx, full_ds in full_datasets:
+                # Expand episode indices to sample indices
                 ep_data_index = full_ds.episode_data_index
-                num_episodes = len(ep_data_index["from"])
-                train_episodes = int(self.train_split_ratio * num_episodes)
-
                 train_indices = []
-                for ep_idx in range(train_episodes):
+                for ep_idx in train_ep_idx:
                     start = int(ep_data_index["from"][ep_idx])
                     end = int(ep_data_index["to"][ep_idx])
                     train_indices.extend(range(start, end))
@@ -600,14 +595,8 @@ class BlendedLeRobotDataModule(L.LightningDataModule):
                 train_subsets.append(train_sub)
                 train_weights.append((source["weight"], len(train_sub)))
 
-            # Common keys for collator when blending
-            common_keys = set(self.delta_timestamps.keys())
-            common_keys.update([
-                "episode_index", "frame_index", "timestamp", "index",
-                "task_index",
-            ])
-
             # Filter samples to common keys when blending
+            common_keys = self._common_sample_keys()
             if len(train_subsets) > 1:
                 train_subsets = [
                     KeyFilterDataset(sub, common_keys)
@@ -633,7 +622,7 @@ class BlendedLeRobotDataModule(L.LightningDataModule):
 
         # ---- Validation dataset (always uses old path) ----
         val_parts = []
-        for source, val_idx, full_ds in full_datasets:
+        for source, train_ep_idx, val_idx, full_ds in full_datasets:
             if val_ts is not self.delta_timestamps:
                 kwargs = {"delta_timestamps": val_ts}
                 if "root" in source:
@@ -650,14 +639,8 @@ class BlendedLeRobotDataModule(L.LightningDataModule):
             else:
                 val_parts.append(Subset(full_ds, val_idx))
 
-        # Common keys for collator when blending
-        common_keys = set(self.delta_timestamps.keys())
-        common_keys.update([
-            "episode_index", "frame_index", "timestamp", "index",
-            "task_index",
-        ])
-
         # Filter val samples to common keys when blending
+        common_keys = self._common_sample_keys()
         if len(val_parts) > 1:
             val_parts = [
                 KeyFilterDataset(vp, common_keys) for vp in val_parts
