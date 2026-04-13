@@ -92,7 +92,20 @@ class FastLeRobotDataset(LeRobotDataset):
                  **kwargs):
         # Stash before super().__init__ — load_hf_dataset() reads this.
         self._arrow_cache_path = arrow_cache_path
-        super().__init__(*args, **kwargs)
+
+        if arrow_cache_path is not None:
+            # Skip timestamp validation — the parent already validated
+            # this dataset. Re-validating in a spawned child materializes
+            # 1M+ rows via torch.tensor() per row, which hangs for minutes.
+            import lerobot.common.datasets.lerobot_dataset as _ld
+            _orig_check = _ld.check_timestamps_sync
+            _ld.check_timestamps_sync = lambda *a, **kw: True
+            try:
+                super().__init__(*args, **kwargs)
+            finally:
+                _ld.check_timestamps_sync = _orig_check
+        else:
+            super().__init__(*args, **kwargs)
         self._cache_frames = cache_frames
         self._return_uint8 = return_uint8
         self._frame_source = None

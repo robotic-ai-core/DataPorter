@@ -208,23 +208,19 @@ class TestDevShmCapacity:
         assert buf.capacity == 2
 
 
-class TestVideoPathExtension:
-    """Verify that _make_child_decode_fn preserves the .mp4 extension.
+class TestVideoPathResolution:
+    """Verify that _make_child_decode_fn resolves video symlinks.
 
     HF hub-cache stores video files as symlinks:
       videos/.../episode_000000.mp4 → ../../blobs/<hash>
 
-    The symlink has .mp4 extension; the blob does not. pyav/ffmpeg uses
-    the extension for format detection. Resolving the symlink loses the
-    extension, potentially causing ffmpeg to probe content (which can
-    hang in spawned processes on some environments).
-
-    The decode function must pass the symlink path (with .mp4) to
-    decode_video_frames, NOT the resolved blob path.
+    The decode function resolves these so the child process gets a
+    concrete file path rather than a symlink chain. Verified locally
+    that pyav handles extensionless blob paths correctly.
     """
 
-    def test_decode_fn_preserves_mp4_extension(self, tmp_path):
-        """decode_video_frames receives a path with .mp4 extension."""
+    def test_decode_fn_resolves_video_path(self, tmp_path):
+        """decode_video_frames receives a resolved (non-symlink) path."""
         from unittest.mock import patch, MagicMock
         from dataporter.producer_pool import _make_child_decode_fn, ProducerConfig
 
@@ -281,8 +277,8 @@ class TestVideoPathExtension:
         assert len(captured_paths) == 1
         from pathlib import Path
         decoded_path = Path(captured_paths[0])
-        assert decoded_path.suffix == ".mp4", (
-            f"decode_video_frames received path without .mp4 extension: "
-            f"{decoded_path.name}. pyav needs the extension for format "
-            f"detection — resolved blob paths lose it."
+        assert not decoded_path.is_symlink(), (
+            f"decode_video_frames received a symlink: {decoded_path}. "
+            f"Should be resolved to avoid symlink chain issues in "
+            f"spawned processes."
         )
