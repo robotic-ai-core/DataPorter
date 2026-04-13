@@ -321,26 +321,32 @@ class LeRobotPrefetcher(BasePrefetcher):
         else:
             self._do_snapshot(use_hub_cache=True)
 
-        # Verify and retry missing episodes
+        # Verify and retry missing episodes. HF's XET rate limit
+        # (500 req/5min per IP) causes partial downloads — each retry
+        # picks up ~500 more files. Wait 5 min between retries for the
+        # rate limit window to reset.
         missing = self._find_missing_episodes(episodes)
-        retries = 0
-        while missing and retries < 3:
-            retries += 1
+        while missing and not self._stop_event.is_set():
             logger.warning(
-                f"Bulk download incomplete: {len(missing)} episodes missing "
-                f"(retry {retries}/3). Likely caused by HF 429 rate limit."
+                f"Bulk download incomplete: {len(missing)}/{len(episodes)} "
+                f"episodes missing. Waiting 5 min for HF rate limit reset..."
             )
+            self._stop_event.wait(timeout=310)  # 5 min + 10s buffer
+            if self._stop_event.is_set():
+                break
             patterns = ["meta/*"] + self._episode_patterns(missing)
             self._do_snapshot(allow_patterns=patterns, use_hub_cache=True)
             missing = self._find_missing_episodes(episodes)
 
         if missing:
             logger.warning(
-                f"Still missing {len(missing)} episodes after 3 retries: "
+                f"Still missing {len(missing)} episodes at shutdown: "
                 f"{missing[:10]}..."
             )
         else:
-            logger.info(f"Bulk download verified: all {len(episodes)} episodes present")
+            logger.info(
+                f"Bulk download verified: all {len(episodes)} episodes present"
+            )
 
         self._check_min_ready()
 
