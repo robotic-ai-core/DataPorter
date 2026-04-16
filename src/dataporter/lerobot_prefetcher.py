@@ -313,13 +313,16 @@ class LeRobotPrefetcher(BasePrefetcher):
     def _download_bulk(self, episodes: list[int]) -> None:
         """Download episodes in rate-limited batches.
 
-        Uses hub-cache mode (symlink) to avoid per-file HEAD calls.
-        Batches requests to stay under HF's XET 500-req/5min per-IP
-        limit. Signals min_ready as soon as enough episodes are
-        available — training can start while the rest downloads.
+        Uses local-dir mode (direct file copy, no symlinks) to avoid
+        pyav hanging on symlinked blob paths. Batches requests to stay
+        under HF's XET 500-req/5min per-IP limit.
+
+        Previously used hub-cache mode (symlinks) but this caused:
+        - pyav decode hangs on double symlink chains (dir→snapshot→blob)
+        - SameFileError when snapshot_download copies onto itself
         """
         # Download metadata first
-        self._do_snapshot(allow_patterns=["meta/*"], use_hub_cache=True)
+        self._do_snapshot(allow_patterns=["meta/*"])
 
         # Batch episodes to stay under rate limit
         total = len(episodes)
@@ -335,7 +338,7 @@ class LeRobotPrefetcher(BasePrefetcher):
             )
 
             patterns = self._episode_patterns(batch)
-            self._do_snapshot(allow_patterns=patterns, use_hub_cache=True)
+            self._do_snapshot(allow_patterns=patterns)
             self._check_min_ready()
 
             # Cooldown between batches (skip after last batch)
