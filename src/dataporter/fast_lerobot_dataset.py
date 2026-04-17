@@ -127,6 +127,27 @@ class FastLeRobotDataset(LeRobotDataset):
         else:
             super().__init__(*args, **kwargs)
 
+        # Invariant: self.episodes must be contiguous starting from 0.
+        # Upstream LeRobot indexes episode_data_index positionally
+        # (`episode_data_index["from"][pos]`) but passes a raw episode ID to
+        # `get_video_file_path(ep_idx, ...)` in the same __getitem__ call.
+        # These coincide only when self.episodes == [0..K-1].  A
+        # non-contiguous list (e.g. [5, 10, 15] after eviction) would make
+        # LeRobotDataset IndexError on the first sample; a non-zero start
+        # would fetch the wrong video file.  Assert fast, with a message
+        # that points at the coordinate-system conflation.
+        if self.episodes is not None:
+            expected_episodes = list(range(len(self.episodes)))
+            if list(self.episodes) != expected_episodes:
+                raise ValueError(
+                    f"FastLeRobotDataset: self.episodes must be contiguous "
+                    f"from 0 (LeRobot indexes episode_data_index positionally "
+                    f"but get_video_file_path expects raw IDs — they agree "
+                    f"only when episodes == [0..K-1]). Got first="
+                    f"{self.episodes[0]}, last={self.episodes[-1]}, "
+                    f"len={len(self.episodes)}."
+                )
+
         # Fast integrity check: episode_data_index must cover every row in the
         # Arrow table.  A mismatch means self.episodes disagrees with what
         # load_hf_dataset() produced — typically from passing a train subset
