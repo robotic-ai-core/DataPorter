@@ -207,6 +207,12 @@ def _spawn_pool_entry(
 
         # Main loop: iterate shards, tokenize rows, push to buffer.
         doc_idx = 0
+        # Per-row kernel errors (bad UTF-8, tokenizer edge cases) are
+        # tolerated — one bad row shouldn't kill a 12h training job.
+        # We track consecutive failures and bail if the kernel is
+        # systemically broken (e.g. wrong tokenizer, all rows rejected).
+        consecutive_kernel_failures = 0
+        MAX_CONSECUTIVE_KERNEL_FAILURES = 500
         with ThreadPoolExecutor(
             max_workers=max(1, config.thread_workers),
             thread_name_prefix=f"tokenize-{config.source_name}",
@@ -230,19 +236,50 @@ def _spawn_pool_entry(
                 rng.shuffle(row_order)
 
                 # Parallel tokenize in batches so we don't queue millions
-                # of futures when shards are huge.
+                # of futures when shards are huge.  We use submit+result
+                # (not executor.map) so a single bad row raises only for
+                # that row — executor.map would propagate the first
+                # exception and tear down the whole producer.
                 batch_size = max(32, config.thread_workers * 8)
                 for i in range(0, len(row_order), batch_size):
                     if stop_event.is_set():
                         return
                     batch_idx = row_order[i : i + batch_size]
                     batch_texts = [texts[j] for j in batch_idx]
+                    futures = [
+                        executor.submit(config.tokenize_fn, text)
+                        for text in batch_texts
+                    ]
 
-                    for result in executor.map(config.tokenize_fn, batch_texts):
+                    for future in futures:
                         if stop_event.is_set():
                             return
+                        try:
+                            result = future.result()
+                        except Exception as row_err:
+                            consecutive_kernel_failures += 1
+                            if consecutive_kernel_failures >= MAX_CONSECUTIVE_KERNEL_FAILURES:
+                                raise RuntimeError(
+                                    f"TextProducerPool: "
+                                    f"{consecutive_kernel_failures} "
+                                    f"consecutive tokenize_fn errors — "
+                                    f"kernel is systemically broken. "
+                                    f"Last: {row_err}"
+                                ) from row_err
+                            # Log at DEBUG — per-row errors are expected
+                            # on pathological inputs.  Only the consecutive
+                            # threshold surfaces to the parent.
+                            logger.debug(
+                                f"[text-producer] row error "
+                                f"({consecutive_kernel_failures}/"
+                                f"{MAX_CONSECUTIVE_KERNEL_FAILURES}): "
+                                f"{row_err}"
+                            )
+                            continue
+
                         if result is None:
                             continue
+                        consecutive_kernel_failures = 0  # success resets
                         tokens, mask = result
                         if tokens.numel() == 0:
                             continue
