@@ -42,6 +42,18 @@ class ProducerConfig:
     All fields are primitives — no dataset objects, no closures.
     The spawned child process creates its own dataset from these params.
 
+    Two related but distinct episode lists:
+
+    - ``dataset_episodes``: the full list of episodes present in the parent's
+      Arrow cache.  Passed to the child's ``FastLeRobotDataset(episodes=...)``
+      so ``get_episode_data_index`` produces boundaries that match every
+      episode in the Arrow table.  When this disagrees with what's actually
+      in the cache, ``check_timestamps_sync`` fails at every unmasked
+      episode boundary (negative diff where ``ts → 0.0``).
+    - ``episode_indices``: the subset the producer iterates over (e.g. the
+      train split).  Used only for the work queue — never as the child
+      dataset's ``episodes=`` kwarg.
+
     ``episode_offset`` shifts raw episode indices into a source-unique
     namespace before writing to the ShuffleBuffer.  This prevents key
     collisions when multiple sources share the same raw episode indices
@@ -55,6 +67,7 @@ class ProducerConfig:
     repo_id: str
     root: str
     episode_indices: list[int]
+    dataset_episodes: list[int] | None = None
     weight: float = 1.0
     seed: int = 42
     tolerance_s: float | None = None
@@ -68,6 +81,11 @@ class ProducerConfig:
         arrow_cache_path extraction — prevents the SameFileError bug
         class where a new kwarg is added in one place but missed in
         another.
+
+        ``episodes=`` is sourced from ``dataset_episodes`` (the full list
+        in the Arrow cache) so ``get_episode_data_index`` masks every
+        real boundary.  Falls back to ``episode_indices`` for legacy
+        callers that iterate the entire dataset.
         """
         from pathlib import Path
         kwargs = {"root": Path(self.root)}
@@ -75,9 +93,61 @@ class ProducerConfig:
             kwargs["tolerance_s"] = self.tolerance_s
         if self.arrow_cache_path is not None:
             kwargs["arrow_cache_path"] = self.arrow_cache_path
-        if self.episode_indices:
-            kwargs["episodes"] = self.episode_indices
+            # Parent has already validated the Arrow cache's timestamps.
+            # Re-running check_timestamps_sync (802k rows) is wasted work,
+            # and any parent↔child self.episodes disagreement surfaces as
+            # a clear size-mismatch RuntimeError in FastLeRobotDataset
+            # instead of a cryptic tolerance ValueError 800k rows later.
+            kwargs["skip_timestamp_validation"] = True
+        episodes = (
+            self.dataset_episodes
+            if self.dataset_episodes is not None
+            else self.episode_indices
+        )
+        if episodes:
+            kwargs["episodes"] = list(episodes)
         return kwargs
+
+    @classmethod
+    def from_source(
+        cls,
+        source: dict,
+        full_ds,
+        iteration_episodes: list[int],
+        episode_offset: int = 0,
+    ) -> "ProducerConfig":
+        """Build a ProducerConfig from a parent dataset + iteration subset.
+
+        Pulls ``root``, ``dataset_episodes``, and ``arrow_cache_path`` off
+        the parent dataset so callers can't forget to keep them in sync.
+        The parent dataset is the single source of truth for what's in
+        the Arrow cache; the caller only provides the subset the producer
+        should iterate (typically the train episodes).
+
+        Args:
+            source: Source dict with ``repo_id``, ``weight``, optional
+                ``tolerance_s``.
+            full_ds: The parent ``FastLeRobotDataset`` — must already be
+                loaded so ``full_ds.episodes`` and ``full_ds.arrow_cache_path``
+                are populated.
+            iteration_episodes: Episode indices the producer cycles over
+                (e.g. the train split).
+            episode_offset: Shift applied to keys written to the
+                ShuffleBuffer so multi-source namespaces don't collide.
+        """
+        return cls(
+            source_name=source["repo_id"],
+            repo_id=source["repo_id"],
+            root=str(full_ds.root),
+            episode_indices=list(iteration_episodes),
+            dataset_episodes=(
+                list(full_ds.episodes) if full_ds.episodes else None
+            ),
+            weight=source.get("weight", 1.0),
+            tolerance_s=source.get("tolerance_s"),
+            episode_offset=episode_offset,
+            arrow_cache_path=full_ds.arrow_cache_path,
+        )
 
 
 # Keep AsyncProducer as a convenience wrapper for thread-based usage

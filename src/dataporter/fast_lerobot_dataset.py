@@ -104,13 +104,47 @@ class FastLeRobotDataset(LeRobotDataset):
                  frame_buffer_capacity: int | None = None,
                  return_uint8: bool = False,
                  arrow_cache_path: str | None = None,
+                 skip_timestamp_validation: bool = False,
                  **kwargs):
         # Stash before super().__init__ — load_hf_dataset() reads this.
         self._arrow_cache_path = arrow_cache_path
-        super().__init__(*args, **kwargs)
+        self._frame_source = None  # set here so __del__ is safe on init failure
+
+        if skip_timestamp_validation:
+            # The spawned ProducerPool child loads the parent's Arrow cache,
+            # which the parent has already validated.  Re-running the 802k-row
+            # check_timestamps_sync is wasted work *and* a failure amplifier:
+            # any parent↔child disagreement about self.episodes turns into a
+            # cryptic ValueError.  The size-mismatch assert below catches
+            # the real issue with a clear message.
+            import lerobot.common.datasets.lerobot_dataset as _ld
+            _orig = _ld.check_timestamps_sync
+            _ld.check_timestamps_sync = lambda *a, **kw: True
+            try:
+                super().__init__(*args, **kwargs)
+            finally:
+                _ld.check_timestamps_sync = _orig
+        else:
+            super().__init__(*args, **kwargs)
+
+        # Fast integrity check: episode_data_index must cover every row in the
+        # Arrow table.  A mismatch means self.episodes disagrees with what
+        # load_hf_dataset() produced — typically from passing a train subset
+        # as `episodes=` when the Arrow cache contains the parent's full list.
+        # Before this check, that class of bug surfaced as an opaque
+        # check_timestamps_sync tolerance error 800k rows later.
+        if len(self.episode_data_index["to"]) > 0:
+            expected = int(self.episode_data_index["to"][-1])
+            actual = len(self.hf_dataset)
+            if expected != actual:
+                raise RuntimeError(
+                    f"FastLeRobotDataset: Arrow cache has {actual} rows but "
+                    f"episode_data_index covers {expected}. self.episodes "
+                    f"doesn't match the Arrow table contents."
+                )
+
         self._cache_frames = cache_frames
         self._return_uint8 = return_uint8
-        self._frame_source = None
 
         # Shared memory buffer mode (DEPRECATED — use ShuffleBuffer pipeline)
         if frame_buffer_capacity is not None:

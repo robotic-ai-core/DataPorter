@@ -443,32 +443,19 @@ class BlendedLeRobotDataModule(L.LightningDataModule):
                 )
                 max_frames = max(max_frames, ep_len)
 
-            # Build ProducerConfig (picklable, for spawn mode)
-            # episode_offset shifts raw indices so multiple sources
-            # don't collide in the ShuffleBuffer key space.
-            # Pass root as-is — do NOT resolve(). Resolving a symlink
-            # to the hub cache snapshot causes SameFileError when the
-            # child's LeRobotDataset tries snapshot_download into it.
-
-            # Extract the parent's Arrow IPC cache path so the spawned
-            # child can load it directly (instant) instead of rebuilding
-            # from 10k parquet files (300s).
-            arrow_cache_path = full_ds.arrow_cache_path
-            if arrow_cache_path:
+            # Build ProducerConfig via the from_source factory — it pulls
+            # root, dataset_episodes, and arrow_cache_path off full_ds so
+            # they can't drift out of sync with the parent's Arrow cache.
+            if full_ds.arrow_cache_path:
                 logger.info(
                     f"Arrow cache for {source['repo_id']}: "
-                    f"{arrow_cache_path}"
+                    f"{full_ds.arrow_cache_path}"
                 )
-
-            config = ProducerConfig(
-                source_name=source["repo_id"],
-                repo_id=source["repo_id"],
-                root=str(full_ds.root),
-                episode_indices=train_ep_indices,
-                weight=source["weight"],
-                tolerance_s=source.get("tolerance_s"),
+            config = ProducerConfig.from_source(
+                source=source,
+                full_ds=full_ds,
+                iteration_episodes=train_ep_indices,
                 episode_offset=cumulative_offset,
-                arrow_cache_path=arrow_cache_path,
             )
             producers.append(config)
 

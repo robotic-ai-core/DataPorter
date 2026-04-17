@@ -212,8 +212,8 @@ class TestFastLeRobotDatasetInit:
 
         assert validation_ran, "check_timestamps_sync was never called"
 
-    def test_arrow_cache_path_also_validates(self):
-        """Even with arrow_cache_path, validation runs."""
+    def test_arrow_cache_path_also_validates_by_default(self):
+        """With arrow_cache_path but no skip flag, validation still runs."""
         from dataporter import FastLeRobotDataset
         import lerobot.common.datasets.lerobot_dataset as _ld
 
@@ -233,7 +233,7 @@ class TestFastLeRobotDatasetInit:
 
         _ld.check_timestamps_sync = tracking_check
         try:
-            ds2 = FastLeRobotDataset(
+            FastLeRobotDataset(
                 "lerobot/pusht",
                 delta_timestamps={"observation.image": [0.0]},
                 arrow_cache_path=cache_path,
@@ -242,6 +242,69 @@ class TestFastLeRobotDatasetInit:
             _ld.check_timestamps_sync = _orig
 
         assert validation_ran
+
+    def test_skip_timestamp_validation_skips_check(self):
+        """skip_timestamp_validation=True bypasses check_timestamps_sync."""
+        from dataporter import FastLeRobotDataset
+        import lerobot.common.datasets.lerobot_dataset as _ld
+
+        ds1 = FastLeRobotDataset(
+            "lerobot/pusht",
+            delta_timestamps={"observation.image": [0.0]},
+        )
+        cache_path = ds1.hf_dataset.cache_files[0]["filename"]
+
+        validation_ran = False
+        _orig = _ld.check_timestamps_sync
+
+        def tracking_check(*args, **kwargs):
+            nonlocal validation_ran
+            validation_ran = True
+            return _orig(*args, **kwargs)
+
+        _ld.check_timestamps_sync = tracking_check
+        try:
+            FastLeRobotDataset(
+                "lerobot/pusht",
+                delta_timestamps={"observation.image": [0.0]},
+                arrow_cache_path=cache_path,
+                skip_timestamp_validation=True,
+            )
+        finally:
+            _ld.check_timestamps_sync = _orig
+
+        assert not validation_ran, (
+            "check_timestamps_sync ran despite skip_timestamp_validation=True"
+        )
+
+    def test_size_mismatch_raises_clear_error(self):
+        """Arrow cache / episode_data_index mismatch raises RuntimeError.
+
+        This is the size-assert guard that catches the class of bug
+        where parent passes one episode list and child passes another.
+        Reproduces the Vast v4 failure mode cheaply and deterministically.
+        """
+        from dataporter import FastLeRobotDataset
+
+        parent = FastLeRobotDataset(
+            "lerobot/pusht",
+            delta_timestamps={"observation.image": [0.0]},
+            episodes=list(range(20)),
+        )
+        cache_path = parent.arrow_cache_path
+
+        # Child receives only 18 episodes in self.episodes but loads the
+        # parent's 20-episode Arrow cache. skip_timestamp_validation=True
+        # would silently hide the bug without the size assert.
+        with pytest.raises(RuntimeError, match="doesn't match the Arrow table"):
+            FastLeRobotDataset(
+                "lerobot/pusht",
+                delta_timestamps={"observation.image": [0.0]},
+                root=parent.root,
+                episodes=list(range(18)),
+                arrow_cache_path=cache_path,
+                skip_timestamp_validation=True,
+            )
 
     def test_hf_dataset_has_transform(self):
         """hf_dataset has set_transform applied, returns torch tensors."""
