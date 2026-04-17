@@ -29,6 +29,11 @@ from .shuffle_buffer import ShuffleBuffer
 from .producer_pool import ProducerPool, AsyncProducer
 from .shuffle_buffer_dataset import ShuffleBufferDataset
 from .lerobot_shuffle_buffer_dataset import LeRobotShuffleBufferDataset
+from .token_shuffle_buffer import TokenShuffleBuffer
+from .text_producer_pool import (
+    TextProducerConfig, TextProducerPool, TokenizeFn,
+)
+from .token_shuffle_buffer_dataset import TokenShuffleBufferDataset
 
 # Lazy imports for optional dependencies (lerobot, lightning)
 def __getattr__(name):
@@ -105,6 +110,12 @@ __all__ = [
     'AsyncProducer',
     'ShuffleBufferDataset',
     'LeRobotShuffleBufferDataset',
+    # Shuffle buffer (text pipeline)
+    'TokenShuffleBuffer',
+    'TextProducerConfig',
+    'TextProducerPool',
+    'TokenizeFn',
+    'TokenShuffleBufferDataset',
     # Instrumentation
     'TimedDataLoader',
     # Utilities
