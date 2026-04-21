@@ -107,80 +107,97 @@ class TestAdversarialConfigs:
             or "episode_data_index covers" in joined
         ), f"Expected size-mismatch error, got: {errors}"
 
-    def test_non_contiguous_episodes_rejected(self, parent_fixture):
-        """Non-contiguous self.episodes would silently fetch wrong
-        video files at decode time.  Must fail at dataset init with
-        a message that names the coordinate-system invariant."""
-        parent, K = parent_fixture
-        # Every other episode — triggers positional/raw conflation.
-        non_contig = [i for i in range(K) if i % 2 == 0]
-
-        cfg = ProducerConfig(
-            source_name="adversarial-noncontig",
-            repo_id="lerobot/pusht",
-            root=str(parent.root),
-            episode_indices=[0, 1, 2],
-            dataset_episodes=non_contig,
-            arrow_cache_path=parent.arrow_cache_path,
-        )
-        errors = _run_pool_briefly([cfg])
-
-        assert errors, "Child failed but produced no error message"
-        joined = " ".join(errors)
-        assert "contiguous from 0" in joined, (
-            f"Expected contiguous-from-0 error, got: {errors}"
-        )
-
-    def test_non_zero_start_rejected(self, parent_fixture):
-        """Episodes starting from non-zero (e.g. [5..15]) would cause
-        get_video_file_path to fetch episode 5's file when the producer
-        asks for positional index 0.  Must fail fast."""
-        parent, K = parent_fixture
-        shifted = list(range(5, K))
-
-        cfg = ProducerConfig(
-            source_name="adversarial-shifted",
-            repo_id="lerobot/pusht",
-            root=str(parent.root),
-            episode_indices=[0, 1],
-            dataset_episodes=shifted,
-            arrow_cache_path=parent.arrow_cache_path,
-        )
-        errors = _run_pool_briefly([cfg])
-
-        assert errors, "Child failed but produced no error message"
-        joined = " ".join(errors)
-        assert "contiguous from 0" in joined, (
-            f"Expected contiguous-from-0 error, got: {errors}"
-        )
-
 
 # ---------------------------------------------------------------------------
-# Unit-level: the invariant itself (doesn't need a ProducerPool)
+# Unit-level: sparse / shifted subsets are NOW supported (no more
+# contiguous-from-0 assertion, coordinate translation handles it).
 # ---------------------------------------------------------------------------
 
 
-def test_contiguous_from_zero_rejected_directly(parent_fixture):
-    """FastLeRobotDataset directly rejects non-contiguous episodes —
-    this is the single source of truth for the invariant, the e2e
-    tests above just verify it's enforced through the full stack."""
+def test_sparse_episodes_accepted(parent_fixture):
+    """Sparse subsets like [0, 2, 4, 6] — previously rejected by a
+    defensive contiguous-from-0 assertion — are now supported.  The raw
+    episode id is translated to a positional index for
+    ``episode_data_index`` lookups while ``get_video_file_path`` still
+    receives the raw id.  Locks in the decoupling fix.
+    """
     parent, _ = parent_fixture
 
-    with pytest.raises(ValueError, match="contiguous from 0"):
-        FastLeRobotDataset(
-            "lerobot/pusht",
-            delta_timestamps={"observation.image": [0.0]},
-            root=parent.root,
-            episodes=[0, 2, 4, 6],
-            arrow_cache_path=parent.arrow_cache_path,
-            skip_timestamp_validation=True,
-        )
+    # Use the real parquet subset path (no Arrow cache) so
+    # episode_data_index matches the hf_dataset row count.
+    child = FastLeRobotDataset(
+        "lerobot/pusht",
+        delta_timestamps={"observation.image": [0.0]},
+        episodes=[0, 2, 4, 6],
+    )
+    del parent  # silence unused
+    assert len(child.episode_data_index["from"]) == 4
+    # Raw-id → positional translation populated.
+    assert child._raw_to_pos == {0: 0, 2: 1, 4: 2, 6: 3}
+
+
+def test_non_zero_start_accepted():
+    """Shifted-start subsets [5, 6, 7] don't need the raw id to be 0.
+    Regression coverage for partial-prefetch scenarios where the first
+    episode to land is not episode 0.
+    """
+    child = FastLeRobotDataset(
+        "lerobot/pusht",
+        delta_timestamps={"observation.image": [0.0]},
+        episodes=[5, 6, 7],
+    )
+    assert len(child.episode_data_index["from"]) == 3
+    assert child._raw_to_pos == {5: 0, 6: 1, 7: 2}
+
+
+def test_unknown_raw_ep_id_raises_clear_error():
+    """``_ep_positional`` must fail loud when asked to translate a raw
+    id that isn't in the configured subset — not silently index into
+    the wrong row.
+    """
+    child = FastLeRobotDataset(
+        "lerobot/pusht",
+        delta_timestamps={"observation.image": [0.0]},
+        episodes=[0, 2, 4],
+    )
+    with pytest.raises(KeyError, match="not in this dataset's episode subset"):
+        child._ep_positional(99)
+
+
+def test_sparse_getitem_returns_correct_episode_rows():
+    """End-to-end correctness: with a sparse subset, ``__getitem__``
+    must route each row's raw ``episode_index`` through the
+    translation so videos load from the right file and
+    ``_get_query_indices`` reads the right ``episode_data_index``
+    slot.  Without the fix, this would IndexError or decode wrong
+    frames.
+    """
+    subset = [0, 2, 4]
+    child = FastLeRobotDataset(
+        "lerobot/pusht",
+        delta_timestamps={"observation.image": [0.0]},
+        episodes=subset,
+    )
+
+    # Pick one row per selected episode and verify the returned
+    # episode_index matches the subset (no silent drift to a
+    # neighbouring episode).
+    seen_raw_ids = set()
+    for pos in range(len(subset)):
+        ep_start = child.episode_data_index["from"][pos].item()
+        sample = child[ep_start]
+        seen_raw_ids.add(int(sample["episode_index"].item()))
+    assert seen_raw_ids == set(subset), (
+        f"sparse-subset __getitem__ returned episodes {seen_raw_ids}, "
+        f"expected {set(subset)} — coordinate translation is wrong"
+    )
 
 
 def test_happy_path_passes_invariants(parent_fixture):
-    """Contiguous-from-0 episodes matching the Arrow cache pass both
-    the size assertion and the contiguity assertion — the safety nets
-    don't accidentally reject legitimate configs."""
+    """Contiguous-from-0 episodes matching the Arrow cache pass the
+    size assertion — the safety nets don't accidentally reject
+    legitimate configs.
+    """
     parent, K = parent_fixture
 
     child = FastLeRobotDataset(
@@ -192,3 +209,5 @@ def test_happy_path_passes_invariants(parent_fixture):
         skip_timestamp_validation=True,
     )
     assert len(child.episode_data_index["from"]) == K
+    # [0..K-1] → identity map.
+    assert child._raw_to_pos == {i: i for i in range(K)}

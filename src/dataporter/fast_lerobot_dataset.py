@@ -53,20 +53,24 @@ def _make_frame_producer(
 ) -> callable:
     """Create a producer that decodes video frames for all episodes.
 
-    Yields (episode_idx, frames_uint8) pairs in random order.
-    Cycles through the full dataset.
+    Yields (raw_episode_id, frames_uint8) pairs in random order.  Cycles
+    through the full dataset.  Keyed by RAW episode id (matching what
+    ``LeRobotDataset.__getitem__`` passes to ``_query_videos``).
     """
     def producer() -> Iterator[tuple[int, torch.Tensor]]:
         rng = random.Random(seed)
-        num_episodes = len(dataset.episode_data_index["from"])
-        episode_order = list(range(num_episodes))
+        # Raw episode IDs in the order the dataset exposes them.  For
+        # ``self.episodes=None`` this is [0..K-1]; for a subset, the raw
+        # IDs assigned at dataset build time (potentially sparse).
+        episode_order = list(dataset._raw_ep_ids())
 
         while True:
             rng.shuffle(episode_order)
             for ep_idx in episode_order:
                 for vid_key in dataset.meta.video_keys:
-                    ep_start = dataset.episode_data_index["from"][ep_idx].item()
-                    ep_end = dataset.episode_data_index["to"][ep_idx].item()
+                    pos = dataset._ep_positional(ep_idx)
+                    ep_start = dataset.episode_data_index["from"][pos].item()
+                    ep_end = dataset.episode_data_index["to"][pos].item()
                     num_frames = ep_end - ep_start
 
                     video_path = (
@@ -127,26 +131,21 @@ class FastLeRobotDataset(LeRobotDataset):
         else:
             super().__init__(*args, **kwargs)
 
-        # Invariant: self.episodes must be contiguous starting from 0.
-        # Upstream LeRobot indexes episode_data_index positionally
-        # (`episode_data_index["from"][pos]`) but passes a raw episode ID to
-        # `get_video_file_path(ep_idx, ...)` in the same __getitem__ call.
-        # These coincide only when self.episodes == [0..K-1].  A
-        # non-contiguous list (e.g. [5, 10, 15] after eviction) would make
-        # LeRobotDataset IndexError on the first sample; a non-zero start
-        # would fetch the wrong video file.  Assert fast, with a message
-        # that points at the coordinate-system conflation.
+        # Raw episode id → positional index in episode_data_index.  Upstream
+        # LeRobot builds episode_data_index masked to len(self.episodes) and
+        # indexes it positionally, but __getitem__ passes the RAW episode id
+        # (read from the parquet's episode_index column) to _get_query_indices
+        # and _query_videos.  When self.episodes is a sparse subset (e.g.
+        # [15, 127, 500] from a partial prefetch), raw ≠ positional and the
+        # upstream indexing breaks.  We maintain this translation and
+        # override the upstream hooks to route positional lookups through it.
         if self.episodes is not None:
-            expected_episodes = list(range(len(self.episodes)))
-            if list(self.episodes) != expected_episodes:
-                raise ValueError(
-                    f"FastLeRobotDataset: self.episodes must be contiguous "
-                    f"from 0 (LeRobot indexes episode_data_index positionally "
-                    f"but get_video_file_path expects raw IDs — they agree "
-                    f"only when episodes == [0..K-1]). Got first="
-                    f"{self.episodes[0]}, last={self.episodes[-1]}, "
-                    f"len={len(self.episodes)}."
-                )
+            self._raw_to_pos: dict[int, int] = {
+                int(raw): pos for pos, raw in enumerate(self.episodes)
+            }
+        else:
+            # All episodes present → raw == positional → no translation needed.
+            self._raw_to_pos = None
 
         # Fast integrity check: episode_data_index must cover every row in the
         # Arrow table.  A mismatch means self.episodes disagrees with what
@@ -280,11 +279,72 @@ class FastLeRobotDataset(LeRobotDataset):
 
         return hf_dataset
 
+    def _ep_positional(self, ep_idx: int) -> int:
+        """Map a raw episode id → positional index in ``episode_data_index``.
+
+        Returns the input unchanged when no episode subset is set (raw ==
+        positional in that case).  Raises ``KeyError`` with a clear message
+        when a raw id outside the configured subset leaks in — that's a
+        real bug, not something to silently paper over.
+        """
+        if self._raw_to_pos is None:
+            return int(ep_idx)
+        try:
+            return self._raw_to_pos[int(ep_idx)]
+        except KeyError:
+            raise KeyError(
+                f"FastLeRobotDataset: raw episode id {ep_idx} is not in "
+                f"this dataset's episode subset "
+                f"(size={len(self._raw_to_pos)}).  Check that "
+                f"__getitem__(idx) produced a row whose 'episode_index' "
+                f"is in the selected subset."
+            )
+
+    def _raw_ep_ids(self) -> list[int]:
+        """Raw episode ids in the order they appear in episode_data_index."""
+        if self.episodes is not None:
+            return [int(e) for e in self.episodes]
+        return list(range(len(self.episode_data_index["from"])))
+
+    def _get_query_indices(
+        self, idx: int, ep_idx: int,
+    ) -> tuple[dict[str, list[int | bool]]]:
+        """Override to translate RAW ``ep_idx`` → positional before indexing
+        ``episode_data_index``.
+
+        Upstream assumes ``episode_data_index[ep_idx]`` works with the raw
+        value; that only holds when the selected subset equals [0..K-1].
+        For sparse subsets (partial prefetches, holdouts, sharding) we
+        translate here.
+        """
+        pos = self._ep_positional(ep_idx)
+        ep_start = self.episode_data_index["from"][pos]
+        ep_end = self.episode_data_index["to"][pos]
+        query_indices = {
+            key: [
+                max(ep_start.item(), min(ep_end.item() - 1, idx + delta))
+                for delta in delta_idx
+            ]
+            for key, delta_idx in self.delta_indices.items()
+        }
+        padding = {
+            f"{key}_is_pad": torch.BoolTensor(
+                [
+                    (idx + delta < ep_start.item())
+                    | (idx + delta >= ep_end.item())
+                    for delta in delta_idx
+                ]
+            )
+            for key, delta_idx in self.delta_indices.items()
+        }
+        return query_indices, padding
+
     def _decode_episode_fallback(self, ep_idx: int) -> torch.Tensor:
-        """On-demand fallback: decode frames for an episode."""
+        """On-demand fallback: decode frames for an episode (raw id)."""
+        pos = self._ep_positional(ep_idx)
         for vid_key in self.meta.video_keys:
-            ep_start = self.episode_data_index["from"][ep_idx].item()
-            ep_end = self.episode_data_index["to"][ep_idx].item()
+            ep_start = self.episode_data_index["from"][pos].item()
+            ep_end = self.episode_data_index["to"][pos].item()
             num_frames = ep_end - ep_start
             video_path = self.root / self.meta.get_video_file_path(ep_idx, vid_key)
             return decode_episode_frames(
@@ -417,9 +477,10 @@ class FastLeRobotDataset(LeRobotDataset):
         return super()._query_videos(query_timestamps, ep_idx)
 
     def _cache_episode_frames(self, ep_idx: int, vid_key: str) -> None:
-        """Decode all frames for an episode into per-worker LRU cache."""
-        ep_start = self.episode_data_index["from"][ep_idx].item()
-        ep_end = self.episode_data_index["to"][ep_idx].item()
+        """Decode all frames for an episode (raw id) into per-worker LRU cache."""
+        pos = self._ep_positional(ep_idx)
+        ep_start = self.episode_data_index["from"][pos].item()
+        ep_end = self.episode_data_index["to"][pos].item()
         num_frames = ep_end - ep_start
 
         video_path = self.root / self.meta.get_video_file_path(ep_idx, vid_key)
