@@ -364,3 +364,179 @@ class TestLeRobotPrefetcher:
         assert len(calls) >= 2
         # First call is metadata
         assert calls[0]["allow_patterns"] == ["meta/*"]
+
+
+# ---------------------------------------------------------------------------
+# Episode-level readiness (parquet + video) — new in
+# fix/lerobot-prefetch-shm-and-readiness to stop ProducerPool from kicking
+# off while MP4 downloads are still in flight.
+# ---------------------------------------------------------------------------
+
+
+class TestReadyEpisodes:
+    """``ready_episodes()`` must return only episodes with BOTH parquet
+    AND every video file present.  ``_check_min_ready`` must dispatch
+    through this predicate, not the parquet-only ``shard_count``.
+    """
+
+    def _write_parquet(self, root: Path, ep_idx: int) -> None:
+        chunks_size = FAKE_META["chunks_size"]
+        chunk = ep_idx // chunks_size
+        d = root / f"data/chunk-{chunk:03d}"
+        d.mkdir(parents=True, exist_ok=True)
+        schema = pa.schema([("x", pa.int64())])
+        pq.write_table(
+            pa.table({"x": [1]}, schema=schema),
+            d / f"episode_{ep_idx:06d}.parquet",
+        )
+
+    def _write_video(self, root: Path, ep_idx: int) -> None:
+        chunks_size = FAKE_META["chunks_size"]
+        chunk = ep_idx // chunks_size
+        for vk in ["observation.image"]:
+            d = root / f"videos/chunk-{chunk:03d}/{vk}"
+            d.mkdir(parents=True, exist_ok=True)
+            (d / f"episode_{ep_idx:06d}.mp4").write_bytes(b"fake")
+
+    def test_parquet_without_video_is_excluded(self, tmp_path):
+        """An episode that has a parquet but no MP4 is NOT ready.
+        Regression for the bug where ``scan_available_episodes`` counted
+        parquets only and ProducerPool crashed decoding missing MP4s.
+        """
+        # Episodes 0,1,2 have parquet+video; 3,4 have only parquet.
+        for ep in range(5):
+            self._write_parquet(tmp_path, ep)
+        for ep in range(3):
+            self._write_video(tmp_path, ep)
+
+        prefetcher = LeRobotPrefetcher(
+            repo_id="test/dataset",
+            cache_dir=tmp_path,
+            min_shards=1,
+            _meta_loader=_fake_meta_loader,
+        )
+        ready = prefetcher.ready_episodes()
+        assert ready == [0, 1, 2], (
+            f"expected [0, 1, 2], got {ready}; parquet-only episodes "
+            f"leaked into the ready set"
+        )
+
+    def test_empty_cache_returns_empty(self, tmp_path):
+        prefetcher = LeRobotPrefetcher(
+            repo_id="test/dataset",
+            cache_dir=tmp_path,
+            min_shards=1,
+            _meta_loader=_fake_meta_loader,
+        )
+        assert prefetcher.ready_episodes() == []
+
+    def test_check_min_ready_waits_for_videos(self, tmp_path):
+        """``_check_min_ready`` must wait until videos exist, not fire on
+        parquet count alone.  Simulates the real race: parquet arrives,
+        readiness check runs, video hasn't arrived yet.
+        """
+        # 2 episodes with parquets, no videos yet.
+        self._write_parquet(tmp_path, 0)
+        self._write_parquet(tmp_path, 1)
+
+        import threading
+
+        prefetcher = LeRobotPrefetcher(
+            repo_id="test/dataset",
+            cache_dir=tmp_path,
+            min_shards=2,
+            _meta_loader=_fake_meta_loader,
+        )
+        # _min_ready is populated by start(); install one manually so we
+        # can exercise the predicate without the download thread.
+        prefetcher._min_ready = threading.Event()
+        prefetcher._check_min_ready()
+        assert not prefetcher._min_ready.is_set(), (
+            "_check_min_ready fired on parquet-only presence — regression"
+        )
+
+        # Now videos show up.
+        self._write_video(tmp_path, 0)
+        self._write_video(tmp_path, 1)
+        prefetcher._check_min_ready()
+        assert prefetcher._min_ready.is_set()
+
+    def test_dataset_without_video_features_uses_parquet_only(self, tmp_path):
+        """For a dataset with no video features, parquet presence alone
+        is sufficient — we must not accidentally require nonexistent mp4s.
+        """
+        meta_no_video = {
+            **FAKE_META,
+            "features": {
+                "observation.state": {"dtype": "float32", "shape": [2]},
+                "action": {"dtype": "float32", "shape": [2]},
+            },
+        }
+        self._write_parquet(tmp_path, 0)
+        self._write_parquet(tmp_path, 1)
+
+        prefetcher = LeRobotPrefetcher(
+            repo_id="test/dataset",
+            cache_dir=tmp_path,
+            min_shards=1,
+            _meta_loader=lambda r, d: meta_no_video,
+        )
+        assert prefetcher.ready_episodes() == [0, 1]
+
+
+# ---------------------------------------------------------------------------
+# Producer-side resize: maybe_resize_frames should keep uint8 semantics
+# and return a correctly-shaped tensor.  Tested here because it's exercised
+# by the prefetcher → producer path.
+# ---------------------------------------------------------------------------
+
+
+class TestMaybeResizeFrames:
+    def test_noop_when_target_is_none(self):
+        import torch
+        from dataporter.fast_lerobot_dataset import maybe_resize_frames
+
+        frames = torch.randint(0, 255, (5, 3, 224, 224), dtype=torch.uint8)
+        out = maybe_resize_frames(frames, None)
+        assert out is frames
+
+    def test_noop_when_target_matches_source(self):
+        import torch
+        from dataporter.fast_lerobot_dataset import maybe_resize_frames
+
+        frames = torch.randint(0, 255, (5, 3, 96, 96), dtype=torch.uint8)
+        out = maybe_resize_frames(frames, (96, 96))
+        assert out is frames
+
+    def test_resize_preserves_dtype_and_shape(self):
+        import torch
+        from dataporter.fast_lerobot_dataset import maybe_resize_frames
+
+        frames = torch.randint(0, 255, (7, 3, 224, 224), dtype=torch.uint8)
+        out = maybe_resize_frames(frames, (96, 96))
+        assert out.dtype == torch.uint8
+        assert out.shape == (7, 3, 96, 96)
+        assert out.min() >= 0 and out.max() <= 255
+
+    def test_shm_sizing_at_target_resolution(self):
+        """The whole point of the plumbing: at target resolution the
+        producer's output matches the ShuffleBuffer allocation.  Without
+        this, the user's 224x224 case costs 74 GB of shm.
+        """
+        import torch
+        from dataporter.fast_lerobot_dataset import maybe_resize_frames
+        from dataporter.shuffle_buffer import ShuffleBuffer
+
+        # Small allocation so we can actually build it in the test.
+        buffer = ShuffleBuffer(
+            capacity=4, max_frames=8, channels=3, height=16, width=16,
+        )
+        # Producer decodes at source res (48x48) then resizes to 16x16
+        # before buffer.put.  Without the resize, buffer.put would
+        # shape-mismatch.
+        source_frames = torch.randint(
+            0, 255, (8, 3, 48, 48), dtype=torch.uint8,
+        )
+        resized = maybe_resize_frames(source_frames, (16, 16))
+        buffer.put(0, resized)    # should not raise
+        assert len(buffer) == 1

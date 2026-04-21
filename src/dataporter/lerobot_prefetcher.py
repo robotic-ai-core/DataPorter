@@ -145,6 +145,73 @@ class LeRobotPrefetcher(BasePrefetcher):
             )
 
     # ------------------------------------------------------------------
+    # Episode-level readiness (parquet + video present)
+    # ------------------------------------------------------------------
+
+    def ready_episodes(self) -> list[int]:
+        """Episodes whose parquet AND all video files exist on disk.
+
+        ``BasePrefetcher.shard_count`` counts parquets only; training
+        consumers that decode video need both.  This predicate is the
+        authoritative source for "what's safe to load right now".
+
+        Returns a sorted list of ready episode ids.  Empty until the
+        prefetcher has produced a complete episode (important during the
+        first few batches of a fresh download).
+        """
+        cache_dir = self._cache_dir
+        # Scan parquets first (cheap rglob) to narrow the set, then
+        # verify each candidate has all its video files.
+        import re
+        parquet_eps = {
+            int(m.group(1))
+            for p in cache_dir.rglob("episode_*.parquet")
+            if (m := re.search(r"episode_(\d+)", p.stem))
+        }
+        # Only load meta if there are any parquets to check — avoids a
+        # spurious HF call during a cold start.
+        if not parquet_eps:
+            return []
+        try:
+            self._load_meta()
+        except Exception:
+            # Metadata not available yet (e.g. meta/* hasn't finished
+            # downloading).  Fall back to parquet-only readiness in that
+            # window — ffmpeg will still fail loudly downstream, but we
+            # don't hide episodes that actually are complete.
+            return sorted(parquet_eps)
+        # If the dataset has no video features, parquet presence is
+        # sufficient.
+        if not self._get_video_keys():
+            return sorted(parquet_eps)
+        video_template = self._get_video_path_template()
+        if not video_template:
+            return sorted(parquet_eps)
+        ready: list[int] = []
+        for ep_idx in sorted(parquet_eps):
+            if all(
+                (cache_dir / video_path).is_file()
+                for video_path in self._episode_video_paths(ep_idx)
+            ):
+                ready.append(ep_idx)
+        return ready
+
+    def _check_min_ready(self) -> None:
+        # Override BasePrefetcher's parquet-count check: an episode is
+        # only usable when BOTH parquet AND its video files are on disk.
+        # Without this, a fresh prefetch signals ready as soon as N
+        # parquets land but before the MP4s finish, and ProducerPool
+        # crashes on the first decode.
+        if self._min_ready.is_set():
+            return
+        if len(self.ready_episodes()) >= self._min_shards:
+            self._min_ready.set()
+            logger.info(
+                f"Min episodes ready ({self._min_shards} with parquet+video), "
+                f"training can start"
+            )
+
+    # ------------------------------------------------------------------
     # Metadata
     # ------------------------------------------------------------------
 

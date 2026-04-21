@@ -73,6 +73,13 @@ class ProducerConfig:
     tolerance_s: float | None = None
     episode_offset: int = 0
     arrow_cache_path: str | None = None
+    # Optional producer-side resize target.  When both are set, decoded
+    # frames are bilinear-downsampled to (target_height, target_width)
+    # before being written to the ShuffleBuffer — so shm can be allocated
+    # at training resolution rather than source resolution (74 GB → 14 GB
+    # at 224→96 for capacity=2000, max_frames=264).
+    target_height: int | None = None
+    target_width: int | None = None
 
     def dataset_kwargs(self) -> dict:
         """Build FastLeRobotDataset kwargs from this config.
@@ -115,6 +122,8 @@ class ProducerConfig:
         full_ds,
         iteration_episodes: list[int],
         episode_offset: int = 0,
+        target_height: int | None = None,
+        target_width: int | None = None,
     ) -> "ProducerConfig":
         """Build a ProducerConfig from a parent dataset + iteration subset.
 
@@ -147,6 +156,8 @@ class ProducerConfig:
             tolerance_s=source.get("tolerance_s"),
             episode_offset=episode_offset,
             arrow_cache_path=full_ds.arrow_cache_path,
+            target_height=target_height,
+            target_width=target_width,
         )
 
 
@@ -294,20 +305,31 @@ def _make_child_decode_fn(config: ProducerConfig) -> Callable[[int], torch.Tenso
                 "cannot decode frames"
             )
         vid_key = ds.meta.video_keys[0]
-        ep_start = ds.episode_data_index["from"][ep_idx].item()
-        ep_end = ds.episode_data_index["to"][ep_idx].item()
+        # ep_idx from the work queue is POSITIONAL (index into the
+        # dataset's filtered episode list).  episode_data_index is also
+        # positional.  get_video_file_path wants the RAW id — translate.
+        pos = ep_idx
+        raw_ep_id = ds._raw_ep_ids()[pos]
+        ep_start = ds.episode_data_index["from"][pos].item()
+        ep_end = ds.episode_data_index["to"][pos].item()
         num_frames = ep_end - ep_start
-        video_path = ds.root / ds.meta.get_video_file_path(ep_idx, vid_key)
+        video_path = ds.root / ds.meta.get_video_file_path(raw_ep_id, vid_key)
         # Resolve symlinks — HF hub-cache stores video files as
         # symlinks to ../../blobs/<hash>. pyav/ffmpeg may hang on
         # symlinked paths in spawned process contexts.
         video_path = video_path.resolve()
 
-        from .fast_lerobot_dataset import decode_episode_frames
-        return decode_episode_frames(
+        from .fast_lerobot_dataset import (
+            decode_episode_frames, maybe_resize_frames,
+        )
+        frames = decode_episode_frames(
             video_path, num_frames,
             ds.fps, ds.tolerance_s, ds.video_backend,
         )
+        target_hw = None
+        if config.target_height is not None and config.target_width is not None:
+            target_hw = (config.target_height, config.target_width)
+        return maybe_resize_frames(frames, target_hw)
 
     return decode
 

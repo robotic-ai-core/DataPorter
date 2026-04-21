@@ -161,6 +161,8 @@ class BlendedLeRobotDataModule(L.LightningDataModule):
         cache_budget_gb: float = 2.0,
         frame_buffer_capacity: int | None = None,
         shuffle_buffer_capacity: int | None = None,
+        shuffle_buffer_target_height: int | None = None,
+        shuffle_buffer_target_width: int | None = None,
         train_split_ratio: float = 0.9,
         tolerance_s: float | None = None,
     ):
@@ -190,6 +192,18 @@ class BlendedLeRobotDataModule(L.LightningDataModule):
         else:
             self.frame_buffer_capacity = frame_buffer_capacity
         self.shuffle_buffer_capacity = shuffle_buffer_capacity
+        # Optional producer-side resize so the ShuffleBuffer allocates shm
+        # at training resolution, not source resolution.  Both must be
+        # set together — None means "use source resolution" (prior
+        # behaviour, but a 74 GB shm bill for 224x224 at capacity=2000).
+        self.shuffle_buffer_target_height = shuffle_buffer_target_height
+        self.shuffle_buffer_target_width = shuffle_buffer_target_width
+        if (shuffle_buffer_target_height is None) != (shuffle_buffer_target_width is None):
+            raise ValueError(
+                "shuffle_buffer_target_height and shuffle_buffer_target_width "
+                "must both be set or both be None, got "
+                f"{shuffle_buffer_target_height=} {shuffle_buffer_target_width=}"
+            )
         self.dtype_conversions = dtype_conversions
         self.train_split_ratio = train_split_ratio
 
@@ -317,11 +331,16 @@ class BlendedLeRobotDataModule(L.LightningDataModule):
         self._prefetchers.append(prefetcher)
         source["root"] = str(local_dir)
 
-        available_episodes = scan_available_episodes(local_dir)
+        # Use the prefetcher's episode-level readiness predicate (parquet
+        # AND video files present) rather than the parquet-only scan —
+        # otherwise ProducerPool crashes trying to decode MP4s whose
+        # download hasn't completed.
+        available_episodes = prefetcher.ready_episodes()
         source["_available_episodes"] = available_episodes
         logger.info(
             f"Prefetcher started for {repo_id} → {local_dir} "
-            f"({len(available_episodes)} episodes ready)"
+            f"({len(available_episodes)} episodes ready "
+            f"with parquet+video)"
         )
 
     # ------------------------------------------------------------------
@@ -425,9 +444,22 @@ class BlendedLeRobotDataModule(L.LightningDataModule):
         if vid_keys:
             # LeRobot metadata stores shape as (H, W, C)
             shape = first_ds.meta.features[vid_keys[0]].get("shape", (96, 96, 3))
-            height, width, channels = shape[0], shape[1], shape[2]
+            source_height, source_width, channels = shape[0], shape[1], shape[2]
         else:
-            height, width, channels = 96, 96, 3
+            source_height, source_width, channels = 96, 96, 3
+
+        # Producer-side resize: when target H/W is set, the producer
+        # downsamples before buffer.put so shm is allocated at training
+        # resolution.  Otherwise shm is allocated at source resolution.
+        if self.shuffle_buffer_target_height is not None:
+            height = self.shuffle_buffer_target_height
+            width = self.shuffle_buffer_target_width
+            logger.info(
+                f"ShuffleBuffer: producer-side resize "
+                f"{source_height}x{source_width} -> {height}x{width}"
+            )
+        else:
+            height, width = source_height, source_width
         producers = []
         sources_for_dataset = []
         cumulative_offset = 0
@@ -456,6 +488,8 @@ class BlendedLeRobotDataModule(L.LightningDataModule):
                 full_ds=full_ds,
                 iteration_episodes=train_ep_indices,
                 episode_offset=cumulative_offset,
+                target_height=self.shuffle_buffer_target_height,
+                target_width=self.shuffle_buffer_target_width,
             )
             producers.append(config)
 
