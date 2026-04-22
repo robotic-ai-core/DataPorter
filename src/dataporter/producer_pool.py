@@ -73,13 +73,13 @@ class ProducerConfig:
     tolerance_s: float | None = None
     episode_offset: int = 0
     arrow_cache_path: str | None = None
-    # Optional producer-side resize target.  When both are set, decoded
-    # frames are bilinear-downsampled to (target_height, target_width)
-    # before being written to the ShuffleBuffer — so shm can be allocated
-    # at training resolution rather than source resolution (74 GB → 14 GB
-    # at 224→96 for capacity=2000, max_frames=264).
-    target_height: int | None = None
-    target_width: int | None = None
+    # Optional producer-side frame transform.  Applied to each decoded
+    # episode tensor BEFORE it lands in the ShuffleBuffer — so the buffer
+    # allocates shm at the transform's output resolution rather than
+    # source resolution.  Must be picklable (the spawn child unpickles
+    # ``ProducerConfig``); use a class like ``ResizeFrames`` from
+    # :mod:`dataporter.frame_transforms`, not a lambda.
+    producer_transform: Callable | None = None
 
     def dataset_kwargs(self) -> dict:
         """Build FastLeRobotDataset kwargs from this config.
@@ -122,8 +122,7 @@ class ProducerConfig:
         full_ds,
         iteration_episodes: list[int],
         episode_offset: int = 0,
-        target_height: int | None = None,
-        target_width: int | None = None,
+        producer_transform: Callable | None = None,
     ) -> "ProducerConfig":
         """Build a ProducerConfig from a parent dataset + iteration subset.
 
@@ -156,8 +155,7 @@ class ProducerConfig:
             tolerance_s=source.get("tolerance_s"),
             episode_offset=episode_offset,
             arrow_cache_path=full_ds.arrow_cache_path,
-            target_height=target_height,
-            target_width=target_width,
+            producer_transform=producer_transform,
         )
 
 
@@ -321,17 +319,14 @@ def _make_child_decode_fn(config: ProducerConfig) -> Callable[[int], torch.Tenso
         # symlinked paths in spawned process contexts.
         video_path = video_path.resolve()
 
-        from .fast_lerobot_dataset import (
-            decode_episode_frames, maybe_resize_frames,
-        )
+        from .fast_lerobot_dataset import decode_episode_frames
         frames = decode_episode_frames(
             video_path, num_frames,
             ds.fps, ds.tolerance_s, ds.video_backend,
         )
-        target_hw = None
-        if config.target_height is not None and config.target_width is not None:
-            target_hw = (config.target_height, config.target_width)
-        return maybe_resize_frames(frames, target_hw)
+        if config.producer_transform is not None:
+            frames = config.producer_transform(frames)
+        return frames
 
     return decode
 

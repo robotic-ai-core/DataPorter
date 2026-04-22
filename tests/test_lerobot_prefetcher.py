@@ -485,58 +485,116 @@ class TestReadyEpisodes:
 
 
 # ---------------------------------------------------------------------------
-# Producer-side resize: maybe_resize_frames should keep uint8 semantics
-# and return a correctly-shaped tensor.  Tested here because it's exercised
-# by the prefetcher → producer path.
+# Producer-side transforms: ResizeFrames / FrameCompose / probe_output_shape.
+# These exercise the buffer-sizing contract via the producer_transform API.
 # ---------------------------------------------------------------------------
 
 
-class TestMaybeResizeFrames:
-    def test_noop_when_target_is_none(self):
+class TestFrameTransforms:
+    def test_resize_frames_preserves_dtype_and_shape(self):
         import torch
-        from dataporter.fast_lerobot_dataset import maybe_resize_frames
+        from dataporter import ResizeFrames
 
-        frames = torch.randint(0, 255, (5, 3, 224, 224), dtype=torch.uint8)
-        out = maybe_resize_frames(frames, None)
-        assert out is frames
-
-    def test_noop_when_target_matches_source(self):
-        import torch
-        from dataporter.fast_lerobot_dataset import maybe_resize_frames
-
-        frames = torch.randint(0, 255, (5, 3, 96, 96), dtype=torch.uint8)
-        out = maybe_resize_frames(frames, (96, 96))
-        assert out is frames
-
-    def test_resize_preserves_dtype_and_shape(self):
-        import torch
-        from dataporter.fast_lerobot_dataset import maybe_resize_frames
-
+        t = ResizeFrames(96, 96)
         frames = torch.randint(0, 255, (7, 3, 224, 224), dtype=torch.uint8)
-        out = maybe_resize_frames(frames, (96, 96))
+        out = t(frames)
         assert out.dtype == torch.uint8
         assert out.shape == (7, 3, 96, 96)
         assert out.min() >= 0 and out.max() <= 255
 
-    def test_shm_sizing_at_target_resolution(self):
-        """The whole point of the plumbing: at target resolution the
-        producer's output matches the ShuffleBuffer allocation.  Without
-        this, the user's 224x224 case costs 74 GB of shm.
+    def test_resize_frames_noop_when_already_at_target(self):
+        import torch
+        from dataporter import ResizeFrames
+
+        t = ResizeFrames(96, 96)
+        frames = torch.randint(0, 255, (5, 3, 96, 96), dtype=torch.uint8)
+        out = t(frames)
+        assert out is frames     # same tensor, no copy
+
+    def test_resize_frames_output_shape_matches_call(self):
+        """output_shape() must agree with actually running the transform —
+        it's the contract probe_output_shape() relies on.
         """
         import torch
-        from dataporter.fast_lerobot_dataset import maybe_resize_frames
+        from dataporter import ResizeFrames
+
+        t = ResizeFrames(64, 48)
+        input_shape = (5, 3, 240, 320)
+        declared = t.output_shape(input_shape)
+        actual = t(
+            torch.zeros(input_shape, dtype=torch.uint8),
+        ).shape
+        assert tuple(actual) == declared == (5, 3, 64, 48)
+
+    def test_resize_frames_picklable(self):
+        """ProducerConfig crosses the spawn boundary; transforms must
+        survive pickle.
+        """
+        import pickle
+        from dataporter import ResizeFrames
+
+        t = ResizeFrames(96, 96)
+        restored = pickle.loads(pickle.dumps(t))
+        assert restored.height == 96 and restored.width == 96
+
+    def test_frame_compose_chains_output_shape(self):
+        """FrameCompose's output_shape threads through each transform,
+        so the DataModule can pre-compute the buffer dims without a
+        probe.
+        """
+        from dataporter import ResizeFrames, FrameCompose
+
+        pipeline = FrameCompose([
+            ResizeFrames(120, 160),
+            ResizeFrames(96, 96),
+        ])
+        assert pipeline.output_shape((5, 3, 240, 320)) == (5, 3, 96, 96)
+
+    def test_frame_compose_empty_rejected(self):
+        import pytest as _pytest
+        from dataporter import FrameCompose
+        with _pytest.raises(ValueError, match="at least one transform"):
+            FrameCompose([])
+
+    def test_probe_output_shape_with_transform(self):
+        """``probe_output_shape`` uses a declared output_shape when
+        available; falls back to a dummy-tensor probe otherwise.
+        """
+        import torch
+        from dataporter import probe_output_shape, ResizeFrames
+
+        # Declared path.
+        assert probe_output_shape(
+            ResizeFrames(48, 48), (1, 3, 96, 96),
+        ) == (1, 3, 48, 48)
+
+        # Probe fallback — plain callable that doesn't expose output_shape.
+        def halve(frames: torch.Tensor) -> torch.Tensor:
+            t, c, h, w = frames.shape
+            return torch.zeros((t, c, h // 2, w // 2), dtype=frames.dtype)
+
+        assert probe_output_shape(halve, (2, 3, 96, 96)) == (2, 3, 48, 48)
+
+    def test_probe_output_shape_none_is_identity(self):
+        from dataporter import probe_output_shape
+
+        assert probe_output_shape(None, (5, 3, 96, 96)) == (5, 3, 96, 96)
+
+    def test_shm_sizing_via_transform_round_trips(self):
+        """End-to-end: produce source-res frames, apply ResizeFrames, write
+        to a target-res ShuffleBuffer.  Without the transform, buffer.put
+        would shape-mismatch.
+        """
+        import torch
+        from dataporter import ResizeFrames
         from dataporter.shuffle_buffer import ShuffleBuffer
 
-        # Small allocation so we can actually build it in the test.
         buffer = ShuffleBuffer(
             capacity=4, max_frames=8, channels=3, height=16, width=16,
         )
-        # Producer decodes at source res (48x48) then resizes to 16x16
-        # before buffer.put.  Without the resize, buffer.put would
-        # shape-mismatch.
         source_frames = torch.randint(
             0, 255, (8, 3, 48, 48), dtype=torch.uint8,
         )
-        resized = maybe_resize_frames(source_frames, (16, 16))
-        buffer.put(0, resized)    # should not raise
+        t = ResizeFrames(16, 16)
+        buffer.put(0, t(source_frames))
         assert len(buffer) == 1

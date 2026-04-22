@@ -35,6 +35,9 @@ from .text_producer_pool import (
 )
 from .token_shuffle_buffer_dataset import TokenShuffleBufferDataset
 from .growing_dataset_callback import GrowingDatasetCallback
+from .frame_transforms import (
+    ResizeFrames, FrameCompose, probe_output_shape,
+)
 
 # Lazy imports for optional dependencies (lerobot, lightning)
 def __getattr__(name):
@@ -107,6 +110,10 @@ __all__ = [
     'write_cache_sentinel',
     # Growing dataset integration (Lightning callback)
     'GrowingDatasetCallback',
+    # Frame-level transforms for the producer-side pipeline
+    'ResizeFrames',
+    'FrameCompose',
+    'probe_output_shape',
     # Shuffle buffer (video pipeline)
     'ShuffleBuffer',
     'ProducerPool',

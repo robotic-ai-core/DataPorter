@@ -47,35 +47,10 @@ def decode_episode_frames(
     return (all_frames * 255).to(torch.uint8)
 
 
-def maybe_resize_frames(
-    frames_uint8: torch.Tensor,
-    target_hw: tuple[int, int] | None,
-) -> torch.Tensor:
-    """Resize ``[T, C, H, W]`` uint8 frames to ``(target_h, target_w)``.
-
-    Returns the input unchanged when ``target_hw is None`` or the input
-    already matches.  Used on the producer side so the ShuffleBuffer's
-    shm pre-allocation is sized to training resolution, not source — at
-    224x224, capacity=2000, max_frames=264 that's 74 GB of shm vs
-    ~14 GB after resize to 96x96.
-    """
-    if target_hw is None:
-        return frames_uint8
-    h, w = target_hw
-    if frames_uint8.shape[-2] == h and frames_uint8.shape[-1] == w:
-        return frames_uint8
-    # interpolate requires float; round-trip via float32 back to uint8.
-    frames_f = frames_uint8.float()
-    frames_resized = torch.nn.functional.interpolate(
-        frames_f, size=(h, w), mode="bilinear", align_corners=False,
-    )
-    return frames_resized.clamp_(0, 255).to(torch.uint8)
-
-
 def _make_frame_producer(
     dataset: "FastLeRobotDataset",
     seed: int = 42,
-    target_hw: tuple[int, int] | None = None,
+    producer_transform: "Callable | None" = None,
 ) -> callable:
     """Create a producer that decodes video frames for all episodes.
 
@@ -83,9 +58,10 @@ def _make_frame_producer(
     through the full dataset.  Keyed by RAW episode id (matching what
     ``LeRobotDataset.__getitem__`` passes to ``_query_videos``).
 
-    When ``target_hw`` is provided, decoded frames are bilinear-
-    downsampled before yielding — the consumer buffer can then be sized
-    to the training resolution rather than the source resolution.
+    When ``producer_transform`` is provided (e.g.
+    :class:`dataporter.frame_transforms.ResizeFrames`), decoded frames
+    pass through it before yielding — the consumer buffer is sized to
+    the transform's output shape rather than the source resolution.
     """
     def producer() -> Iterator[tuple[int, torch.Tensor]]:
         rng = random.Random(seed)
@@ -116,7 +92,8 @@ def _make_frame_producer(
                     except Exception as e:
                         logger.warning(f"Failed to decode ep {ep_idx}/{vid_key}: {e}")
                         break
-                    frames_uint8 = maybe_resize_frames(frames_uint8, target_hw)
+                    if producer_transform is not None:
+                        frames_uint8 = producer_transform(frames_uint8)
                     yield ep_idx, frames_uint8
                     break  # Only first video key for now (PushT has one)
 

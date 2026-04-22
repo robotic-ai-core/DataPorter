@@ -191,8 +191,7 @@ class BlendedLeRobotDataModule(L.LightningDataModule):
         cache_budget_gb: float = 2.0,
         frame_buffer_capacity: int | None = None,
         shuffle_buffer_capacity: int | None = None,
-        shuffle_buffer_target_height: int | None = None,
-        shuffle_buffer_target_width: int | None = None,
+        producer_transform: Callable | None = None,
         prefetch_min_episodes: int = 50,
         prefetch_min_fraction: float | None = None,
         refresh_min_new: int = 0,
@@ -226,18 +225,15 @@ class BlendedLeRobotDataModule(L.LightningDataModule):
         else:
             self.frame_buffer_capacity = frame_buffer_capacity
         self.shuffle_buffer_capacity = shuffle_buffer_capacity
-        # Optional producer-side resize so the ShuffleBuffer allocates shm
-        # at training resolution, not source resolution.  Both must be
-        # set together — None means "use source resolution" (prior
-        # behaviour, but a 74 GB shm bill for 224x224 at capacity=2000).
-        self.shuffle_buffer_target_height = shuffle_buffer_target_height
-        self.shuffle_buffer_target_width = shuffle_buffer_target_width
-        if (shuffle_buffer_target_height is None) != (shuffle_buffer_target_width is None):
-            raise ValueError(
-                "shuffle_buffer_target_height and shuffle_buffer_target_width "
-                "must both be set or both be None, got "
-                f"{shuffle_buffer_target_height=} {shuffle_buffer_target_width=}"
-            )
+        # Optional producer-side frame transform.  Applied to decoded
+        # episode tensors before they land in the ShuffleBuffer; the
+        # buffer's shm allocation matches the transform's output shape.
+        # Typical use: pass ``ResizeFrames(H, W)`` so the buffer stores
+        # training-resolution frames instead of source-resolution
+        # frames (74 GB → ~14 GB at 224→96 for capacity=2000).  Any
+        # picklable callable works; exposed ``output_shape(input_shape)``
+        # lets the DataModule compute the buffer shape without probing.
+        self.producer_transform = producer_transform
         self.dtype_conversions = dtype_conversions
         self.train_split_ratio = train_split_ratio
         # Three knobs for the growing-set behaviour.
@@ -528,6 +524,7 @@ class BlendedLeRobotDataModule(L.LightningDataModule):
         from .shuffle_buffer import ShuffleBuffer
         from .producer_pool import ProducerConfig, ProducerPool
         from .lerobot_shuffle_buffer_dataset import LeRobotShuffleBufferDataset
+        from .frame_transforms import probe_output_shape
 
         # Determine max_frames and frame dimensions across all sources
         max_frames = 0
@@ -541,15 +538,21 @@ class BlendedLeRobotDataModule(L.LightningDataModule):
         else:
             source_height, source_width, channels = 96, 96, 3
 
-        # Producer-side resize: when target H/W is set, the producer
-        # downsamples before buffer.put so shm is allocated at training
-        # resolution.  Otherwise shm is allocated at source resolution.
-        if self.shuffle_buffer_target_height is not None:
-            height = self.shuffle_buffer_target_height
-            width = self.shuffle_buffer_target_width
+        # Producer-side transform: probe its output shape so the
+        # ShuffleBuffer allocates shm at training (post-transform)
+        # resolution.  No transform → source resolution.
+        # input_shape is (T, C, H, W); we only need the spatial dims for
+        # the buffer.  max_frames is determined below.
+        source_spatial = (channels, source_height, source_width)
+        if self.producer_transform is not None:
+            out_spatial = probe_output_shape(
+                self.producer_transform, (1, *source_spatial),
+            )
+            # (T=1, C, H', W') → pull C, H, W
+            _, channels, height, width = out_spatial
             logger.info(
-                f"ShuffleBuffer: producer-side resize "
-                f"{source_height}x{source_width} -> {height}x{width}"
+                f"ShuffleBuffer: producer_transform={self.producer_transform!r} "
+                f"({source_height}x{source_width} -> {height}x{width})"
             )
         else:
             height, width = source_height, source_width
@@ -581,8 +584,7 @@ class BlendedLeRobotDataModule(L.LightningDataModule):
                 full_ds=full_ds,
                 iteration_episodes=train_ep_indices,
                 episode_offset=cumulative_offset,
-                target_height=self.shuffle_buffer_target_height,
-                target_width=self.shuffle_buffer_target_width,
+                producer_transform=self.producer_transform,
             )
             producers.append(config)
 
