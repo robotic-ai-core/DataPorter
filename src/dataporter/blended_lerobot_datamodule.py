@@ -198,6 +198,8 @@ class BlendedLeRobotDataModule(L.LightningDataModule):
         split_fn: Callable[[int], bool] | None = None,
         train_split_ratio: float = 0.9,
         tolerance_s: float | None = None,
+        self_refresh_every_n_items: int | None = None,
+        nominal_total_frames: int | None = None,
     ):
         super().__init__()
 
@@ -261,6 +263,21 @@ class BlendedLeRobotDataModule(L.LightningDataModule):
                 )
         self.prefetch_min_fraction = prefetch_min_fraction
         self.refresh_min_new = int(refresh_min_new)
+        # Self-refresh / pinned-length knobs — forwarded to
+        # LeRobotShuffleBufferDataset.  When set together they let the
+        # user drop GrowingDatasetCallback and
+        # reload_dataloaders_every_n_epochs=1 entirely: each DataLoader
+        # worker keeps its own admission map fresh via self.refresh()
+        # every N __getitem__ calls, and Lightning sees a stable
+        # __len__ so num_training_batches is correct from fit() start.
+        self.self_refresh_every_n_items = (
+            int(self_refresh_every_n_items)
+            if self_refresh_every_n_items is not None else None
+        )
+        self.nominal_total_frames = (
+            int(nominal_total_frames)
+            if nominal_total_frames is not None else None
+        )
         # Split predicate.  Default: 90/10 by modulo-10 on raw episode id.
         # Stable across refreshes; an episode's train/val assignment never
         # changes as the admitted set grows.
@@ -657,6 +674,8 @@ class BlendedLeRobotDataModule(L.LightningDataModule):
             default_min_new=self.refresh_min_new,
             epoch_length=total_train_samples,
             image_keys=self.get_image_keys(),
+            refresh_every_n_items=self.self_refresh_every_n_items,
+            nominal_total_frames=self.nominal_total_frames,
         )
         self._train_sampler = None  # No sampler needed
 

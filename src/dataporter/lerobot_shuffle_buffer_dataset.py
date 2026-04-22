@@ -85,6 +85,23 @@ class LeRobotShuffleBufferDataset(Dataset):
             episodes each refresh (deterministic per-epoch cadence).
         image_keys: List of video/image keys in the dataset.
         seed: Random seed for per-worker RNG.
+        refresh_every_n_items: If set, the consumer calls
+            :meth:`refresh` itself every N ``__getitem__`` invocations.
+            Runs per-worker — each forked DataLoader worker self-refreshes
+            independently, updating its local ``_ep_to_source`` and
+            broadcasting the new episode list to the shared pool via its
+            ``update_queue``.  With this set, neither
+            :class:`GrowingDatasetCallback` nor
+            ``reload_dataloaders_every_n_epochs=1`` is required: workers
+            keep their admission maps fresh on their own.  ``None``
+            (default) preserves the callback-driven flow.
+        nominal_total_frames: If set, overrides ``__len__`` to a fixed
+            value regardless of admission growth.  Used with
+            ``refresh_every_n_items`` to give Lightning a stable
+            ``num_training_batches`` so ``reload_dataloaders_every_n_epochs``
+            and epoch-length-aware schedulers (OneCycleLR.total_steps)
+            work correctly on streaming datasets.  ``None`` (default)
+            preserves the live-growing ``_epoch_length`` semantics.
     """
 
     # Amortized stale-refresh detection tunables (instance-level overridable
@@ -105,6 +122,8 @@ class LeRobotShuffleBufferDataset(Dataset):
         epoch_length: int | None = None,
         image_keys: list[str] | None = None,
         seed: int = 42,
+        refresh_every_n_items: int | None = None,
+        nominal_total_frames: int | None = None,
     ):
         self._buffer = buffer
         self._sources = sources
@@ -118,6 +137,18 @@ class LeRobotShuffleBufferDataset(Dataset):
         self._image_keys = image_keys or ["observation.image"]
         self._seed = seed
         self._rng = random.Random(seed)
+        # Self-refresh knobs (see class docstring).  None preserves the
+        # historical callback-driven flow.
+        self._refresh_every_n_items: int | None = (
+            int(refresh_every_n_items)
+            if refresh_every_n_items is not None
+            else None
+        )
+        self._nominal_total_frames: int | None = (
+            int(nominal_total_frames)
+            if nominal_total_frames is not None
+            else None
+        )
 
         # Per-source offsets are fixed at construction; the admitted
         # episode list rebuilds on every refresh().
@@ -314,6 +345,12 @@ class LeRobotShuffleBufferDataset(Dataset):
     # ------------------------------------------------------------------
 
     def __len__(self) -> int:
+        # When the caller pinned a nominal length at construction, honor
+        # that regardless of admission growth — keeps Lightning's
+        # num_training_batches stable and eliminates the need for
+        # reload_dataloaders_every_n_epochs=1 on growing datasets.
+        if self._nominal_total_frames is not None:
+            return self._nominal_total_frames
         return self._epoch_length
 
     def __getitem__(self, idx: int) -> dict[str, torch.Tensor | int]:
@@ -321,12 +358,36 @@ class LeRobotShuffleBufferDataset(Dataset):
 
         ``idx`` is ignored -- every call samples uniformly from the buffer.
         Amortized stale-refresh check runs every
-        :attr:`_REFRESH_WARN_SAMPLE_PERIOD` calls.
+        :attr:`_REFRESH_WARN_SAMPLE_PERIOD` calls.  If
+        ``refresh_every_n_items`` is set, a worker-local
+        :meth:`refresh` fires every N calls — no external callback
+        required.
         """
         self._getitem_counter += 1
         if (
+            self._refresh_every_n_items
+            and self._getitem_counter % self._refresh_every_n_items == 0
+        ):
+            # Worker-local refresh: rescans disk via prefetchers, updates
+            # this worker's ``_ep_to_source``, and broadcasts the new
+            # episode list to the shared producer pool via its
+            # ``_update_queue`` (mp.Queue handles survive fork, so writes
+            # from any worker reach the spawn-child pool).  Errors are
+            # logged and swallowed — a transient disk scan failure
+            # shouldn't crash the training step.
+            try:
+                self.refresh()
+            except Exception as e:
+                logger.warning(
+                    f"LeRobotShuffleBufferDataset: self-refresh failed: "
+                    f"{type(e).__name__}: {e}; continuing with current "
+                    f"admitted set"
+                )
+        elif (
             self._getitem_counter % self._REFRESH_WARN_SAMPLE_PERIOD == 0
         ):
+            # Stale-refresh warning only fires when self-refresh isn't
+            # wired — otherwise the warning would be spurious.
             self._maybe_warn_stale_refresh()
 
         # 1. Sample random episode from buffer
