@@ -210,6 +210,7 @@ def _spawn_pool_entry(
     warmup_event,
     stop_event,
     error_queue=None,
+    update_queue=None,
 ) -> None:
     """Entry point for the spawned producer process.
 
@@ -263,6 +264,7 @@ def _spawn_pool_entry(
             buffer, configs, total_workers,
             warmup_target, warmup_event, stop_event,
             decode_fns=decode_fns,
+            update_queue=update_queue,
         ))
     except Exception as e:
         _report_error(f"ProducerPool child error: {e}")
@@ -342,6 +344,7 @@ async def _run_spawn_pool(
     warmup_event,
     stop_event,
     decode_fns: dict[str, Callable] | None = None,
+    update_queue=None,
 ) -> None:
     """Async event loop in spawned child: parallel decode via executors.
 
@@ -349,6 +352,11 @@ async def _run_spawn_pool(
     per-source ThreadPoolExecutors. Results are collected as they
     complete and written to the buffer. This gives true parallelism
     (N decodes in flight) instead of sequential await.
+
+    When ``update_queue`` is provided, an async task polls it for
+    ``(source_name, new_episode_list)`` messages and swaps the
+    per-source iterator atomically.  The new list takes effect on the
+    very next ``_next_dispatch()`` call for that source.
     """
     loop = asyncio.get_event_loop()
 
@@ -441,6 +449,48 @@ async def _run_spawn_pool(
             for k in tokens:
                 tokens[k] = 0.0
         return name, ep_idx
+
+    async def _poll_updates() -> None:
+        """Background task: pull update_episodes messages from the parent.
+
+        Swaps ``iterators[source_name]`` to a fresh iterator over the new
+        list as soon as a message arrives.  The currently-dispatched
+        decode tasks finish on the old list; subsequent dispatches pick up
+        the new list.
+        """
+        if update_queue is None:
+            return
+        while not stop_event.is_set():
+            try:
+                msg = update_queue.get_nowait()
+            except Exception:
+                await asyncio.sleep(0.1)
+                continue
+            try:
+                source_name, new_episodes = msg
+                if source_name not in iterators:
+                    logger.warning(
+                        f"update_episodes: unknown source "
+                        f"{source_name!r}, ignoring"
+                    )
+                    continue
+                rng = random.Random(
+                    next(
+                        (c.seed for c in configs if c.source_name == source_name),
+                        42,
+                    )
+                )
+                iterators[source_name] = _episode_iterator(
+                    list(new_episodes), rng,
+                )
+                logger.info(
+                    f"ProducerPool: {source_name} iterator swapped to "
+                    f"{len(new_episodes)} episodes"
+                )
+            except Exception as e:
+                logger.warning(f"update_episodes handler: {e}")
+
+    update_task = asyncio.create_task(_poll_updates())
 
     # Seed the pipeline with total_workers concurrent decodes
     for _ in range(total_workers):
@@ -611,11 +661,16 @@ class ProducerPool:
             self._warmup_event = ctx.Event()
             self._stop_event = ctx.Event()
             self._error_queue = ctx.Queue()
+            # Parent → child control channel for update_episodes().
+            # Messages are (source_name, new_episode_list) tuples; the
+            # child swaps its per-source iterator when one arrives.
+            self._update_queue = ctx.Queue()
         else:
             import threading
             self._warmup_event = threading.Event()
             self._stop_event = threading.Event()
             self._error_queue = None
+            self._update_queue = None
 
     def start(self) -> None:
         """Start the producer (spawn process or daemon thread)."""
@@ -639,6 +694,7 @@ class ProducerPool:
                     self._warmup_event,
                     self._stop_event,
                     self._error_queue,
+                    self._update_queue,
                 ),
                 daemon=True,
                 name="producer-pool",
@@ -704,6 +760,44 @@ class ProducerPool:
             if hasattr(self._worker, 'terminate') and self._worker.is_alive():
                 self._worker.terminate()
             self._worker = None
+
+    def update_episodes(
+        self, source_name: str, new_episodes: list[int],
+    ) -> None:
+        """Swap the work-queue for a running source atomically.
+
+        Sends a message to the spawn child; the child's update poller
+        replaces ``iterators[source_name]`` with a fresh iterator over
+        ``new_episodes``.  Currently-dispatched decode tasks finish on
+        the old list; subsequent dispatches use the new list.
+
+        No-op (with warning) in thread mode — update semantics aren't
+        needed there because thread-mode callers typically rebuild the
+        pool between epochs.
+
+        Args:
+            source_name: ``ProducerConfig.source_name`` for the source
+                to update.
+            new_episodes: Full episode-id list for that source (not a
+                delta; the iterator is replaced).
+        """
+        if not self._use_spawn or self._update_queue is None:
+            logger.warning(
+                "ProducerPool.update_episodes: no-op in thread mode "
+                "(use spawn mode with ProducerConfig for live updates)"
+            )
+            return
+        if not self.is_alive:
+            logger.warning(
+                "ProducerPool.update_episodes: worker not running; "
+                "start() the pool first or the message will be lost"
+            )
+        try:
+            self._update_queue.put_nowait(
+                (source_name, list(new_episodes)),
+            )
+        except Exception as e:
+            logger.warning(f"update_episodes: failed to enqueue: {e}")
 
     @property
     def is_alive(self) -> bool:

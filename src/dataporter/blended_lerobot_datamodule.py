@@ -28,6 +28,36 @@ from .resumable import ResumableDataLoader, resolve_num_workers
 logger = logging.getLogger(__name__)
 
 
+def _make_default_split_fn(train_ratio: float) -> Callable[[int], bool]:
+    """Build a stable modulo-based split predicate from a train ratio.
+
+    Keeps an episode's train/val assignment constant across dataset
+    growth (the anti-pattern the old "first-N" split caused: episodes
+    silently migrating from val to train as more became available).
+
+    Rounds the ratio to the nearest 10% bucket — 0.9 → ``e % 10 != 9``,
+    0.8 → ``e % 5 != 4``, etc.  Logs a warning for values that don't map
+    cleanly; the bug the warning flags is usually a misread config knob.
+    """
+    if train_ratio <= 0 or train_ratio >= 1:
+        raise ValueError(
+            f"train_split_ratio must be in (0, 1), got {train_ratio}"
+        )
+    # Snap to modulo-10 → modulo-2 lattice.
+    val_ratio = 1.0 - train_ratio
+    for bucket in (10, 5, 4, 2):
+        cutoff = int(round(bucket * val_ratio))
+        if cutoff >= 1 and abs(cutoff / bucket - val_ratio) < 1e-3:
+            val_start = bucket - cutoff
+            return lambda e, _b=bucket, _s=val_start: e % _b < _s
+    logger.warning(
+        f"train_split_ratio={train_ratio!r} doesn't map cleanly to a "
+        f"modulo bucket; falling back to ``e % 10 != 9`` (≈90/10). "
+        f"Pass an explicit split_fn=lambda e: ... to override."
+    )
+    return lambda e: e % 10 != 9
+
+
 def scan_available_episodes(local_dir: Path) -> list[int]:
     """Scan a prefetch directory for available episode parquet files.
 
@@ -163,6 +193,9 @@ class BlendedLeRobotDataModule(L.LightningDataModule):
         shuffle_buffer_capacity: int | None = None,
         shuffle_buffer_target_height: int | None = None,
         shuffle_buffer_target_width: int | None = None,
+        prefetch_min_episodes: int = 50,
+        refresh_min_new: int = 0,
+        split_fn: Callable[[int], bool] | None = None,
         train_split_ratio: float = 0.9,
         tolerance_s: float | None = None,
     ):
@@ -206,6 +239,21 @@ class BlendedLeRobotDataModule(L.LightningDataModule):
             )
         self.dtype_conversions = dtype_conversions
         self.train_split_ratio = train_split_ratio
+        # Two independent knobs for the growing-set behaviour.
+        # - prefetch_min_episodes: absolute threshold before training
+        #   can START.  setup() blocks until this many train-bucket
+        #   episodes are ready.
+        # - refresh_min_new: default delta for subsequent refresh() calls
+        #   (typically driven by GrowingDatasetCallback on epoch start).
+        #   0 = non-blocking (admit whatever's ready, don't wait).
+        self.prefetch_min_episodes = int(prefetch_min_episodes)
+        self.refresh_min_new = int(refresh_min_new)
+        # Split predicate.  Default: 90/10 by modulo-10 on raw episode id.
+        # Stable across refreshes; an episode's train/val assignment never
+        # changes as the admitted set grows.
+        if split_fn is None:
+            split_fn = _make_default_split_fn(train_split_ratio)
+        self.split_fn = split_fn
 
         self.delta_timestamps = dict(delta_timestamps)
         self._val_delta_timestamps = (
@@ -497,6 +545,7 @@ class BlendedLeRobotDataModule(L.LightningDataModule):
             transform = self.get_train_transform(source)
             sources_for_dataset.append({
                 "dataset": full_ds,
+                "source_name": source["repo_id"],
                 "train_episode_indices": train_ep_indices,
                 "episode_offset": cumulative_offset,
                 "transform": transform,
@@ -539,6 +588,10 @@ class BlendedLeRobotDataModule(L.LightningDataModule):
             buffer=buffer,
             sources=sources_for_dataset,
             delta_timestamps=delta_timestamps,
+            prefetchers=list(self._prefetchers),
+            producer_pool=self._producer_pool,
+            split_fn=self.split_fn,
+            default_min_new=self.refresh_min_new,
             epoch_length=total_train_samples,
             image_keys=self.get_image_keys(),
         )

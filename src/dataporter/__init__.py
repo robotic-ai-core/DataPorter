@@ -34,6 +34,7 @@ from .text_producer_pool import (
     TextProducerConfig, TextProducerPool, TokenizeFn,
 )
 from .token_shuffle_buffer_dataset import TokenShuffleBufferDataset
+from .growing_dataset_callback import GrowingDatasetCallback
 
 # Lazy imports for optional dependencies (lerobot, lightning)
 def __getattr__(name):
@@ -104,6 +105,8 @@ __all__ = [
     'check_hf_cache_populated',
     'hf_cache_repo_path',
     'write_cache_sentinel',
+    # Growing dataset integration (Lightning callback)
+    'GrowingDatasetCallback',
     # Shuffle buffer (video pipeline)
     'ShuffleBuffer',
     'ProducerPool',

@@ -427,6 +427,23 @@ class BasePrefetcher:
         if self._error:
             raise RuntimeError(f"Prefetcher failed: {self._error}") from self._error
 
+    def is_done(self) -> bool:
+        """True when the background download worker has terminated.
+
+        Used by consumers (e.g. :meth:`LeRobotShuffleBufferDataset.refresh`)
+        that poll ``ready_episodes()``: once the worker has stopped no
+        more episodes will arrive, so the poll loop should exit instead of
+        blocking for data that will never come.
+
+        Returns ``False`` before ``start()`` is called.  A prefetcher that
+        errored out and stopped via an unrecoverable failure still counts
+        as done — the caller decides how to surface the error (via the
+        error queue or ``_error`` attribute).
+        """
+        if self._worker is None:
+            return False
+        return not self._worker.is_alive()
+
     def stop(self) -> None:
         """Stop background production."""
         if self._stop_event is not None:
