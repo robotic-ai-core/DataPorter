@@ -194,6 +194,7 @@ class BlendedLeRobotDataModule(L.LightningDataModule):
         shuffle_buffer_target_height: int | None = None,
         shuffle_buffer_target_width: int | None = None,
         prefetch_min_episodes: int = 50,
+        prefetch_min_fraction: float | None = None,
         refresh_min_new: int = 0,
         split_fn: Callable[[int], bool] | None = None,
         train_split_ratio: float = 0.9,
@@ -239,14 +240,30 @@ class BlendedLeRobotDataModule(L.LightningDataModule):
             )
         self.dtype_conversions = dtype_conversions
         self.train_split_ratio = train_split_ratio
-        # Two independent knobs for the growing-set behaviour.
-        # - prefetch_min_episodes: absolute threshold before training
-        #   can START.  setup() blocks until this many train-bucket
-        #   episodes are ready.
+        # Three knobs for the growing-set behaviour.
+        # - prefetch_min_episodes: absolute floor for the setup-time gate.
+        #   Default 50 = conservative "training can start with some data"
+        #   (historic behaviour).  For large datasets (10k+ episodes),
+        #   raise this to ~500 so epoch 1 iterates meaningful diversity
+        #   instead of the same few episodes.  Small datasets hit the
+        #   is_done() short-circuit inside refresh() and settle for
+        #   whatever's available.
+        # - prefetch_min_fraction: optional size-aware scaler.  When set,
+        #   effective gate = max(prefetch_min_episodes, fraction * total).
+        #   Portable configs: the same YAML works across dataset sizes.
+        #   e.g. ``prefetch_min_fraction=0.1`` on an 18k dataset yields a
+        #   1,800-episode setup gate; on a 200-episode dataset it yields
+        #   20 (capped by the floor to max(50, 20) = 50).
         # - refresh_min_new: default delta for subsequent refresh() calls
-        #   (typically driven by GrowingDatasetCallback on epoch start).
-        #   0 = non-blocking (admit whatever's ready, don't wait).
+        #   (typically driven by GrowingDatasetCallback).  0 = non-blocking.
         self.prefetch_min_episodes = int(prefetch_min_episodes)
+        if prefetch_min_fraction is not None:
+            if not (0.0 < prefetch_min_fraction <= 1.0):
+                raise ValueError(
+                    f"prefetch_min_fraction must be in (0, 1], got "
+                    f"{prefetch_min_fraction!r}"
+                )
+        self.prefetch_min_fraction = prefetch_min_fraction
         self.refresh_min_new = int(refresh_min_new)
         # Split predicate.  Default: 90/10 by modulo-10 on raw episode id.
         # Stable across refreshes; an episode's train/val assignment never
@@ -365,9 +382,37 @@ class BlendedLeRobotDataModule(L.LightningDataModule):
         prefetcher = LeRobotPrefetcher(
             repo_id=repo_id,
             cache_dir=local_dir,
-            min_shards=min(50, source.get("prefetch_min_episodes", 50)),
+            min_shards=source.get(
+                "prefetch_min_episodes", self.prefetch_min_episodes,
+            ),
             max_shards=source.get("prefetch_max_episodes", 10000),
         )
+        # Optional size-aware scaling: `prefetch_min_fraction` lifts the
+        # effective setup gate to `fraction × total_episodes` when that
+        # exceeds the floor.  Triggers a one-shot metadata load via the
+        # prefetcher's `total_episodes` property (cheap — just reads
+        # info.json from the HF hub cache or issues a meta-only
+        # snapshot_download).
+        if self.prefetch_min_fraction is not None:
+            try:
+                total = prefetcher.total_episodes
+            except Exception as e:
+                logger.warning(
+                    f"prefetch_min_fraction requested but metadata "
+                    f"load failed ({e}); falling back to "
+                    f"prefetch_min_episodes={prefetcher._min_shards}"
+                )
+            else:
+                fraction_gate = int(self.prefetch_min_fraction * total)
+                if fraction_gate > prefetcher._min_shards:
+                    logger.info(
+                        f"prefetch_min_fraction="
+                        f"{self.prefetch_min_fraction:.2f}: raising setup "
+                        f"gate from {prefetcher._min_shards} to "
+                        f"{fraction_gate} "
+                        f"({self.prefetch_min_fraction:.0%} of {total})"
+                    )
+                    prefetcher._min_shards = fraction_gate
         prefetcher.start()
         # 3600s timeout: bulk mode downloads all episodes in one snapshot_download
         # call before signalling ready. With 2000+ files and HF rate-limiting

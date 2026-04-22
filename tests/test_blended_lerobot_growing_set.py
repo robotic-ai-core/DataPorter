@@ -851,3 +851,132 @@ class TestProducerPoolUpdateEpisodes:
         assert hasattr(ProducerPool, "update_episodes"), (
             "ProducerPool.update_episodes not defined — Phase 2A missing"
         )
+
+
+# ---------------------------------------------------------------------------
+# 8. Size-aware setup gate: prefetch_min_episodes + prefetch_min_fraction
+# ---------------------------------------------------------------------------
+
+
+class TestSetupGateSizeAware:
+
+    def test_default_min_episodes_is_conservative_floor(self):
+        """Default prefetch_min_episodes is deliberately kept at 50
+        (historic behaviour) so adopting DataPorter doesn't silently
+        break test fixtures that use small public datasets.  Large-
+        dataset users raise to ~500 explicitly, or use
+        prefetch_min_fraction for size-aware scaling.
+        """
+        from dataporter.blended_lerobot_datamodule import (
+            BlendedLeRobotDataModule,
+        )
+        import inspect
+
+        sig = inspect.signature(BlendedLeRobotDataModule.__init__)
+        assert sig.parameters["prefetch_min_episodes"].default == 50
+        assert sig.parameters["prefetch_min_fraction"].default is None
+
+    def test_fraction_raises_effective_gate_on_large_totals(
+        self, tmp_path, source_dir,
+    ):
+        """With prefetch_min_fraction=0.2 and total=50, effective gate
+        should be max(floor=5, 10) = 10.  The raw ``_min_shards`` on
+        the prefetcher should reflect this after the fraction is
+        applied.
+        """
+        # Inline the _start_prefetcher fraction-scaling logic against our
+        # fake prefetcher (the real DataModule requires a full HF flow).
+        pf = _ControlledFakePrefetcher(
+            source_dir=source_dir,
+            cache_dir=tmp_path / "c",
+            min_shards=5,          # the floor
+        )
+        # Apply fraction-scaling — 20% of 50 = 10, which exceeds floor=5.
+        total = pf.total_episodes
+        assert total == 50
+        fraction = 0.2
+        effective = int(fraction * total)
+        if effective > pf._min_shards:
+            pf._min_shards = effective
+        assert pf._min_shards == 10
+
+    def test_floor_wins_on_small_totals(self, tmp_path, source_dir):
+        """prefetch_min_episodes=500 + fraction=0.1 on total=50: the
+        floor (500) exceeds fraction (5), so the gate stays at 500.
+        The is_done() short-circuit in refresh() then handles the
+        "only 50 available" case gracefully.
+        """
+        pf = _ControlledFakePrefetcher(
+            source_dir=source_dir,
+            cache_dir=tmp_path / "c",
+            min_shards=500,
+        )
+        total = pf.total_episodes    # 50 in the fixture
+        fraction = 0.1
+        fraction_gate = int(fraction * total)   # 5
+        if fraction_gate > pf._min_shards:      # 5 <= 500, no change
+            pf._min_shards = fraction_gate
+        assert pf._min_shards == 500
+
+
+# ---------------------------------------------------------------------------
+# 9. Step-based callback cadence
+# ---------------------------------------------------------------------------
+
+
+class TestGrowingDatasetCallbackStepMode:
+
+    def test_step_based_callback_fires_every_n_steps(self):
+        """With every_n_steps=N, refresh fires exclusively on
+        on_train_batch_start at step % N == 0 (skipping step 0).
+        Epoch start is a no-op in this mode.
+        """
+        from unittest.mock import MagicMock
+        from dataporter import GrowingDatasetCallback
+
+        cb = GrowingDatasetCallback(every_n_steps=3)
+        trainer = MagicMock()
+        trainer.datamodule.train_dataset.refresh = MagicMock()
+        pl_module = MagicMock()
+
+        # Epoch-start must NOT fire when in step mode.
+        cb.on_train_epoch_start(trainer, pl_module)
+        assert trainer.datamodule.train_dataset.refresh.call_count == 0
+
+        # Walk steps 0..6; refresh fires at 3 and 6 only.
+        fired_at = []
+        for step in range(7):
+            trainer.global_step = step
+            cb.on_train_batch_start(trainer, pl_module, batch=None, batch_idx=step)
+            if trainer.datamodule.train_dataset.refresh.call_count > len(fired_at):
+                fired_at.append(step)
+        assert fired_at == [3, 6], (
+            f"expected refresh at steps [3, 6], got {fired_at}"
+        )
+
+    def test_epoch_based_callback_ignores_batch_hooks(self):
+        """Default (every_n_steps=None): on_train_batch_start is a
+        no-op.  Only on_train_epoch_start fires refresh.
+        """
+        from unittest.mock import MagicMock
+        from dataporter import GrowingDatasetCallback
+
+        cb = GrowingDatasetCallback()   # default = epoch mode
+        trainer = MagicMock()
+        trainer.datamodule.train_dataset.refresh = MagicMock()
+        pl_module = MagicMock()
+        trainer.global_step = 100
+
+        for _ in range(500):
+            cb.on_train_batch_start(trainer, pl_module, batch=None, batch_idx=0)
+        assert trainer.datamodule.train_dataset.refresh.call_count == 0
+
+        cb.on_train_epoch_start(trainer, pl_module)
+        assert trainer.datamodule.train_dataset.refresh.call_count == 1
+
+    def test_invalid_every_n_steps_raises(self):
+        from dataporter import GrowingDatasetCallback
+        with pytest.raises(ValueError, match="every_n_steps must be positive"):
+            GrowingDatasetCallback(every_n_steps=0)
+        with pytest.raises(ValueError, match="every_n_steps must be positive"):
+            GrowingDatasetCallback(every_n_steps=-5)

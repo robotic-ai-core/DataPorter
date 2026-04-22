@@ -250,6 +250,16 @@ class LeRobotPrefetcher(BasePrefetcher):
     def _get_total_episodes(self) -> int:
         return self._load_meta().get("total_episodes", 0)
 
+    @property
+    def total_episodes(self) -> int:
+        """Total episode count reported by the dataset metadata.
+
+        Triggers a metadata load on first access; consumers can call
+        this before ``start()`` to compute size-aware setup gates
+        (e.g. ``prefetch_min_fraction`` in ``BlendedLeRobotDataModule``).
+        """
+        return self._get_total_episodes()
+
     # ------------------------------------------------------------------
     # Episode path helpers
     # ------------------------------------------------------------------
