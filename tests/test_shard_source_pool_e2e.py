@@ -836,3 +836,217 @@ def test_consumer_samples_match_parquet_for_sampled_episode(tmp_path):
             )
     finally:
         pool.stop()
+
+
+# ===========================================================================
+# (9) GrowingDatasetCallback drives growth end-to-end — epoch mode
+# ===========================================================================
+
+
+def _build_pool_and_consumer(tmp_path, initial_eps: list[int]):
+    """Shared setup: synthetic dataset + pool + consumer + prefetcher.
+
+    Returns ``(root, src, buf, pool, consumer, prefetcher)`` so each
+    callback-driven test can construct identical wiring and only vary
+    the callback's scheduling policy.
+    """
+    from dataporter import LeRobotShardSource, ResizeFrames
+    from dataporter.lerobot_shuffle_buffer_dataset import (
+        LeRobotShuffleBufferDataset,
+    )
+    from dataporter.producer_pool import ProducerConfig, ProducerPool
+    from dataporter.shuffle_buffer import ShuffleBuffer
+
+    root = tmp_path / "ds"
+    _make_dataset(root, ready_eps=initial_eps, total_episodes=20)
+    src = LeRobotShardSource(root)
+    prefetcher = _LiveDiskPrefetcher(root)
+
+    buf = ShuffleBuffer(
+        capacity=32, max_frames=32, channels=3, height=32, width=32,
+    )
+    cfg = ProducerConfig.from_source(
+        source={"repo_id": "synth", "weight": 1.0},
+        shard_source=src,
+        iteration_episodes=initial_eps,
+        producer_transform=ResizeFrames(32, 32),
+    )
+    pool = ProducerPool(buf, configs=[cfg], total_workers=2, warmup_target=1)
+
+    consumer = LeRobotShuffleBufferDataset(
+        buffer=buf,
+        sources=[{
+            "shard_source": src,
+            "source_name": "synth",
+            "episode_offset": 0,
+            "transform": None,
+            "train_episode_indices": list(initial_eps),
+        }],
+        delta_timestamps={},
+        prefetchers=[prefetcher],
+        producer_pool=pool,
+        split_fn=lambda ep: True,
+        image_keys=["observation.image"],
+    )
+    return root, src, buf, pool, consumer, prefetcher
+
+
+def _wait_for_keys(buf, wanted: set[int], timeout: float = 30.0) -> set[int]:
+    """Poll the buffer for ``wanted`` keys, clearing when full so the
+    pool's backpressure doesn't park and hide new dispatches.
+    """
+    seen: set[int] = set()
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        seen.update(set(buf.keys()) & wanted)
+        if seen >= wanted:
+            return seen
+        if len(buf) >= buf.capacity - 1:
+            buf.clear()
+        time.sleep(0.2)
+    return seen
+
+
+def test_epoch_mode_callback_drives_growth_end_to_end(tmp_path):
+    """GrowingDatasetCallback() (default epoch mode), fired against a
+    running pool via ``on_train_epoch_start``, admits new episodes that
+    appeared on disk between invocations and their frames reach the
+    ShuffleBuffer without any direct ``refresh()`` call.
+
+    Proves the full control flow: ``trainer.on_train_epoch_start`` →
+    callback → ``consumer.refresh()`` → pool ``update_episodes`` →
+    child decoder picks up new ids → buffer holds them.
+    """
+    from unittest.mock import MagicMock
+
+    from dataporter import GrowingDatasetCallback
+
+    root, _src, buf, pool, consumer, _pf = _build_pool_and_consumer(
+        tmp_path, initial_eps=[0, 1],
+    )
+
+    pool.start()
+    try:
+        pool.wait_for_warmup(timeout=30.0)
+
+        # Fake Lightning trainer — callback walks
+        # trainer.datamodule.train_dataset.refresh().
+        trainer = MagicMock()
+        trainer.datamodule.train_dataset = consumer
+        cb = GrowingDatasetCallback()   # default: epoch mode
+
+        # Sanity: epoch-start BEFORE new disk writes admits nothing new.
+        cb.on_train_epoch_start(trainer, None)
+        assert set(consumer._current_train_episodes) == {0, 1}
+
+        # Simulate the prefetcher landing 3 more episodes mid-epoch.
+        for ep in (5, 11, 17):
+            _write_episode_parquet(root, ep, n_frames=20)
+            _write_episode_mp4(
+                root, ep,
+                n_frames=20, height=32, width=32, fps=30,
+            )
+
+        # Batch hooks must NOT fire refresh in epoch mode.
+        cb.on_train_batch_start(trainer, None, batch=None, batch_idx=0)
+        assert set(consumer._current_train_episodes) == {0, 1}, (
+            "batch hook fired refresh in epoch mode — regression"
+        )
+
+        # Next epoch start admits the three new eps.
+        cb.on_train_epoch_start(trainer, None)
+        assert set(consumer._current_train_episodes) == {0, 1, 5, 11, 17}
+
+        # And the pool actually decodes them — new keys must land in the
+        # buffer before the deadline.
+        seen = _wait_for_keys(buf, wanted={5, 11, 17}, timeout=30.0)
+        assert seen, (
+            f"epoch-mode callback refreshed admitted set but no new "
+            f"episodes reached the buffer; keys={buf.keys()}"
+        )
+    finally:
+        pool.stop()
+
+
+# ===========================================================================
+# (10) GrowingDatasetCallback drives growth end-to-end — step mode
+# ===========================================================================
+
+
+def test_step_mode_callback_drives_growth_end_to_end(tmp_path):
+    """``GrowingDatasetCallback(every_n_steps=N)`` fires refresh only
+    when ``global_step`` is a positive multiple of ``N``.  Non-multiple
+    steps are no-ops; the epoch hook is a no-op.
+
+    Between the two refresh ticks we write one new episode to disk; it
+    must be invisible at the first tick (wasn't on disk yet) and
+    admitted at the second tick.  The resulting update_episodes call
+    must carry into the pool and the new episode's frames must reach
+    the buffer.
+    """
+    from unittest.mock import MagicMock
+
+    from dataporter import GrowingDatasetCallback
+
+    root, _src, buf, pool, consumer, _pf = _build_pool_and_consumer(
+        tmp_path, initial_eps=[0, 1],
+    )
+
+    pool.start()
+    try:
+        pool.wait_for_warmup(timeout=30.0)
+
+        trainer = MagicMock()
+        trainer.datamodule.train_dataset = consumer
+        cb = GrowingDatasetCallback(every_n_steps=3)
+
+        # Epoch-start must NOT fire in step mode.
+        cb.on_train_epoch_start(trainer, None)
+        assert set(consumer._current_train_episodes) == {0, 1}
+
+        # Walk a few steps; refresh fires only at steps 3, 6, ...
+        # Step 1–2: no fire.
+        for step in (1, 2):
+            trainer.global_step = step
+            cb.on_train_batch_start(
+                trainer, None, batch=None, batch_idx=step,
+            )
+        assert set(consumer._current_train_episodes) == {0, 1}
+
+        # Step 3: first fire.  Disk unchanged — admits nothing new.
+        trainer.global_step = 3
+        cb.on_train_batch_start(trainer, None, batch=None, batch_idx=3)
+        assert set(consumer._current_train_episodes) == {0, 1}
+
+        # Between ticks, the prefetcher lands ep 7.
+        _write_episode_parquet(root, 7, n_frames=20)
+        _write_episode_mp4(
+            root, 7, n_frames=20, height=32, width=32, fps=30,
+        )
+
+        # Step 4, 5: no fire (not multiples of 3).
+        for step in (4, 5):
+            trainer.global_step = step
+            cb.on_train_batch_start(
+                trainer, None, batch=None, batch_idx=step,
+            )
+        assert set(consumer._current_train_episodes) == {0, 1}, (
+            f"step {step} fired refresh — cadence wrong"
+        )
+
+        # Step 6: second fire — admits ep 7.
+        trainer.global_step = 6
+        cb.on_train_batch_start(trainer, None, batch=None, batch_idx=6)
+        assert 7 in consumer._current_train_episodes, (
+            f"step-6 refresh didn't admit ep 7; admitted="
+            f"{consumer._current_train_episodes}"
+        )
+
+        # Pool picks up the updated iterator and decodes ep 7.
+        seen = _wait_for_keys(buf, wanted={7}, timeout=30.0)
+        assert seen, (
+            f"step-mode callback refreshed admitted set but ep 7 "
+            f"never reached the buffer; keys={buf.keys()}"
+        )
+    finally:
+        pool.stop()
