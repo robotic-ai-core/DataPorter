@@ -30,6 +30,7 @@ from typing import Callable
 
 import torch
 
+from ._blending import WeightedRoundRobinDispatcher
 from ._producer_pool_base import BaseProducerPool
 from .shuffle_buffer import ShuffleBuffer
 
@@ -452,17 +453,13 @@ async def _run_spawn_pool(
             return source_name, ep_idx, None
 
     # Weighted dispatch: fill the pipeline with total_workers tasks
-    tokens = {name: 0.0 for name in weight_map}
+    dispatcher = WeightedRoundRobinDispatcher(weight_map)
     pending: set[asyncio.Task] = set()
 
     def _next_dispatch() -> tuple[str, int]:
         """Pick next (source, episode) using weighted round-robin."""
-        name = max(tokens, key=lambda n: weight_map[n] - tokens[n])
+        name = dispatcher.next()
         ep_idx = next(iterators[name])
-        tokens[name] += 1
-        if all(t >= weight_map[n] for n, t in tokens.items()):
-            for k in tokens:
-                tokens[k] = 0.0
         return name, ep_idx
 
     async def _poll_updates() -> None:
@@ -568,16 +565,16 @@ def _run_thread_pool(
         rng = random.Random(p.seed)
         iterators[p.source_name] = _episode_iterator(p.episode_indices, rng)
 
-    tokens = {p.source_name: 0.0 for p in producers}
     weight_map = {p.source_name: p.weight for p in producers}
     decode_map = {p.source_name: p.decode_fn for p in producers}
     offset_map = {p.source_name: p.episode_offset for p in producers}
+    dispatcher = WeightedRoundRobinDispatcher(weight_map)
 
     consecutive_failures = 0
     max_consecutive = 50
 
     while not stop_event.is_set():
-        name = max(tokens, key=lambda n: weight_map[n] - tokens[n])
+        name = dispatcher.next()
         ep_idx = next(iterators[name])
 
         try:
@@ -597,10 +594,6 @@ def _run_thread_pool(
 
         consecutive_failures = 0  # reset on success
         buffer.put(offset_map[name] + ep_idx, frames)
-
-        tokens[name] += 1
-        if all(t >= weight_map[n] for n, t in tokens.items()):
-            tokens = {n: 0.0 for n in tokens}
 
         if not warmup_event.is_set() and len(buffer) >= warmup_target:
             warmup_event.set()

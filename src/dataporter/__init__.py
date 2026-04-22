@@ -26,6 +26,7 @@ from .transformable_dataset import TransformableDataset
 from .timed_loader import TimedDataLoader
 from .dataset_wrappers import KeyFilterDataset, AugmentedDataset
 from .shuffle_buffer import ShuffleBuffer
+from ._blending import WeightedRoundRobinDispatcher
 from ._producer_pool_base import BaseProducerPool
 from .producer_pool import ProducerPool, AsyncProducer
 from .shuffle_buffer_dataset import ShuffleBufferDataset
@@ -134,6 +135,7 @@ __all__ = [
     'BaseProducerPool',
     'ProducerPool',
     'AsyncProducer',
+    'WeightedRoundRobinDispatcher',
     'ShuffleBufferDataset',
     'LeRobotShuffleBufferDataset',
     # Shuffle buffer (text pipeline)

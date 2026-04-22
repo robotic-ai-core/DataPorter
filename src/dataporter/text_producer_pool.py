@@ -42,6 +42,7 @@ from typing import Callable, Protocol
 
 import torch
 
+from ._producer_pool_base import BaseProducerPool
 from .token_shuffle_buffer import TokenShuffleBuffer
 
 logger = logging.getLogger(__name__)
@@ -321,17 +322,26 @@ def _spawn_pool_entry(
 # ---------------------------------------------------------------------------
 
 
-class TextProducerPool:
+class TextProducerPool(BaseProducerPool):
     """Background process that tokenizes shards into a TokenShuffleBuffer.
+
+    Inherits ``start``/``stop``/``wait_for_warmup``/``is_alive``/
+    ``_drain_error_queue`` from :class:`BaseProducerPool`.  Owns only
+    the modality-specific worker construction.
 
     Args:
         buffer: Shared-memory token buffer to fill.
         config: Producer config (shards, tokenize_fn, parallelism).
-        warmup_target: Wait until the buffer holds this many items before
-            ``wait_for_warmup`` returns.  Defaults to half the buffer
-            capacity — full capacity is aggressive and stalls startup on
-            slow tokenizers.
+        warmup_target: Wait until the buffer holds this many items
+            before ``wait_for_warmup`` returns.  Defaults to half the
+            buffer capacity — full capacity is aggressive and stalls
+            startup on slow tokenizers.
     """
+
+    # Text pool has no per-decode ffmpeg cold-start tax; 300s is
+    # plenty for warmup.  Overrides BaseProducerPool's 1200s video
+    # default.
+    _DEFAULT_WARMUP_TIMEOUT_S = 300.0
 
     def __init__(
         self,
@@ -347,16 +357,12 @@ class TextProducerPool:
         self._warmup_event = ctx.Event()
         self._stop_event = ctx.Event()
         self._error_queue = ctx.Queue()
+        self._update_queue = None   # text pool has no live-update path
         self._worker: mp.Process | None = None
 
-    def start(self) -> None:
-        if self._worker is not None and self._worker.is_alive():
-            raise RuntimeError("TextProducerPool already running")
-        self._stop_event.clear()
-        self._warmup_event.clear()
-
+    def _create_worker(self) -> mp.Process:
         ctx = mp.get_context("spawn")
-        self._worker = ctx.Process(
+        return ctx.Process(
             target=_spawn_pool_entry,
             args=(
                 self._buffer,
@@ -369,50 +375,3 @@ class TextProducerPool:
             daemon=True,
             name=f"text-producer-{self._config.source_name}",
         )
-        self._worker.start()
-
-    def wait_for_warmup(self, timeout: float = 300.0) -> None:
-        """Block until the buffer hits ``warmup_target``.
-
-        Errors reported by the child are re-raised here so they appear
-        in the parent's training log — child-process logger output
-        often doesn't reach the parent's handler.
-        """
-        if not self._warmup_event.wait(timeout=timeout):
-            child_error = self._drain_error_queue()
-            if child_error:
-                raise RuntimeError(
-                    f"TextProducerPool child failed: {child_error}"
-                )
-            raise TimeoutError(
-                f"TextProducerPool didn't fill {self._warmup_target} "
-                f"items in {timeout}s (have {len(self._buffer)})"
-            )
-        child_error = self._drain_error_queue()
-        if child_error:
-            raise RuntimeError(
-                f"TextProducerPool child failed: {child_error}"
-            )
-
-    def _drain_error_queue(self) -> str | None:
-        try:
-            return self._error_queue.get_nowait()
-        except Exception:
-            return None
-
-    @property
-    def error(self) -> str | None:
-        """Return the first queued error without consuming it."""
-        return self._drain_error_queue()
-
-    @property
-    def is_alive(self) -> bool:
-        return self._worker is not None and self._worker.is_alive()
-
-    def stop(self) -> None:
-        self._stop_event.set()
-        if self._worker is not None:
-            self._worker.join(timeout=10)
-            if self._worker.is_alive():
-                self._worker.terminate()
-            self._worker = None
