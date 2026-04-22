@@ -175,6 +175,15 @@ class BaseProducerPool(ABC):
         with an update queue (thread mode, or subclasses that disable
         live updates).
 
+        Safe to call from forked DataLoader workers: ``mp.Queue`` put
+        handles survive fork, and we deliberately *don't* check
+        ``is_alive`` here because that would invoke
+        ``mp.Process.is_alive()`` on a handle owned by the parent,
+        which raises ``AssertionError`` from any non-owning process.
+        If the pool is actually dead, ``put_nowait`` fails loudly with
+        the real exception — more informative than a pre-flight
+        ownership assertion.
+
         Args:
             source_name: Routing key — must match a
                 ``ProducerConfig.source_name`` the child knows about.
@@ -188,12 +197,6 @@ class BaseProducerPool(ABC):
                 "(pool constructed without an update queue)"
             )
             return
-        if not self.is_alive:
-            logger.warning(
-                f"{type(self).__name__}.update_episodes: worker not "
-                "running; start() the pool first or the message will "
-                "be lost"
-            )
         try:
             self._update_queue.put_nowait(
                 (source_name, list(new_episodes)),

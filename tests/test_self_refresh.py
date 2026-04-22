@@ -370,3 +370,234 @@ def test_pinned_len_survives_admission_growth_end_to_end(tmp_path):
     assert len(consumer) == pinned, (
         "pinned __len__ must not change when admission shrinks"
     )
+
+
+# ===========================================================================
+# Regression: Bug 1 — no-prefetcher + self_refresh must not wipe admission
+# ===========================================================================
+
+
+def test_self_refresh_on_local_only_source_preserves_admission(tmp_path):
+    """Regression for commit-305e35a wipe bug.
+
+    Repro: a source with a local ``root`` (no prefetcher) + train
+    episodes admitted at construction via ``train_episode_indices`` +
+    ``refresh_every_n_items`` set.  After N __getitem__ calls the
+    consumer must still have the admitted set — the old
+    ``_scan_ready_train_episodes_by_source`` enumerated
+    ``self._prefetchers`` and returned ``{}`` when none were attached,
+    which tripped ``_admit_by_source({})`` into wiping
+    ``_current_train_episodes``.
+
+    Under the shard-driven discovery design the scan uses
+    ``shard.list_ready_episodes()`` for every source, so static sources
+    return their own ready set and the wipe can no longer happen.
+    """
+    from dataporter import LeRobotShardSource, ResizeFrames
+    from dataporter.lerobot_shuffle_buffer_dataset import (
+        LeRobotShuffleBufferDataset,
+    )
+    from dataporter.shuffle_buffer import ShuffleBuffer
+
+    root = tmp_path / "ds"
+    _make_dataset(root, ready_eps=[0, 1, 2, 3], total_episodes=4)
+    src = LeRobotShardSource(root)
+
+    buf = ShuffleBuffer(
+        capacity=8, max_frames=32, channels=3, height=32, width=32,
+    )
+    # Fill buffer so __getitem__ can route.
+    for ep in [0, 1, 2, 3]:
+        buf.put(ep, torch.zeros((20, 3, 32, 32), dtype=torch.uint8))
+
+    consumer = LeRobotShuffleBufferDataset(
+        buffer=buf,
+        sources=[{
+            "shard_source": src,
+            "source_name": "local",
+            "episode_offset": 0,
+            "train_episode_indices": [0, 1, 2, 3],
+            "transform": None,
+        }],
+        delta_timestamps={},
+        prefetchers=[],   # local-only source — no prefetcher
+        producer_pool=None,
+        split_fn=lambda ep: True,
+        image_keys=["observation.image"],
+        refresh_every_n_items=5,
+    )
+
+    assert set(consumer._current_train_episodes) == {0, 1, 2, 3}
+
+    # Drive past the refresh threshold a few times.  Under the old
+    # scanner this wiped _current_train_episodes to [].
+    for _ in range(30):
+        _ = consumer[0]
+
+    assert set(consumer._current_train_episodes) == {0, 1, 2, 3}, (
+        f"self-refresh on a no-prefetcher source wiped admission to "
+        f"{consumer._current_train_episodes}"
+    )
+
+
+# ===========================================================================
+# Regression: Bug 2 — update_episodes must not raise cross-fork
+# ===========================================================================
+
+
+def _call_update_episodes_in_subprocess(conn, buffer, config) -> None:
+    """Run inside a spawned child: construct a ProducerPool whose
+    worker handle was created in ANOTHER process, then call
+    update_episodes.  Returns ``("ok", None)`` or ``("err", str)``.
+    """
+    from dataporter.producer_pool import ProducerPool
+    try:
+        pool = ProducerPool(
+            buffer, configs=[config], total_workers=1, warmup_target=1,
+        )
+        # Without start(), self._worker is None — is_alive() was the
+        # only path that would have raised the cross-fork assertion.
+        # Simulate a post-start state by monkeypatching to a stub
+        # Process handle whose is_alive() asserts on parent_pid.
+        import multiprocessing as _mp
+        import os as _os
+
+        class _FakeProcess:
+            _parent_pid = -1     # never matches real pid → would assert
+            def is_alive(self):
+                assert self._parent_pid == _os.getpid(), (
+                    "can only test a child process"
+                )
+                return True
+
+        pool._worker = _FakeProcess()
+        pool.update_episodes("synth", [0, 1, 2])
+        conn.send(("ok", None))
+    except Exception as e:
+        conn.send(("err", f"{type(e).__name__}: {e}"))
+    finally:
+        conn.close()
+
+
+def test_update_episodes_does_not_raise_cross_fork(tmp_path):
+    """Regression: update_episodes once called ``self.is_alive`` which
+    invoked ``mp.Process.is_alive()`` on a handle owned by the parent.
+    Any non-owning process got ``AssertionError: can only test a child
+    process``.  The fix drops the is_alive gate — queue puts survive
+    fork, and if the pool is dead, put_nowait fails with a real
+    exception.
+
+    This test simulates a forked worker by spawning a subprocess that
+    calls ``update_episodes`` on a pool whose ``_worker`` is a stub
+    whose ``is_alive()`` always asserts.  Under the old code this
+    would propagate the AssertionError out; under the fix
+    update_episodes never touches is_alive and the put goes through.
+    """
+    import multiprocessing as mp
+
+    from dataporter import LeRobotShardSource, ResizeFrames
+    from dataporter.producer_pool import ProducerConfig
+    from dataporter.shuffle_buffer import ShuffleBuffer
+
+    root = tmp_path / "ds"
+    _make_dataset(root, ready_eps=[0], total_episodes=1)
+    src = LeRobotShardSource(root)
+
+    buf = ShuffleBuffer(
+        capacity=2, max_frames=32, channels=3, height=32, width=32,
+    )
+    cfg = ProducerConfig.from_source(
+        source={"repo_id": "synth", "weight": 1.0},
+        shard_source=src,
+        iteration_episodes=[0],
+        producer_transform=ResizeFrames(32, 32),
+    )
+
+    ctx = mp.get_context("spawn")
+    parent_conn, child_conn = ctx.Pipe()
+    proc = ctx.Process(
+        target=_call_update_episodes_in_subprocess,
+        args=(child_conn, buf, cfg),
+    )
+    proc.start()
+    proc.join(timeout=30)
+    assert proc.exitcode == 0, f"subprocess exited with {proc.exitcode}"
+    status, msg = parent_conn.recv()
+    assert status == "ok", (
+        f"update_episodes raised in cross-process context: {msg}"
+    )
+
+
+# ===========================================================================
+# Mixed config: HF-prefetched source + local-root source discover together
+# ===========================================================================
+
+
+def test_mixed_prefetched_and_local_sources_discover_together(tmp_path):
+    """With one prefetched source and one local-only source, the scan
+    must discover ready episodes for BOTH — not just the prefetched
+    one.  The fix iterates self._sources (not self._prefetchers) so
+    each source's own shard_source drives discovery regardless of
+    whether it has an attached prefetcher.
+    """
+    from dataporter import LeRobotShardSource
+    from dataporter.lerobot_shuffle_buffer_dataset import (
+        LeRobotShuffleBufferDataset,
+    )
+    from dataporter.shuffle_buffer import ShuffleBuffer
+
+    root_hf = tmp_path / "hf_like"
+    root_local = tmp_path / "local"
+    _make_dataset(root_hf, ready_eps=[0, 1], total_episodes=10)
+    _make_dataset(root_local, ready_eps=[0, 1, 2], total_episodes=3)
+    shard_hf = LeRobotShardSource(root_hf)
+    shard_local = LeRobotShardSource(root_local)
+
+    # Prefetcher is a stand-in; only its is_done() is used by the
+    # consumer now (shard.list_ready_episodes() drives discovery).
+    prefetcher_hf = _LiveDiskPrefetcher(root_hf)
+
+    buf = ShuffleBuffer(
+        capacity=16, max_frames=32, channels=3, height=32, width=32,
+    )
+    # Fill buffer stubs so __getitem__ doesn't crash on route-miss.
+    for k in [0, 1, 100, 101, 102]:
+        buf.put(k, torch.zeros((20, 3, 32, 32), dtype=torch.uint8))
+
+    consumer = LeRobotShuffleBufferDataset(
+        buffer=buf,
+        sources=[
+            {
+                "shard_source": shard_hf,
+                "source_name": "hf",
+                "episode_offset": 0,
+                "transform": None,
+            },
+            {
+                "shard_source": shard_local,
+                "source_name": "local",
+                "episode_offset": 100,
+                "train_episode_indices": [0, 1, 2],   # static
+                "transform": None,
+            },
+        ],
+        delta_timestamps={},
+        prefetchers=[prefetcher_hf],   # only for the HF source
+        producer_pool=None,
+        split_fn=lambda ep: True,
+        image_keys=["observation.image"],
+    )
+
+    # Refresh should populate the HF source from disk and preserve the
+    # local source's static admission — NOT wipe either.
+    new_len = consumer.refresh(min_new=0)
+    admitted = set(consumer._current_train_episodes)
+    # HF source: raw ids 0, 1 → keys 0, 1
+    assert {0, 1} <= admitted, (
+        f"HF source's on-disk eps not admitted via scan; got {admitted}"
+    )
+    # Local source: raw ids 0, 1, 2 → keys 100, 101, 102
+    assert {100, 101, 102} <= admitted, (
+        f"Local source's static eps not admitted; got {admitted}"
+    )
+    assert new_len > 0

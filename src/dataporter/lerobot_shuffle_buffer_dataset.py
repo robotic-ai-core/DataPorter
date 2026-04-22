@@ -271,18 +271,31 @@ class LeRobotShuffleBufferDataset(Dataset):
     def _scan_ready_train_episodes_by_source(self) -> dict[str, list[int]]:
         """Per-source lists of currently-ready raw episode ids in train.
 
-        Keyed by ``source_name``; values are sorted raw ids whose
-        ``split_fn`` is True.  Structured by source so ``_admit_by_source``
-        can route without re-deriving source attribution from the offset
-        (which depends on the trusted-but-fallible ``info.json``).
+        Discovery goes through :meth:`LeRobotShardSource.list_ready_episodes`
+        — the READER view of disk state — for every source.  This works
+        uniformly for three cases:
+
+        - Static (pre-populated local root, no prefetcher): the shard
+          scans whatever is on disk right now.  refresh() is effectively
+          idempotent in this case; admission doesn't change.
+        - Dynamic (HF-prefetched): the prefetcher writes, the shard
+          reads.  New episodes show up on the next scan.
+        - Mixed (some of each): no special-casing — every source uses
+          the same discovery path through its own shard.
+
+        The prefetcher is a pure writer in this design.  Its own
+        ``ready_episodes`` stays for internal min-ready gating but is
+        no longer part of the consumer's read contract — see
+        :class:`EpisodicPrefetcher` Protocol in ``interfaces.py``, which
+        intentionally only requires ``is_done()`` for bounded-wait
+        refresh semantics.
         """
         out: dict[str, list[int]] = {}
-        for src_idx, pf in enumerate(self._prefetchers):
-            if src_idx >= len(self._source_names):
-                continue
+        for src_idx, src in enumerate(self._sources):
             name = self._source_names[src_idx]
+            shard = src["shard_source"]
             ready = [
-                raw for raw in pf.ready_episodes()
+                raw for raw in shard.list_ready_episodes()
                 if self._split_fn(raw)
             ]
             out[name] = sorted(set(ready))
@@ -300,7 +313,23 @@ class LeRobotShuffleBufferDataset(Dataset):
         Source attribution is supplied by the caller so routing never
         depends on ``info.json``'s ``total_episodes`` (which can lie —
         stale downloads, in-flight updates, etc.).
+
+        Defensive guard: an empty ``per_source`` dict that would clear a
+        non-empty admitted set is treated as a no-op.  The scan path
+        (:meth:`_scan_ready_train_episodes_by_source`) no longer produces
+        this shape thanks to shard-driven discovery, but external
+        callers may still hand us ``{}`` — don't wipe state on empty
+        input.
         """
+        if not per_source and self._current_train_episodes:
+            logger.debug(
+                "LeRobotShuffleBufferDataset._admit_by_source: empty "
+                "per_source would wipe %d admitted episodes; treating as "
+                "no-op",
+                len(self._current_train_episodes),
+            )
+            return
+
         # Flat canonical form for idempotence check + sampling routing.
         flat: list[int] = []
         ep_to_source: dict[int, int] = {}

@@ -29,6 +29,7 @@ import logging
 import shutil
 import threading
 import time
+from typing import Callable
 from pathlib import Path
 
 import numpy as np
@@ -197,22 +198,38 @@ class _ControlledFakePrefetcher(LeRobotPrefetcher):
 
 
 class _MiniShardSource:
-    """Stand-in for LeRobotShardSource exposing only what the consumer
-    needs: ``fps``, ``total_episodes``, ``episode_frame_count``, and the
-    row/window loaders.  ``refresh()`` only needs frame_count for each
-    admitted raw id; ``__getitem__`` (not exercised in most refresh
-    tests) needs the row/window loaders to return plausible tensors.
+    """Stand-in for LeRobotShardSource exposing what the consumer
+    needs: ``fps``, ``total_episodes``, ``episode_frame_count``,
+    ``list_ready_episodes`` (readiness view), ``tasks``, and the
+    row/window loaders.
+
+    ``list_ready_episodes`` can be wired to an external callable
+    (typically ``prefetcher.ready_episodes``) so tests that simulate
+    download cadence can drive readiness from the prefetcher side; if
+    omitted it defaults to "all nominally-declared episodes are ready"
+    which is the right answer for static-config tests.
     """
 
-    def __init__(self, frames_per_episode: int = 300, num_episodes: int = 50):
+    def __init__(
+        self,
+        frames_per_episode: int = 300,
+        num_episodes: int = 50,
+        ready_source: Callable[[], list[int]] | None = None,
+    ):
         self.fps = 30
         self.root = Path("/tmp/mini")
         self._frames_per_episode = frames_per_episode
         self._num_episodes = num_episodes
+        self._ready_source = ready_source
 
     @property
     def total_episodes(self) -> int:
         return self._num_episodes
+
+    def list_ready_episodes(self) -> list[int]:
+        if self._ready_source is not None:
+            return sorted(set(self._ready_source()))
+        return list(range(self._num_episodes))
 
     def episode_frame_count(self, raw_ep: int) -> int:
         return self._frames_per_episode
@@ -305,10 +322,19 @@ def _build_dataset(
     default_min_new: int = 0,
     source_name: str = "test",
 ) -> "LeRobotShuffleBufferDataset":
-    """Construct a dataset with the new refresh-capable signature."""
+    """Construct a dataset with the new refresh-capable signature.
+
+    The mock shard source's ``list_ready_episodes`` is wired to the
+    test prefetcher's ``ready_episodes`` so the shard reflects what the
+    prefetcher has "made ready" — matching the real pipeline's
+    design where the shard scans the disk the prefetcher has written.
+    """
     from dataporter.lerobot_shuffle_buffer_dataset import (
         LeRobotShuffleBufferDataset,
     )
+    # Wire shard readiness to the prefetcher's scan — the new
+    # consumer queries shard.list_ready_episodes().
+    mini_source._ready_source = prefetcher.ready_episodes
     buffer = ShuffleBuffer(
         capacity=16, max_frames=8, channels=3, height=8, width=8,
     )
