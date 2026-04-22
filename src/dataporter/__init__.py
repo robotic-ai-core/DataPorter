@@ -39,6 +39,12 @@ from .frame_transforms import (
     ResizeFrames, FrameCompose, probe_output_shape,
 )
 from .lerobot_shard_source import LeRobotShardSource
+from .interfaces import (
+    EpisodicSource,
+    TemporalEpisodicSource,
+    EpisodicPrefetcher,
+    ProducerConfigProtocol,
+)
 
 # Lazy imports for optional dependencies (lerobot, lightning)
 def __getattr__(name):
@@ -117,6 +123,11 @@ __all__ = [
     'probe_output_shape',
     # Live, lazy LeRobot shard source
     'LeRobotShardSource',
+    # Public Protocols (structural-typing contracts for extension)
+    'EpisodicSource',
+    'TemporalEpisodicSource',
+    'EpisodicPrefetcher',
+    'ProducerConfigProtocol',
     # Shuffle buffer (video pipeline)
     'ShuffleBuffer',
     'ProducerPool',

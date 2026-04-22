@@ -167,6 +167,19 @@ class LeRobotShardSource:
             if feat.get("dtype") == "video"
         ]
 
+    # ``media_keys`` / ``episode_media_path`` are modality-neutral
+    # aliases for ``video_keys`` / ``episode_video_path``.  They exist
+    # so this class satisfies the :class:`TemporalEpisodicSource`
+    # Protocol without forcing the video-specific name into the
+    # interface contract.  An audio or point-cloud source would expose
+    # the same two names on top of domain-specific accessors.
+    @property
+    def media_keys(self) -> list[str]:
+        return self.video_keys
+
+    def episode_media_path(self, raw_ep: int, media_key: str) -> Path:
+        return self.episode_video_path(raw_ep, media_key)
+
     @property
     def data_path_template(self) -> str:
         return self._info.get("data_path", _DEFAULT_DATA_PATH)
