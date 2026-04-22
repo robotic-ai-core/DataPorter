@@ -1,6 +1,6 @@
 """Tests for LeRobotShuffleBufferDataset.
 
-Uses mock datasets (no real video/HF downloads) to validate:
+Uses mock shard sources (no real video/HF downloads) to validate:
 - Episode -> source mapping
 - Delta timestamps windowing
 - Frame extraction from buffer
@@ -11,8 +11,7 @@ Uses mock datasets (no real video/HF downloads) to validate:
 from __future__ import annotations
 
 import random
-from collections import OrderedDict
-from unittest.mock import MagicMock
+from pathlib import Path
 
 import pytest
 import torch
@@ -26,65 +25,74 @@ from dataporter.lerobot_shuffle_buffer_dataset import LeRobotShuffleBufferDatase
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _make_mock_dataset(
-    num_episodes: int = 5,
-    frames_per_episode: int = 20,
-    fps: int = 10,
-    num_tasks: int = 1,
-) -> MagicMock:
-    """Create a mock FastLeRobotDataset with deterministic data."""
-    ds = MagicMock()
-    ds.fps = fps
-    ds.tolerance_s = 0.04
-    ds.video_backend = "pyav"
-    ds.root = MagicMock()
-    ds.meta = MagicMock()
-    ds.meta.fps = fps
-    ds.meta.video_keys = ["observation.image"]
-    ds.meta.tasks = {i: f"task_{i}" for i in range(num_tasks)}
 
-    # Episode data index: contiguous ranges
-    froms = [i * frames_per_episode for i in range(num_episodes)]
-    tos = [(i + 1) * frames_per_episode for i in range(num_episodes)]
-    ds.episode_data_index = {
-        "from": torch.tensor(froms),
-        "to": torch.tensor(tos),
-    }
+class _MockShardSource:
+    """Minimal in-memory LeRobotShardSource-compatible shim for tests.
 
-    # Mock HF dataset: returns deterministic values by index
-    def hf_getitem(idx):
-        ep_idx = idx // frames_per_episode
-        frame_idx = idx % frames_per_episode
+    Satisfies the narrow interface the consumer uses:
+    ``fps``, ``total_episodes``, ``episode_frame_count``,
+    ``load_episode_row_torch``, ``load_episode_window_torch``, ``tasks``.
+    Deterministic per-(ep, frame) content so tests can assert exact values.
+    """
+
+    def __init__(
+        self,
+        num_episodes: int = 5,
+        frames_per_episode: int = 20,
+        fps: int = 10,
+        num_tasks: int = 1,
+        seed: int = 0,
+    ):
+        self._num_episodes = num_episodes
+        self._frames_per_episode = frames_per_episode
+        self.fps = fps
+        self.root = Path("/tmp/_mock_shard_source")
+        self._rng_seed = seed
+        self._num_tasks = num_tasks
+
+    @property
+    def total_episodes(self) -> int:
+        return self._num_episodes
+
+    def episode_frame_count(self, raw_ep: int) -> int:
+        return self._frames_per_episode
+
+    def _row(self, ep_idx: int, frame_idx: int) -> dict:
+        g = torch.Generator().manual_seed(
+            self._rng_seed + ep_idx * 1000 + frame_idx,
+        )
         return {
             "episode_index": torch.tensor(ep_idx),
             "frame_index": torch.tensor(frame_idx),
-            "timestamp": torch.tensor(frame_idx / fps),
+            "timestamp": torch.tensor(frame_idx / self.fps),
             "task_index": torch.tensor(0),
-            "index": torch.tensor(idx),
-            "action": torch.randn(2),
-            "observation.state": torch.randn(4),
+            "index": torch.tensor(
+                ep_idx * self._frames_per_episode + frame_idx
+            ),
+            "action": torch.randn(2, generator=g),
+            "observation.state": torch.randn(4, generator=g),
         }
 
-    # Use a simple wrapper class so __getitem__ works correctly with MagicMock
-    class MockHfDataset:
-        def __getitem__(self, idx):
-            return hf_getitem(idx)
+    def load_episode_row_torch(
+        self, raw_ep: int, frame_idx: int,
+    ) -> dict:
+        return self._row(raw_ep, frame_idx)
 
-    ds.hf_dataset = MockHfDataset()
+    def load_episode_window_torch(
+        self, raw_ep: int, frame_indices: list[int],
+    ) -> dict:
+        rows = [self._row(raw_ep, i) for i in frame_indices]
+        stacked: dict = {}
+        for key in rows[0]:
+            stacked[key] = torch.stack([r[key] for r in rows])
+        return stacked
 
-    # Mock _query_hf_dataset for windowed non-video data
-    def query_hf_dataset(query_indices):
-        result = {}
-        for key, indices in query_indices.items():
-            if key == "observation.image":
-                continue
-            rows = [hf_getitem(i) for i in indices]
-            result[key] = torch.stack([r[key] for r in rows])
-        return result
+    def tasks(self) -> dict[int, str]:
+        return {i: f"task_{i}" for i in range(self._num_tasks)}
 
-    ds._query_hf_dataset = query_hf_dataset
 
-    return ds
+# Keep the old helper name as a thin alias so tests don't rename en masse.
+_make_mock_shard_source = _MockShardSource
 
 
 def _fill_buffer(
@@ -114,13 +122,13 @@ class TestLeRobotShuffleBufferDataset:
         buffer = ShuffleBuffer(
             capacity=10, max_frames=20, channels=3, height=8, width=8,
         )
-        ds = _make_mock_dataset(num_episodes=5, frames_per_episode=20)
+        ds = _make_mock_shard_source(num_episodes=5, frames_per_episode=20)
         _fill_buffer(buffer, num_episodes=5, frames_per_episode=20)
 
         dataset = LeRobotShuffleBufferDataset(
             buffer=buffer,
             sources=[{
-                "dataset": ds,
+                "shard_source": ds,
                 "train_episode_indices": list(range(5)),
                 "transform": None,
             }],
@@ -147,7 +155,7 @@ class TestLeRobotShuffleBufferDataset:
         buffer = ShuffleBuffer(
             capacity=10, max_frames=20, channels=3, height=8, width=8,
         )
-        ds = _make_mock_dataset(num_episodes=5, frames_per_episode=20)
+        ds = _make_mock_shard_source(num_episodes=5, frames_per_episode=20)
         _fill_buffer(buffer, num_episodes=5, frames_per_episode=20)
 
         delta_ts = {
@@ -159,7 +167,7 @@ class TestLeRobotShuffleBufferDataset:
         dataset = LeRobotShuffleBufferDataset(
             buffer=buffer,
             sources=[{
-                "dataset": ds,
+                "shard_source": ds,
                 "train_episode_indices": list(range(5)),
                 "transform": None,
             }],
@@ -180,8 +188,8 @@ class TestLeRobotShuffleBufferDataset:
             capacity=20, max_frames=10, channels=3, height=8, width=8,
         )
 
-        ds_a = _make_mock_dataset(num_episodes=5, frames_per_episode=10)
-        ds_b = _make_mock_dataset(num_episodes=3, frames_per_episode=10)
+        ds_a = _make_mock_shard_source(num_episodes=5, frames_per_episode=10)
+        ds_b = _make_mock_shard_source(num_episodes=3, frames_per_episode=10)
 
         # Fill buffer with episodes 0-4 (source A) and 0-2 (source B)
         for ep_idx in range(5):
@@ -207,18 +215,18 @@ class TestLeRobotShuffleBufferDataset:
         for ep_idx in range(5, 8):
             buffer_b.put(ep_idx, torch.full((10, 3, 8, 8), 20, dtype=torch.uint8))
 
-        ds_b2 = _make_mock_dataset(num_episodes=8, frames_per_episode=10)
+        ds_b2 = _make_mock_shard_source(num_episodes=8, frames_per_episode=10)
 
         dataset = LeRobotShuffleBufferDataset(
             buffer=buffer_b,
             sources=[
                 {
-                    "dataset": ds_a,
+                    "shard_source": ds_a,
                     "train_episode_indices": list(range(5)),
                     "transform": None,
                 },
                 {
-                    "dataset": ds_b2,
+                    "shard_source": ds_b2,
                     "train_episode_indices": list(range(5, 8)),
                     "transform": None,
                 },
@@ -243,7 +251,7 @@ class TestLeRobotShuffleBufferDataset:
         buffer = ShuffleBuffer(
             capacity=10, max_frames=10, channels=3, height=8, width=8,
         )
-        ds = _make_mock_dataset(num_episodes=3, frames_per_episode=10)
+        ds = _make_mock_shard_source(num_episodes=3, frames_per_episode=10)
         _fill_buffer(buffer, num_episodes=3, frames_per_episode=10)
 
         transform_called = []
@@ -256,7 +264,7 @@ class TestLeRobotShuffleBufferDataset:
         dataset = LeRobotShuffleBufferDataset(
             buffer=buffer,
             sources=[{
-                "dataset": ds,
+                "shard_source": ds,
                 "train_episode_indices": list(range(3)),
                 "transform": mock_transform,
             }],
@@ -274,13 +282,13 @@ class TestLeRobotShuffleBufferDataset:
         buffer = ShuffleBuffer(
             capacity=10, max_frames=10, channels=3, height=8, width=8,
         )
-        ds = _make_mock_dataset(num_episodes=3, frames_per_episode=10)
+        ds = _make_mock_shard_source(num_episodes=3, frames_per_episode=10)
         _fill_buffer(buffer, num_episodes=3, frames_per_episode=10)
 
         dataset = LeRobotShuffleBufferDataset(
             buffer=buffer,
             sources=[{
-                "dataset": ds,
+                "shard_source": ds,
                 "train_episode_indices": list(range(3)),
                 "transform": None,
             }],
@@ -297,7 +305,7 @@ class TestLeRobotShuffleBufferDataset:
         buffer = ShuffleBuffer(
             capacity=10, max_frames=10, channels=3, height=8, width=8,
         )
-        ds = _make_mock_dataset(num_episodes=3, frames_per_episode=10)
+        ds = _make_mock_shard_source(num_episodes=3, frames_per_episode=10)
 
         # Fill with known uint8 values
         for ep_idx in range(3):
@@ -307,7 +315,7 @@ class TestLeRobotShuffleBufferDataset:
         dataset = LeRobotShuffleBufferDataset(
             buffer=buffer,
             sources=[{
-                "dataset": ds,
+                "shard_source": ds,
                 "train_episode_indices": list(range(3)),
                 "transform": None,
             }],
@@ -329,7 +337,7 @@ class TestLeRobotShuffleBufferDataset:
         buffer = ShuffleBuffer(
             capacity=10, max_frames=10, channels=3, height=8, width=8,
         )
-        ds = _make_mock_dataset(num_episodes=3, frames_per_episode=10)
+        ds = _make_mock_shard_source(num_episodes=3, frames_per_episode=10)
         _fill_buffer(buffer, num_episodes=3, frames_per_episode=10)
 
         # Use negative deltas that will go before episode start
@@ -341,7 +349,7 @@ class TestLeRobotShuffleBufferDataset:
         dataset = LeRobotShuffleBufferDataset(
             buffer=buffer,
             sources=[{
-                "dataset": ds,
+                "shard_source": ds,
                 "train_episode_indices": list(range(3)),
                 "transform": None,
             }],
@@ -360,13 +368,13 @@ class TestLeRobotShuffleBufferDataset:
         buffer = ShuffleBuffer(
             capacity=10, max_frames=10, channels=3, height=8, width=8,
         )
-        ds = _make_mock_dataset(num_episodes=5, frames_per_episode=10)
+        ds = _make_mock_shard_source(num_episodes=5, frames_per_episode=10)
         _fill_buffer(buffer, num_episodes=5, frames_per_episode=10)
 
         dataset = LeRobotShuffleBufferDataset(
             buffer=buffer,
             sources=[{
-                "dataset": ds,
+                "shard_source": ds,
                 "train_episode_indices": list(range(5)),
                 "transform": None,
             }],
@@ -390,13 +398,13 @@ class TestLeRobotShuffleBufferDataset:
         buffer = ShuffleBuffer(
             capacity=20, max_frames=10, channels=3, height=8, width=8,
         )
-        ds = _make_mock_dataset(num_episodes=10, frames_per_episode=10)
+        ds = _make_mock_shard_source(num_episodes=10, frames_per_episode=10)
         _fill_buffer(buffer, num_episodes=10, frames_per_episode=10)
 
         dataset = LeRobotShuffleBufferDataset(
             buffer=buffer,
             sources=[{
-                "dataset": ds,
+                "shard_source": ds,
                 "train_episode_indices": list(range(10)),
                 "transform": None,
             }],
@@ -431,13 +439,13 @@ class TestLeRobotShuffleBufferDataset:
         buffer = ShuffleBuffer(
             capacity=5, max_frames=5, channels=3, height=8, width=8,
         )
-        ds = _make_mock_dataset(num_episodes=3, frames_per_episode=5)
+        ds = _make_mock_shard_source(num_episodes=3, frames_per_episode=5)
         _fill_buffer(buffer, num_episodes=3, frames_per_episode=5)
 
         dataset = LeRobotShuffleBufferDataset(
             buffer=buffer,
             sources=[{
-                "dataset": ds,
+                "shard_source": ds,
                 "train_episode_indices": list(range(3)),
                 "transform": None,
             }],

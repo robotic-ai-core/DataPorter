@@ -298,10 +298,11 @@ class TestVideoPathResolution:
             captured_paths.append(str(video_path))
             return torch.zeros(10, 3, 96, 96)
 
+        from dataporter.lerobot_shard_source import LeRobotShardSource
         config = ProducerConfig(
             source_name="test",
             repo_id="test/repo",
-            source_root=str(tmp_path),
+            shard_source=LeRobotShardSource(tmp_path),
             episode_indices=[0],
         )
         decode_fn = _make_child_decode_fn(config)

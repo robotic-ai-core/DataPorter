@@ -20,6 +20,7 @@ from __future__ import annotations
 import random
 import time
 from collections import Counter
+from pathlib import Path
 
 import pytest
 import torch
@@ -27,7 +28,6 @@ import torch
 from dataporter.producer_pool import AsyncProducer, ProducerPool
 from dataporter.shuffle_buffer import ShuffleBuffer
 from dataporter.lerobot_shuffle_buffer_dataset import LeRobotShuffleBufferDataset
-from unittest.mock import MagicMock
 
 
 # ---------------------------------------------------------------------------
@@ -62,60 +62,59 @@ def _make_frames(
     return torch.full((n_frames, c, h, w), fill_value, dtype=torch.uint8)
 
 
+class _MockShardSource:
+    """Minimal LeRobotShardSource shim for multisource attribution tests."""
+
+    def __init__(
+        self,
+        num_episodes: int = 5,
+        frames_per_episode: int = 10,
+        fps: int = 10,
+    ):
+        self.fps = fps
+        self.root = Path("/tmp/_multisource_mock")
+        self._num_episodes = num_episodes
+        self._frames_per_episode = frames_per_episode
+
+    @property
+    def total_episodes(self) -> int:
+        return self._num_episodes
+
+    def episode_frame_count(self, raw_ep: int) -> int:
+        return self._frames_per_episode
+
+    def _row(self, ep_idx: int, frame_idx: int) -> dict:
+        return {
+            "episode_index": torch.tensor(ep_idx),
+            "frame_index": torch.tensor(frame_idx),
+            "timestamp": torch.tensor(frame_idx / self.fps),
+            "task_index": torch.tensor(0),
+            "action": torch.zeros(2),
+            "observation.state": torch.zeros(4),
+        }
+
+    def load_episode_row_torch(self, raw_ep: int, frame_idx: int) -> dict:
+        return self._row(raw_ep, frame_idx)
+
+    def load_episode_window_torch(
+        self, raw_ep: int, frame_indices: list[int],
+    ) -> dict:
+        rows = [self._row(raw_ep, i) for i in frame_indices]
+        return {
+            key: torch.stack([r[key] for r in rows]) for key in rows[0]
+        }
+
+    def tasks(self) -> dict[int, str]:
+        return {0: "task_0"}
+
+
 def _make_mock_dataset(
     num_episodes: int = 5,
     frames_per_episode: int = 10,
     fps: int = 10,
-) -> MagicMock:
-    """Lightweight mock FastLeRobotDataset for source attribution tests."""
-    ds = MagicMock()
-    ds.fps = fps
-    ds.tolerance_s = 0.04
-    ds.video_backend = "pyav"
-    ds.root = MagicMock()
-    ds.meta = MagicMock()
-    ds.meta.fps = fps
-    ds.meta.video_keys = ["observation.image"]
-    ds.meta.tasks = {0: "task_0"}
-
-    froms = [i * frames_per_episode for i in range(num_episodes)]
-    tos = [(i + 1) * frames_per_episode for i in range(num_episodes)]
-    ds.episode_data_index = {
-        "from": torch.tensor(froms),
-        "to": torch.tensor(tos),
-    }
-
-    def hf_getitem(idx):
-        ep_idx = idx // frames_per_episode
-        frame_idx = idx % frames_per_episode
-        return {
-            "episode_index": torch.tensor(ep_idx),
-            "frame_index": torch.tensor(frame_idx),
-            "timestamp": torch.tensor(frame_idx / fps),
-            "task_index": torch.tensor(0),
-            "index": torch.tensor(idx),
-            "action": torch.randn(2),
-            "observation.state": torch.randn(4),
-        }
-
-    class MockHfDataset:
-        def __getitem__(self, idx):
-            return hf_getitem(idx)
-
-    ds.hf_dataset = MockHfDataset()
-
-    def query_hf_dataset(query_indices):
-        result = {}
-        for key, indices in query_indices.items():
-            if key == "observation.image":
-                continue
-            rows = [hf_getitem(i) for i in indices]
-            result[key] = torch.stack([r[key] for r in rows])
-        return result
-
-    ds._query_hf_dataset = query_hf_dataset
-
-    return ds
+):
+    """Back-compat helper — returns a shard-source-shaped mock."""
+    return _MockShardSource(num_episodes, frames_per_episode, fps)
 
 
 # ---------------------------------------------------------------------------
@@ -264,13 +263,13 @@ class TestSourceAttributionAccuracy:
 
         sources = [
             {
-                "dataset": ds_a,
+                "shard_source": ds_a,
                 "train_episode_indices": [0, 1, 2, 3, 4],
                 "episode_offset": 0,
                 "transform": None,
             },
             {
-                "dataset": ds_b,
+                "shard_source": ds_b,
                 "train_episode_indices": [0, 1, 2, 3, 4],
                 "episode_offset": 5,
                 "transform": None,
@@ -425,13 +424,13 @@ class TestAllSourcesRepresented:
             buffer=buf,
             sources=[
                 {
-                    "dataset": ds_a,
+                    "shard_source": ds_a,
                     "train_episode_indices": list(range(5)),
                     "episode_offset": 0,
                     "transform": None,
                 },
                 {
-                    "dataset": ds_b,
+                    "shard_source": ds_b,
                     "train_episode_indices": list(range(5)),
                     "episode_offset": 5,
                     "transform": None,

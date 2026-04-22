@@ -191,53 +191,56 @@ class _ControlledFakePrefetcher(LeRobotPrefetcher):
 
 
 # ---------------------------------------------------------------------------
-# Minimal stand-in for FastLeRobotDataset sufficient for refresh() logic.
-# Avoids a full arrow load.
+# Minimal stand-in for LeRobotShardSource sufficient for refresh() logic.
+# Avoids a full on-disk dataset layout.
 # ---------------------------------------------------------------------------
 
 
-class _MiniDataset:
-    """Stand-in for FastLeRobotDataset exposing only what refresh() needs.
-
-    ``refresh()`` reads ``episode_data_index["from"] / ["to"]`` to compute
-    per-episode frame counts → epoch_length, and ``hf_dataset[idx]`` is
-    used by ``__getitem__`` (not exercised in most refresh tests).
+class _MiniShardSource:
+    """Stand-in for LeRobotShardSource exposing only what the consumer
+    needs: ``fps``, ``total_episodes``, ``episode_frame_count``, and the
+    row/window loaders.  ``refresh()`` only needs frame_count for each
+    admitted raw id; ``__getitem__`` (not exercised in most refresh
+    tests) needs the row/window loaders to return plausible tensors.
     """
 
     def __init__(self, frames_per_episode: int = 300, num_episodes: int = 50):
-        from unittest.mock import MagicMock
         self.fps = 30
-        self.tolerance_s = 0.04
-        self.video_backend = "pyav"
         self.root = Path("/tmp/mini")
-        self.meta = MagicMock()
-        self.meta.fps = 30
-        self.meta.video_keys = ["observation.image"]
-        self.meta.tasks = {0: "push"}
-        froms = [i * frames_per_episode for i in range(num_episodes)]
-        tos = [(i + 1) * frames_per_episode for i in range(num_episodes)]
-        self.episode_data_index = {
-            "from": torch.tensor(froms),
-            "to": torch.tensor(tos),
+        self._frames_per_episode = frames_per_episode
+        self._num_episodes = num_episodes
+
+    @property
+    def total_episodes(self) -> int:
+        return self._num_episodes
+
+    def episode_frame_count(self, raw_ep: int) -> int:
+        return self._frames_per_episode
+
+    def _row(self, ep_idx: int, frame_idx: int) -> dict:
+        return {
+            "episode_index": torch.tensor(ep_idx),
+            "frame_index": torch.tensor(frame_idx),
+            "timestamp": torch.tensor(frame_idx / self.fps),
+            "task_index": torch.tensor(0),
+            "action": torch.zeros(2),
+            "observation.state": torch.zeros(2),
         }
 
-        class _HF:
-            def __getitem__(self_inner, idx):
-                return {
-                    "episode_index": torch.tensor(idx // frames_per_episode),
-                    "frame_index": torch.tensor(idx % frames_per_episode),
-                    "timestamp": torch.tensor(
-                        (idx % frames_per_episode) / 30.0
-                    ),
-                    "task_index": torch.tensor(0),
-                    "action": torch.zeros(2),
-                    "observation.state": torch.zeros(2),
-                }
+    def load_episode_row_torch(self, raw_ep: int, frame_idx: int) -> dict:
+        return self._row(raw_ep, frame_idx)
 
-        self.hf_dataset = _HF()
+    def load_episode_window_torch(
+        self, raw_ep: int, frame_indices: list[int],
+    ) -> dict:
+        rows = [self._row(raw_ep, i) for i in frame_indices]
+        return {
+            key: torch.stack([r[key] for r in rows])
+            for key in rows[0]
+        }
 
-    def _query_hf_dataset(self, query_indices):
-        return {}
+    def tasks(self) -> dict[int, str]:
+        return {0: "push"}
 
 
 # ---------------------------------------------------------------------------
@@ -286,8 +289,8 @@ def pool():
 
 
 @pytest.fixture
-def mini_dataset():
-    return _MiniDataset(frames_per_episode=300, num_episodes=50)
+def mini_source():
+    return _MiniShardSource(frames_per_episode=300, num_episodes=50)
 
 
 def _train_split(ep_idx: int) -> bool:
@@ -298,7 +301,7 @@ def _train_split(ep_idx: int) -> bool:
 def _build_dataset(
     prefetcher,
     pool,
-    mini_dataset,
+    mini_source,
     default_min_new: int = 0,
     source_name: str = "test",
 ) -> "LeRobotShuffleBufferDataset":
@@ -310,7 +313,7 @@ def _build_dataset(
         capacity=16, max_frames=8, channels=3, height=8, width=8,
     )
     sources = [{
-        "dataset": mini_dataset,
+        "shard_source": mini_source,
         "source_name": source_name,
         "episode_offset": 0,
         "transform": None,
@@ -348,13 +351,13 @@ class TestBugReproduction:
     """
 
     def test_length_grows_after_new_episodes_admitted(
-        self, prefetcher, pool, mini_dataset,
+        self, prefetcher, pool, mini_source,
     ):
         """The original frozen-set bug, inverted.  Before the fix this
         assertion would fail — __len__ stayed constant forever.
         """
         prefetcher.make_ready(list(range(10)))
-        dataset = _build_dataset(prefetcher, pool, mini_dataset)
+        dataset = _build_dataset(prefetcher, pool, mini_source)
         dataset.refresh()
         initial_len = len(dataset)
         assert initial_len > 0
@@ -368,13 +371,13 @@ class TestBugReproduction:
         )
 
     def test_new_episodes_reach_producer_pool(
-        self, prefetcher, pool, mini_dataset,
+        self, prefetcher, pool, mini_source,
     ):
         """refresh() must forward the admitted list to the pool so decode
         work reflects the new episodes.
         """
         prefetcher.make_ready(list(range(10)))
-        dataset = _build_dataset(prefetcher, pool, mini_dataset)
+        dataset = _build_dataset(prefetcher, pool, mini_source)
         dataset.refresh()
         pool.update_calls.clear()
 
@@ -401,18 +404,18 @@ class TestBugReproduction:
 class TestRefreshHappyPath:
 
     def test_refresh_admits_new_episodes(
-        self, prefetcher, pool, mini_dataset,
+        self, prefetcher, pool, mini_source,
     ):
         prefetcher.make_ready([0, 1, 2, 3, 4])
-        dataset = _build_dataset(prefetcher, pool, mini_dataset)
+        dataset = _build_dataset(prefetcher, pool, mini_source)
         dataset.refresh()
         assert len(dataset) > 0
 
     def test_refresh_min_new_blocks_until_available(
-        self, prefetcher, pool, mini_dataset,
+        self, prefetcher, pool, mini_source,
     ):
         prefetcher.make_ready([0, 1, 2])
-        dataset = _build_dataset(prefetcher, pool, mini_dataset)
+        dataset = _build_dataset(prefetcher, pool, mini_source)
         dataset.refresh()       # admits the 3 ready
 
         def delayed_admit():
@@ -434,13 +437,13 @@ class TestRefreshHappyPath:
         assert len(dataset._current_train_episodes) >= 6
 
     def test_refresh_min_new_returns_early_when_prefetcher_done(
-        self, prefetcher, pool, mini_dataset,
+        self, prefetcher, pool, mini_source,
     ):
         """The critical edge case: refresh must NOT block when there are
         no more episodes coming.
         """
         prefetcher.make_ready([0, 1, 2])
-        dataset = _build_dataset(prefetcher, pool, mini_dataset)
+        dataset = _build_dataset(prefetcher, pool, mini_source)
         dataset.refresh()
         prefetcher.mark_complete()
 
@@ -456,9 +459,9 @@ class TestRefreshHappyPath:
         )
         assert result == len(dataset)
 
-    def test_refresh_timeout_fires(self, prefetcher, pool, mini_dataset):
+    def test_refresh_timeout_fires(self, prefetcher, pool, mini_source):
         prefetcher.make_ready([0, 1])
-        dataset = _build_dataset(prefetcher, pool, mini_dataset)
+        dataset = _build_dataset(prefetcher, pool, mini_source)
         dataset.refresh()
 
         t0 = time.monotonic()
@@ -470,13 +473,13 @@ class TestRefreshHappyPath:
         )
 
     def test_refresh_respects_stable_split(
-        self, prefetcher, pool, mini_dataset,
+        self, prefetcher, pool, mini_source,
     ):
         """Every admitted episode satisfies the split predicate; val-bucket
         (ep_idx % 10 == 9) episodes never leak into the train set.
         """
         prefetcher.make_ready(list(range(30)))
-        dataset = _build_dataset(prefetcher, pool, mini_dataset)
+        dataset = _build_dataset(prefetcher, pool, mini_source)
         dataset.refresh()
 
         admitted = set(dataset._current_train_episodes)
@@ -486,10 +489,10 @@ class TestRefreshHappyPath:
         assert {0, 1, 2, 10, 11, 20}.issubset(admitted)
 
     def test_refresh_noop_when_min_new_zero(
-        self, prefetcher, pool, mini_dataset,
+        self, prefetcher, pool, mini_source,
     ):
         prefetcher.make_ready([0, 1, 2, 3, 4])
-        dataset = _build_dataset(prefetcher, pool, mini_dataset)
+        dataset = _build_dataset(prefetcher, pool, mini_source)
         dataset.refresh()
         before = len(dataset)
         before_calls = len(pool.update_calls)
@@ -500,13 +503,13 @@ class TestRefreshHappyPath:
         assert len(pool.update_calls) == before_calls
 
     def test_refresh_idempotent_when_nothing_changed(
-        self, prefetcher, pool, mini_dataset,
+        self, prefetcher, pool, mini_source,
     ):
         """Two consecutive refreshes with no new episodes must not
         rebuild the mapping or re-notify the pool.
         """
         prefetcher.make_ready(list(range(10)))
-        dataset = _build_dataset(prefetcher, pool, mini_dataset)
+        dataset = _build_dataset(prefetcher, pool, mini_source)
         dataset.refresh()
         calls_after_first = len(pool.update_calls)
         len_after_first = len(dataset)
@@ -524,14 +527,14 @@ class TestRefreshHappyPath:
 class TestSetupGateWiring:
 
     def test_initial_wait_uses_prefetch_min_episodes_not_refresh_default(
-        self, prefetcher, pool, mini_dataset,
+        self, prefetcher, pool, mini_source,
     ):
         """DataModule with default_min_new=0 (non-blocking per-epoch) but
         an explicit setup-time refresh(min_new=5) must block for the
         setup gate.
         """
         dataset = _build_dataset(
-            prefetcher, pool, mini_dataset, default_min_new=0,
+            prefetcher, pool, mini_source, default_min_new=0,
         )
         # Nothing ready; refresh() with no args returns instantly.
         t0 = time.monotonic()
@@ -554,14 +557,14 @@ class TestSetupGateWiring:
         t.join(timeout=1.0)
 
     def test_epoch_refresh_uses_default_min_new(
-        self, prefetcher, pool, mini_dataset,
+        self, prefetcher, pool, mini_source,
     ):
         """refresh() with no args defaults to default_min_new.  If the
         default is 3 and prefetcher has 2 new, refresh blocks until 3.
         """
         prefetcher.make_ready([0, 1])
         dataset = _build_dataset(
-            prefetcher, pool, mini_dataset, default_min_new=3,
+            prefetcher, pool, mini_source, default_min_new=3,
         )
         dataset.refresh(min_new=0)   # admit the 2 that are there
 
@@ -584,26 +587,26 @@ class TestSetupGateWiring:
         t.join(timeout=1.0)
 
     def test_explicit_min_new_always_overrides(
-        self, prefetcher, pool, mini_dataset,
+        self, prefetcher, pool, mini_source,
     ):
         """refresh(min_new=5) uses 5 regardless of default_min_new."""
         prefetcher.make_ready([0, 1, 2])
         dataset = _build_dataset(
-            prefetcher, pool, mini_dataset, default_min_new=0,
+            prefetcher, pool, mini_source, default_min_new=0,
         )
         # Default=0 would be non-blocking, but we pass min_new=5.
         with pytest.raises(TimeoutError):
             dataset.refresh(min_new=5, timeout=0.3)
 
     def test_default_min_new_zero_is_nonblocking(
-        self, prefetcher, pool, mini_dataset,
+        self, prefetcher, pool, mini_source,
     ):
         """The default-config behavior: refresh() is fast and
         scheduler-friendly.  No episodes new? Return immediately.
         """
         prefetcher.make_ready([0, 1])
         dataset = _build_dataset(
-            prefetcher, pool, mini_dataset, default_min_new=0,
+            prefetcher, pool, mini_source, default_min_new=0,
         )
         dataset.refresh()
         t0 = time.monotonic()
@@ -619,14 +622,14 @@ class TestSetupGateWiring:
 class TestStaleRefreshWarning:
 
     def test_stale_refresh_warning_fires(
-        self, prefetcher, pool, mini_dataset, caplog,
+        self, prefetcher, pool, mini_source, caplog,
     ):
         """When unadmitted episodes sit while __getitem__ is called for
         > staleness threshold, a single warning fires with remediation
         guidance.
         """
         prefetcher.make_ready([0, 1, 2, 3, 4])
-        dataset = _build_dataset(prefetcher, pool, mini_dataset)
+        dataset = _build_dataset(prefetcher, pool, mini_source)
         dataset.refresh()
         # Admit 20 more without refreshing.
         prefetcher.make_ready(list(range(5, 25)))
@@ -658,11 +661,11 @@ class TestStaleRefreshWarning:
         )
 
     def test_stale_refresh_warning_silent_when_caught_up(
-        self, prefetcher, pool, mini_dataset, caplog,
+        self, prefetcher, pool, mini_source, caplog,
     ):
         """If the dataset is admitted everything that's ready, no warning."""
         prefetcher.make_ready(list(range(5)))
-        dataset = _build_dataset(prefetcher, pool, mini_dataset)
+        dataset = _build_dataset(prefetcher, pool, mini_source)
         dataset.refresh()
         dataset._REFRESH_WARN_STALENESS_S = 0.05
         for ep in dataset._current_train_episodes:
@@ -683,10 +686,10 @@ class TestStaleRefreshWarning:
         assert not stale, "spurious warning when caught up"
 
     def test_stale_refresh_warning_only_once(
-        self, prefetcher, pool, mini_dataset, caplog,
+        self, prefetcher, pool, mini_source, caplog,
     ):
         prefetcher.make_ready([0, 1, 2, 3, 4])
-        dataset = _build_dataset(prefetcher, pool, mini_dataset)
+        dataset = _build_dataset(prefetcher, pool, mini_source)
         dataset.refresh()
         prefetcher.make_ready(list(range(5, 25)))
         dataset._REFRESH_WARN_STALENESS_S = 0.05
@@ -757,13 +760,13 @@ class TestGrowingDatasetCallback:
 class TestAdversarial:
 
     def test_refresh_during_concurrent_getitem(
-        self, prefetcher, pool, mini_dataset,
+        self, prefetcher, pool, mini_source,
     ):
         """No crashes from refresh() racing against __getitem__ on another
         thread.
         """
         prefetcher.make_ready(list(range(10)))
-        dataset = _build_dataset(prefetcher, pool, mini_dataset)
+        dataset = _build_dataset(prefetcher, pool, mini_source)
         dataset.refresh()
         for ep in dataset._current_train_episodes:
             dataset._buffer.put(
@@ -788,7 +791,7 @@ class TestAdversarial:
         assert not errors, f"concurrent access crashed: {errors}"
 
     def test_refresh_with_prefetcher_error_returns_early(
-        self, tmp_path, source_dir, pool, mini_dataset,
+        self, tmp_path, source_dir, pool, mini_source,
     ):
         """If the prefetcher errored and stopped, refresh() should see
         is_done() == True and return instead of blocking forever.
@@ -798,7 +801,7 @@ class TestAdversarial:
         )
         pf.start()
         pf.make_ready([0, 1, 2])
-        dataset = _build_dataset(pf, pool, mini_dataset)
+        dataset = _build_dataset(pf, pool, mini_source)
         dataset.refresh(min_new=0)
         # Simulate an error + stop.
         pf._error = RuntimeError("HF 401 Unauthorized (simulated)")
@@ -809,14 +812,14 @@ class TestAdversarial:
         assert time.monotonic() - t0 < 1.0
 
     def test_refresh_timeout_none_without_done_blocks(
-        self, prefetcher, pool, mini_dataset,
+        self, prefetcher, pool, mini_source,
     ):
         """Sanity: timeout=None with unsatisfied min_new + live
         prefetcher does block.  (Kill switch on the test side so a
         regression that ignores the predicate can't hang CI.)
         """
         prefetcher.make_ready([0, 1])
-        dataset = _build_dataset(prefetcher, pool, mini_dataset)
+        dataset = _build_dataset(prefetcher, pool, mini_source)
         dataset.refresh(min_new=0)
 
         result_box = {}

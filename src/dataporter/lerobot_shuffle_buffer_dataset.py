@@ -59,13 +59,17 @@ class LeRobotShuffleBufferDataset(Dataset):
     Args:
         buffer: ShuffleBuffer to sample from.
         sources: List of source dicts, each containing:
-            - ``dataset``: FastLeRobotDataset instance
+            - ``shard_source``: :class:`LeRobotShardSource` instance
+              (live, lazy read-only view of the dataset on disk).
             - ``source_name``: string matching
               :attr:`ProducerConfig.source_name`, used by
-              :meth:`refresh` when forwarding admitted lists to the pool
+              :meth:`refresh` when forwarding admitted lists to the pool.
             - ``episode_offset``: shifts raw episode indices into a
-              source-unique namespace
-            - ``transform``: optional per-source transform callable
+              source-unique namespace (prevents key collisions across
+              sources).
+            - ``transform``: optional per-source transform callable.
+            - ``train_episode_indices`` *(optional)*: raw ids for static
+              (non-growing) datasets; admitted immediately at init.
         delta_timestamps: Temporal windowing config (key -> list of delta times).
         prefetchers: Prefetchers to poll for ready episodes during
             :meth:`refresh`.  Usually one per source.  Pass an empty list
@@ -129,18 +133,18 @@ class LeRobotShuffleBufferDataset(Dataset):
         self._current_train_episodes: list[int] = []
         self._epoch_length: int = 0
 
-        # Back-compat: if the caller supplied ``train_episode_indices`` per
-        # source (the pre-growing-set construction shape), admit it
-        # immediately so ``__len__`` and sampling work without a
-        # refresh() call.  Growing-mode callers pass prefetchers instead
-        # and leave train_episode_indices off.
-        initial: list[int] = []
+        # Static-set construction shape: callers that aren't using
+        # prefetcher-driven growth pass ``train_episode_indices`` on each
+        # source dict; admit them immediately so ``__len__`` and sampling
+        # work without a refresh() call.  Growing-mode callers pass
+        # prefetchers instead and leave train_episode_indices off.
+        initial_by_source: dict[str, list[int]] = {}
         for src_idx, src in enumerate(self._sources):
-            offset = self._ep_offsets[src_idx]
-            for ep in src.get("train_episode_indices", []):
-                initial.append(offset + ep)
-        if initial:
-            self._admit(sorted(set(initial)))
+            eps = list(src.get("train_episode_indices", []))
+            if eps:
+                initial_by_source[self._source_names[src_idx]] = eps
+        if initial_by_source:
+            self._admit_by_source(initial_by_source)
 
         # Legacy back-compat: an explicit ``epoch_length`` always wins
         # over whatever ``_admit`` computed, even when
@@ -156,42 +160,25 @@ class LeRobotShuffleBufferDataset(Dataset):
         self._warned_stale: bool = False
         self._getitem_counter: int = 0
 
+        # Source-name uniqueness is load-bearing for update_episodes()
+        # routing — duplicates would silently broadcast to the wrong
+        # producer.  Fail loud.
+        if len(set(self._source_names)) != len(self._source_names):
+            raise ValueError(
+                f"LeRobotShuffleBufferDataset: duplicate source_name in "
+                f"{self._source_names!r} — each source must have a unique "
+                f"source_name (collision would break update_episodes routing)"
+            )
+
         # Pre-compute delta_indices (frame offsets from delta_timestamps).
         self._delta_indices: dict[str, list[int]] | None = None
         if delta_timestamps:
-            fps = self._source_fps(self._sources[0])
+            fps = int(self._sources[0]["shard_source"].fps)
             self._delta_indices = {
                 key: [round(d * fps) for d in deltas]
                 for key, deltas in delta_timestamps.items()
             }
             self._fps = fps
-
-    # ------------------------------------------------------------------
-    # Source abstraction — transitional.  A source dict may carry either:
-    # - ``shard_source`` (preferred; new path): a LeRobotShardSource.
-    # - ``dataset`` (legacy/tests): a FastLeRobotDataset (or MagicMock
-    #   matching that shape).  Supported for backwards compat until
-    #   callers migrate.
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _source_shard(src: dict):
-        return src.get("shard_source")
-
-    @staticmethod
-    def _source_fps(src: dict) -> int:
-        shard = src.get("shard_source")
-        if shard is not None:
-            return int(shard.fps)
-        return int(src["dataset"].fps)
-
-    def _episode_frame_count(self, src: dict, raw_ep: int) -> int:
-        shard = self._source_shard(src)
-        if shard is not None:
-            return int(shard.episode_frame_count(raw_ep))
-        # Legacy FastLeRobotDataset path.
-        edi = src["dataset"].episode_data_index
-        return int(edi["to"][raw_ep] - edi["from"][raw_ep])
 
     # ------------------------------------------------------------------
     # Growing-set API
@@ -230,8 +217,9 @@ class LeRobotShuffleBufferDataset(Dataset):
             time.monotonic() + timeout if timeout is not None else None
         )
         while True:
-            ready_train = self._scan_ready_train_episodes()
-            delta = len(ready_train) - baseline
+            ready_by_source = self._scan_ready_train_episodes_by_source()
+            total_ready = sum(len(v) for v in ready_by_source.values())
+            delta = total_ready - baseline
             if delta >= effective_min_new:
                 break
             if self._all_prefetchers_done():
@@ -245,87 +233,81 @@ class LeRobotShuffleBufferDataset(Dataset):
                 )
             time.sleep(0.1)
 
-        self._admit(ready_train)
+        self._admit_by_source(ready_by_source)
         self._last_refresh_ts = time.monotonic()
         return self._epoch_length
 
-    def _scan_ready_train_episodes(self) -> list[int]:
-        """All currently-ready episodes (across sources) that are train."""
-        ready: list[int] = []
+    def _scan_ready_train_episodes_by_source(self) -> dict[str, list[int]]:
+        """Per-source lists of currently-ready raw episode ids in train.
+
+        Keyed by ``source_name``; values are sorted raw ids whose
+        ``split_fn`` is True.  Structured by source so ``_admit_by_source``
+        can route without re-deriving source attribution from the offset
+        (which depends on the trusted-but-fallible ``info.json``).
+        """
+        out: dict[str, list[int]] = {}
         for src_idx, pf in enumerate(self._prefetchers):
-            offset = self._ep_offsets[src_idx] if src_idx < len(self._ep_offsets) else 0
-            for raw_ep in pf.ready_episodes():
-                if self._split_fn(raw_ep):
-                    ready.append(offset + raw_ep)
-        return sorted(set(ready))
+            if src_idx >= len(self._source_names):
+                continue
+            name = self._source_names[src_idx]
+            ready = [
+                raw for raw in pf.ready_episodes()
+                if self._split_fn(raw)
+            ]
+            out[name] = sorted(set(ready))
+        return out
 
     def _all_prefetchers_done(self) -> bool:
         if not self._prefetchers:
             return True
         return all(pf.is_done() for pf in self._prefetchers)
 
-    def _admit(self, new_train: list[int]) -> None:
-        """Install a new admitted list; no-op if unchanged."""
-        if new_train == self._current_train_episodes:
-            return
-        self._current_train_episodes = list(new_train)
+    def _admit_by_source(self, per_source: dict[str, list[int]]) -> None:
+        """Install a new admitted set, keyed by source.
 
-        # Rebuild ep → source mapping.  Each source_name has one offset;
-        # raw_ep = keyed_ep - offset.
-        self._ep_to_source = {}
-        per_source: dict[str, list[int]] = {
+        Each entry maps ``source_name → raw_ids`` for that source.
+        Source attribution is supplied by the caller so routing never
+        depends on ``info.json``'s ``total_episodes`` (which can lie —
+        stale downloads, in-flight updates, etc.).
+        """
+        # Flat canonical form for idempotence check + sampling routing.
+        flat: list[int] = []
+        ep_to_source: dict[int, int] = {}
+        per_source_normalized: dict[str, list[int]] = {
             name: [] for name in self._source_names
         }
-        for keyed_ep in new_train:
-            src_idx = self._route_episode_to_source(keyed_ep)
+        name_to_idx = {name: i for i, name in enumerate(self._source_names)}
+        for name, raw_list in per_source.items():
+            src_idx = name_to_idx.get(name)
             if src_idx is None:
                 continue
-            self._ep_to_source[keyed_ep] = src_idx
             offset = self._ep_offsets[src_idx]
-            raw_ep = keyed_ep - offset
-            per_source[self._source_names[src_idx]].append(raw_ep)
+            raw_sorted = sorted(set(int(r) for r in raw_list))
+            per_source_normalized[name] = raw_sorted
+            for raw_ep in raw_sorted:
+                keyed_ep = offset + raw_ep
+                flat.append(keyed_ep)
+                ep_to_source[keyed_ep] = src_idx
+        flat.sort()
 
-        # Recompute epoch length from per-source raw episode frame counts.
+        if flat == self._current_train_episodes:
+            return
+        self._current_train_episodes = flat
+        self._ep_to_source = ep_to_source
+
+        # Epoch length = sum of per-source raw-episode frame counts.
         total = 0
-        for src_idx, src in enumerate(self._sources):
-            offset = self._ep_offsets[src_idx]
-            for keyed_ep in new_train:
-                if self._ep_to_source.get(keyed_ep) != src_idx:
-                    continue
-                raw_ep = keyed_ep - offset
-                total += self._episode_frame_count(src, raw_ep)
+        for name, raw_list in per_source_normalized.items():
+            src_idx = name_to_idx[name]
+            shard = self._sources[src_idx]["shard_source"]
+            for raw_ep in raw_list:
+                total += int(shard.episode_frame_count(raw_ep))
         self._epoch_length = total
 
         # Forward to the pool so new decodes sample the admitted set.
         if self._producer_pool is not None:
-            for name, raw_list in per_source.items():
+            for name, raw_list in per_source_normalized.items():
                 self._producer_pool.update_episodes(name, raw_list)
-
-    def _route_episode_to_source(self, keyed_ep: int) -> int | None:
-        """Find which source owns this keyed (offset+raw) episode id.
-
-        Relies on per-source offsets partitioning the id space.  For the
-        common case of one source, always returns 0.
-        """
-        if len(self._sources) == 1:
-            return 0
-        # Pick the source whose offset puts raw_ep into a legal range
-        # for that source.  We use the shard source's own knowledge
-        # when available, fall back to the FastLeRobotDataset shape.
-        for src_idx, src in enumerate(self._sources):
-            offset = self._ep_offsets[src_idx]
-            raw_ep = keyed_ep - offset
-            if raw_ep < 0:
-                continue
-            shard = self._source_shard(src)
-            if shard is not None:
-                if raw_ep < shard.total_episodes:
-                    return src_idx
-            else:
-                ep_data_index = src["dataset"].episode_data_index
-                if raw_ep < len(ep_data_index["from"]):
-                    return src_idx
-        return None
 
     # ------------------------------------------------------------------
     # Dataset interface
@@ -361,95 +343,67 @@ class LeRobotShuffleBufferDataset(Dataset):
             )
 
         source = self._sources[src_idx]
-        shard = self._source_shard(source)
+        shard = source["shard_source"]
 
         # 3. Pick random sample index within episode
         raw_ep = ep_idx - self._ep_offsets[src_idx]
-        num_frames_in_ep = self._episode_frame_count(source, raw_ep)
+        num_frames_in_ep = int(shard.episode_frame_count(raw_ep))
         frame_in_ep = self._rng.randint(0, num_frames_in_ep - 1)
 
-        # 4. Fetch non-video data.  Shard-source path is per-episode
-        # (frame_in_ep is a local index); legacy FastLeRobotDataset
-        # path uses global frame indices computed from episode_data_index.
-        if shard is not None:
-            item = shard.load_episode_row_torch(raw_ep, frame_in_ep)
-            # For delta_timestamps windowing, all indices are LOCAL to
-            # the episode and clamped to [0, num_frames_in_ep - 1].
-            if self._delta_indices is not None:
-                padding: dict[str, torch.Tensor] = {}
-                for key, delta_idx in self._delta_indices.items():
-                    local_indices = [
-                        max(0, min(num_frames_in_ep - 1, frame_in_ep + d))
-                        for d in delta_idx
-                    ]
-                    padding[f"{key}_is_pad"] = torch.BoolTensor([
-                        (frame_in_ep + d < 0)
-                        or (frame_in_ep + d >= num_frames_in_ep)
-                        for d in delta_idx
-                    ])
-                    # Windowed non-video data pulled from the same
-                    # episode's parquet (skip video keys — filled from
-                    # frames_uint8 below).
-                    if key in self._image_keys:
-                        continue
-                    window = shard.load_episode_window_torch(
-                        raw_ep, local_indices,
-                    )
-                    if key in window:
-                        item[key] = window[key]
-                item = {**item, **padding}
-            sample_idx = frame_in_ep           # LOCAL — for video frame extraction below
-            ep_start = 0
-            ep_end = num_frames_in_ep
-        else:
-            # Legacy FastLeRobotDataset path.
-            dataset = source["dataset"]
-            ep_data_index = dataset.episode_data_index
-            ep_start = int(ep_data_index["from"][raw_ep])
-            ep_end = int(ep_data_index["to"][raw_ep])
-            sample_idx = ep_start + frame_in_ep      # GLOBAL frame idx
-            item = dataset.hf_dataset[sample_idx]
-            if self._delta_indices is not None:
-                query_indices = {}
-                padding = {}
-                for key, delta_idx in self._delta_indices.items():
-                    indices = [
-                        max(ep_start, min(ep_end - 1, sample_idx + d))
-                        for d in delta_idx
-                    ]
-                    query_indices[key] = indices
-                    padding[f"{key}_is_pad"] = torch.BoolTensor([
-                        (sample_idx + d < ep_start) or (sample_idx + d >= ep_end)
-                        for d in delta_idx
-                    ])
-                item = {**item, **padding}
-                query_result = dataset._query_hf_dataset(query_indices)
-                for key, val in query_result.items():
-                    item[key] = val
+        # 4. Fetch non-video data (per-episode, local frame indices).
+        item = shard.load_episode_row_torch(raw_ep, frame_in_ep)
+        if self._delta_indices is not None:
+            padding: dict[str, torch.Tensor] = {}
+            for key, delta_idx in self._delta_indices.items():
+                padding[f"{key}_is_pad"] = torch.BoolTensor([
+                    (frame_in_ep + d < 0)
+                    or (frame_in_ep + d >= num_frames_in_ep)
+                    for d in delta_idx
+                ])
+                # Windowed non-video data pulled from the same
+                # episode's parquet (skip video keys — filled from
+                # frames_uint8 below).
+                if key in self._image_keys:
+                    continue
+                local_indices = [
+                    max(0, min(num_frames_in_ep - 1, frame_in_ep + d))
+                    for d in delta_idx
+                ]
+                window = shard.load_episode_window_torch(
+                    raw_ep, local_indices,
+                )
+                if key in window:
+                    item[key] = window[key]
+            item = {**item, **padding}
 
-        # 5. Extract video frame window from sampled frames
-        frame_offset_in_ep = sample_idx - ep_start
-
+        # 5. Extract video frame window from sampled frames.  Indices are
+        # LOCAL to the episode and clamped to the actually-decoded frame
+        # count (episodes.jsonl can disagree with the mp4 at the margin).
+        decoded_n = len(frames_uint8)
         for vid_key in self._image_keys:
             if self._delta_indices is not None and vid_key in self._delta_indices:
-                frame_indices = []
-                for d in self._delta_indices[vid_key]:
-                    abs_idx = max(ep_start, min(ep_end - 1, sample_idx + d))
-                    rel_idx = abs_idx - ep_start
-                    rel_idx = min(rel_idx, len(frames_uint8) - 1)
-                    frame_indices.append(rel_idx)
-                item[vid_key] = frames_uint8[frame_indices].to(torch.float32) / 255.0
+                frame_indices = [
+                    min(
+                        max(0, frame_in_ep + d),
+                        min(num_frames_in_ep, decoded_n) - 1,
+                    )
+                    for d in self._delta_indices[vid_key]
+                ]
+                item[vid_key] = (
+                    frames_uint8[frame_indices].to(torch.float32) / 255.0
+                )
             else:
-                rel_idx = min(frame_offset_in_ep, len(frames_uint8) - 1)
+                rel_idx = min(frame_in_ep, decoded_n - 1)
                 item[vid_key] = (
                     frames_uint8[rel_idx].unsqueeze(0).to(torch.float32) / 255.0
                 )
 
-        task_idx = item["task_index"].item() if hasattr(item["task_index"], "item") else int(item["task_index"])
-        if shard is not None:
-            item["task"] = shard.tasks().get(task_idx, "")
-        else:
-            item["task"] = dataset.meta.tasks[task_idx]
+        task_idx = (
+            item["task_index"].item()
+            if hasattr(item["task_index"], "item")
+            else int(item["task_index"])
+        )
+        item["task"] = shard.tasks().get(task_idx, "")
 
         # 6. Apply per-source transform
         transform = source.get("transform")
@@ -479,8 +433,9 @@ class LeRobotShuffleBufferDataset(Dataset):
         if elapsed < self._REFRESH_WARN_STALENESS_S:
             return
         # How many train episodes are ready but not yet admitted?
-        ready = self._scan_ready_train_episodes()
-        gap = len(ready) - len(self._current_train_episodes)
+        ready_by_source = self._scan_ready_train_episodes_by_source()
+        total_ready = sum(len(v) for v in ready_by_source.values())
+        gap = total_ready - len(self._current_train_episodes)
         if gap < self._REFRESH_WARN_MIN_GAP:
             return
         logger.warning(

@@ -153,7 +153,11 @@ class LeRobotPrefetcher(BasePrefetcher):
 
         ``BasePrefetcher.shard_count`` counts parquets only; training
         consumers that decode video need both.  This predicate is the
-        authoritative source for "what's safe to load right now".
+        authoritative source for "what's safe to load right now" from
+        the WRITER side.  :meth:`LeRobotShardSource.list_ready_episodes`
+        answers the same question from the READER side (no prefetcher
+        state — pure disk scan); the two are kept in sync deliberately
+        and either can be the source of truth for a given caller.
 
         Returns a sorted list of ready episode ids.  Empty until the
         prefetcher has produced a complete episode (important during the

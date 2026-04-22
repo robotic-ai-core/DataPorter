@@ -598,13 +598,10 @@ class BlendedLeRobotDataModule(L.LightningDataModule):
             )
             producers.append(config)
 
-            # Build source dict for LeRobotShuffleBufferDataset.  The
-            # new ``shard_source`` field is what the consumer uses for
-            # lazy per-episode access; ``dataset`` is retained so
-            # legacy map-style consumers and helpers keep working.
+            # Build source dict for LeRobotShuffleBufferDataset — the
+            # shard source backs all per-episode row/window access.
             transform = self.get_train_transform(source)
             sources_for_dataset.append({
-                "dataset": full_ds,
                 "shard_source": shard_source,
                 "source_name": source["repo_id"],
                 "train_episode_indices": train_raw_eps,
@@ -612,8 +609,12 @@ class BlendedLeRobotDataModule(L.LightningDataModule):
                 "transform": transform,
             })
 
-            # Advance offset past this source's raw-id space so keys
-            # from different sources don't collide in the buffer.
+            # Advance offset past this source's raw-id space so buffer
+            # keys from different sources stay disjoint.  Routing in the
+            # consumer uses source_name (not offset-range inference) so
+            # the exact stride beyond non-overlap doesn't matter, but
+            # partitioning the id space avoids surprises if a downstream
+            # caller ever does offset-based lookup.
             cumulative_offset += shard_source.total_episodes + 1
 
         # Create buffer + pool
@@ -771,7 +772,14 @@ class BlendedLeRobotDataModule(L.LightningDataModule):
 
             self.train_dataset = combined_train
 
-        # ---- Validation dataset (always uses old path) ----
+        # ---- Validation dataset (always uses FastLeRobotDataset) ----
+        # Val uses map-style ``Subset(full_ds, val_idx)`` where ``val_idx``
+        # is a list of GLOBAL frame indices computed from
+        # ``episode_data_index`` — an addressing mode the shard source
+        # doesn't materialize.  Migrating val to LeRobotShardSource is
+        # tracked but out of scope until the train path stabilizes; do
+        # not replace this without reworking the val sampler to speak
+        # (episode_id, frame_in_ep) instead of global frame indices.
         val_parts = []
         for source, train_ep_idx, val_idx, full_ds in full_datasets:
             if val_ts is not self.delta_timestamps:

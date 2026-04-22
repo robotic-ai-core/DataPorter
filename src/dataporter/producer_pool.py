@@ -39,9 +39,10 @@ logger = logging.getLogger(__name__)
 class ProducerConfig:
     """Picklable configuration for a data source producer.
 
-    All fields are primitives — no dataset objects, no closures.  The
-    spawned child process uses these params to construct a
-    :class:`LeRobotShardSource` and iterate over the episodes.
+    Holds a :class:`LeRobotShardSource` directly — the shard source's
+    ``__getstate__`` drops its row LRU for pickling so spawn cost is
+    bounded (few KB of info + episodes metadata) while keeping the
+    parent-side construction single-sourced.
 
     Episode semantics:
 
@@ -53,14 +54,10 @@ class ProducerConfig:
     - ``episode_offset``: added to each raw id to form the ShuffleBuffer
       key.  Prevents key collisions when multiple sources share the
       same raw-id space (e.g. two datasets both starting at ep 0).
-
-    The child constructs a new :class:`LeRobotShardSource` at startup —
-    it's O(1) work (info.json + tasks.jsonl, ~0.1ms) so there's no
-    arrow-cache juggling like the old ``FastLeRobotDataset`` flow.
     """
     source_name: str
     repo_id: str
-    source_root: str
+    shard_source: "LeRobotShardSource"
     episode_indices: list[int]
     weight: float = 1.0
     seed: int = 42
@@ -89,10 +86,9 @@ class ProducerConfig:
         Args:
             source: Source dict with ``repo_id``, ``weight``, optional
                 ``tolerance_s`` / ``video_backend``.
-            shard_source: A :class:`LeRobotShardSource` whose ``root``
-                will be passed to the spawn child (child rebuilds its
-                own source from the root — the object itself is not
-                passed, only the path).
+            shard_source: A :class:`LeRobotShardSource` — passed through
+                unchanged; the spawn child unpickles the same instance
+                (with row-LRU dropped) rather than re-constructing one.
             iteration_episodes: RAW episode ids the producer cycles over
                 (typically the train split of currently-ready eps).
             episode_offset: Shift applied to raw ids when writing to
@@ -104,7 +100,7 @@ class ProducerConfig:
         return cls(
             source_name=source["repo_id"],
             repo_id=source["repo_id"],
-            source_root=str(shard_source.root),
+            shard_source=shard_source,
             episode_indices=list(iteration_episodes),
             weight=source.get("weight", 1.0),
             tolerance_s=source.get("tolerance_s", 1e-4),
@@ -221,7 +217,7 @@ def _spawn_pool_entry(
             first_ep = cfg.episode_indices[0] if cfg.episode_indices else 0
             logger.info(
                 f"[child] smoke test starting: {cfg.source_name} "
-                f"ep {first_ep} (source_root={cfg.source_root}, "
+                f"ep {first_ep} (source_root={cfg.shard_source.root}, "
                 f"episodes_count={len(cfg.episode_indices)})"
             )
 
@@ -253,7 +249,7 @@ def _spawn_pool_entry(
                         f"Smoke test: decode of {cfg.source_name} "
                         f"ep {first_ep} hung for {_DECODE_TIMEOUT_S}s. "
                         f"Video decode may be blocked on symlinked blobs. "
-                        f"source_root={cfg.source_root}"
+                        f"source_root={cfg.shard_source.root}"
                     )
 
         logger.info(
@@ -275,9 +271,10 @@ def _spawn_pool_entry(
 def _make_child_decode_fn(config: ProducerConfig) -> Callable[[int], torch.Tensor]:
     """Create a decode function inside the child process.
 
-    Uses :class:`LeRobotShardSource` (live, lazy disk view) rather than
-    the old ``FastLeRobotDataset`` — ~0.1ms construction vs ~500s on
-    18k-episode datasets, and no materialized episode set to maintain.
+    The shard source is carried through ``ProducerConfig.shard_source`` —
+    unpickled fresh in the child (row LRU dropped via ``__getstate__``)
+    so there's no re-read of ``info.json`` and no drift risk between
+    parent and child views.
 
     Accepts RAW episode ids (from ``config.episode_indices``) directly;
     no positional/raw translation needed because the source is raw-indexed
@@ -288,27 +285,20 @@ def _make_child_decode_fn(config: ProducerConfig) -> Callable[[int], torch.Tenso
     import time as _time
 
     def prime() -> None:
-        """Eagerly construct the LeRobotShardSource.
+        """No-op phase separator (source already unpickled).
 
-        Exposed as ``decode.prime`` for symmetry with the older flow —
-        the source itself is ~0.1ms to build, so this is essentially a
-        no-op except for logging.  Kept as a phase separator so the
-        smoke test's 30s decode timeout can't swallow unrelated setup.
+        Kept for API symmetry with the older flow — the smoke test uses
+        ``prime() + decode()`` so construction can't be swallowed by the
+        30s decode timeout.  With the shard source carried through the
+        config, there's nothing to construct here; the call just marks
+        the parent→child handoff in logs.
         """
         if "source" in _state:
             return
-        from .lerobot_shard_source import LeRobotShardSource
-
+        _state["source"] = config.shard_source
         logger.info(
-            f"[child:{config.source_name}] constructing "
-            f"LeRobotShardSource(root={config.source_root})"
-        )
-        t0 = _time.monotonic()
-        source = LeRobotShardSource(config.source_root)
-        _state["source"] = source
-        logger.info(
-            f"[child:{config.source_name}] LeRobotShardSource "
-            f"constructed in {(_time.monotonic() - t0) * 1000:.1f}ms"
+            f"[child:{config.source_name}] shard source ready "
+            f"(root={config.shard_source.root})"
         )
 
     def decode(ep_idx: int) -> torch.Tensor:
@@ -670,6 +660,16 @@ class ProducerPool:
             raise ValueError("Either configs or producers must be provided")
         if configs is not None and producers is not None:
             raise ValueError("Cannot specify both configs and producers")
+        # source_name is the routing key for update_episodes(); duplicates
+        # would silently broadcast to the wrong per-source iterator.
+        if configs is not None:
+            names = [c.source_name for c in configs]
+            if len(set(names)) != len(names):
+                raise ValueError(
+                    f"ProducerPool: duplicate source_name in configs: "
+                    f"{names!r} — each ProducerConfig must have a unique "
+                    f"source_name"
+                )
 
         self._buffer = buffer
         self._configs = configs
