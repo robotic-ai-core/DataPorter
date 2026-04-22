@@ -246,7 +246,18 @@ def _spawn_pool_entry(
                 pass
 
     try:
-        # Smoke test: verify each source can decode at least one episode
+        # Smoke test: verify each source can decode at least one episode.
+        #
+        # Construction is done synchronously (no timeout) in the main
+        # thread: FastLeRobotDataset(episodes=[...]) scales linearly
+        # with episode count and for realistic dataset sizes (~18k)
+        # exceeds the 30s decode budget.  Running it inside the
+        # ThreadPoolExecutor deadlocks on shutdown when construction
+        # blows past timeout (Python threads can't be cancelled, and
+        # `with ex:` calls shutdown(wait=True)).  Moving construction
+        # out keeps the 30s timeout useful for its actual purpose
+        # (catching hanging ffmpeg decodes on symlinked blobs) without
+        # blocking legitimate slow-dataset startups.
         decode_fns = {}
         for cfg in configs:
             fn = _make_child_decode_fn(cfg)
@@ -261,18 +272,29 @@ def _spawn_pool_entry(
                 f"dataset_episodes_count="
                 f"{len(cfg.dataset_episodes) if cfg.dataset_episodes else None})"
             )
+
+            # Phase 1 — construction (no timeout, visible via instrumentation).
+            prime_t0 = _time.monotonic()
+            fn.prime()
+            logger.info(
+                f"[child] smoke phase-1 (construction) done: "
+                f"{cfg.source_name} in {_time.monotonic() - prime_t0:.1f}s"
+            )
+
+            # Phase 2 — decode one episode under the 30s timeout.
             import concurrent.futures
             with concurrent.futures.ThreadPoolExecutor(1) as ex:
-                smoke_t0 = _time.monotonic()
+                decode_t0 = _time.monotonic()
                 future = ex.submit(fn, first_ep)
                 try:
                     frames = future.result(timeout=_DECODE_TIMEOUT_S)
                     if frames is None:
                         raise RuntimeError("decode returned None")
                     logger.info(
-                        f"[child] smoke test OK: {cfg.source_name} "
-                        f"ep {first_ep} → {frames.shape} in "
-                        f"{_time.monotonic() - smoke_t0:.1f}s"
+                        f"[child] smoke phase-2 (decode) OK: "
+                        f"{cfg.source_name} ep {first_ep} → "
+                        f"{frames.shape} in "
+                        f"{_time.monotonic() - decode_t0:.1f}s"
                     )
                 except concurrent.futures.TimeoutError:
                     raise RuntimeError(
@@ -314,29 +336,64 @@ def _make_child_decode_fn(config: ProducerConfig) -> Callable[[int], torch.Tenso
 
     import time as _time
 
-    def decode(ep_idx: int) -> torch.Tensor:
-        if "ds" not in _state:
-            from .fast_lerobot_dataset import FastLeRobotDataset
+    def prime() -> None:
+        """Eagerly construct the FastLeRobotDataset.
 
-            logger.info(
-                f"[child:{config.source_name}] constructing "
-                f"FastLeRobotDataset "
-                f"(arrow_cache_path={'SET' if config.arrow_cache_path else 'None'}, "
-                f"episodes={len(config.episode_indices)})"
-            )
-            t_ds = _time.monotonic()
+        Exposed as ``decode.prime`` so the smoke test can do construction
+        in the main thread (no timeout — construction can take minutes on
+        large datasets and isn't decode work) before running the decode
+        phase under a ThreadPoolExecutor with the 30s decode budget.
+
+        Emits a heartbeat every 30s while construction is in-flight so
+        operators can tell "still working" from "actually hung" — on
+        18k-episode datasets this phase is ~8 minutes of CPU-bound work
+        and silent progress looks indistinguishable from a deadlock.
+        """
+        if "ds" in _state:
+            return
+        from .fast_lerobot_dataset import FastLeRobotDataset
+        import threading as _threading
+
+        logger.info(
+            f"[child:{config.source_name}] constructing "
+            f"FastLeRobotDataset "
+            f"(arrow_cache_path={'SET' if config.arrow_cache_path else 'None'}, "
+            f"episodes={len(config.episode_indices)})"
+        )
+        t_ds = _time.monotonic()
+        _heartbeat_stop = _threading.Event()
+
+        def _heartbeat() -> None:
+            while not _heartbeat_stop.wait(timeout=30.0):
+                logger.info(
+                    f"[child:{config.source_name}] still constructing, "
+                    f"elapsed {_time.monotonic() - t_ds:.0f}s"
+                )
+
+        _heartbeat_thread = _threading.Thread(
+            target=_heartbeat, daemon=True,
+            name=f"prime-heartbeat-{config.source_name}",
+        )
+        _heartbeat_thread.start()
+        try:
             _state["ds"] = FastLeRobotDataset(
                 config.repo_id,
                 delta_timestamps={"observation.image": [0.0]},
                 **config.dataset_kwargs(),
             )
-            logger.info(
-                f"[child:{config.source_name}] FastLeRobotDataset "
-                f"constructed in {_time.monotonic() - t_ds:.1f}s "
-                f"(total_rows={len(_state['ds'].hf_dataset)}, "
-                f"episodes_in_index="
-                f"{len(_state['ds'].episode_data_index['from'])})"
-            )
+        finally:
+            _heartbeat_stop.set()
+            _heartbeat_thread.join(timeout=1.0)
+        logger.info(
+            f"[child:{config.source_name}] FastLeRobotDataset "
+            f"constructed in {_time.monotonic() - t_ds:.1f}s "
+            f"(total_rows={len(_state['ds'].hf_dataset)}, "
+            f"episodes_in_index="
+            f"{len(_state['ds'].episode_data_index['from'])})"
+        )
+
+    def decode(ep_idx: int) -> torch.Tensor:
+        prime()
         ds = _state["ds"]
 
         if not ds.meta.video_keys:
@@ -384,6 +441,7 @@ def _make_child_decode_fn(config: ProducerConfig) -> Callable[[int], torch.Tenso
             _state["first_decode_logged"] = True
         return frames
 
+    decode.prime = prime
     return decode
 
 
@@ -767,13 +825,21 @@ class ProducerPool:
 
         self._worker.start()
 
-    def wait_for_warmup(self, timeout: float = 300.0) -> None:
+    def wait_for_warmup(self, timeout: float = 1200.0) -> None:
         """Block until warmup_target items are in the buffer.
 
         If the child process reported an error (via the error queue),
         raises RuntimeError with the child's message so it appears in
         the parent's training log — child-process logger output often
         goes to stderr and doesn't reach the parent's log handler.
+
+        Default timeout is 1200s (20min).  FastLeRobotDataset
+        construction in the child scales with episode count
+        (~0.025s/episode on typical hardware) — at 18k episodes that's
+        ~500s just to build the dataset, before any decode or buffer
+        warmup happens.  300s (the previous default) was too tight and
+        fired spuriously on large datasets even when the child was
+        working normally.
         """
         if not self._warmup_event.wait(timeout=timeout):
             # Check for child errors before raising generic timeout
