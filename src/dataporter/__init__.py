@@ -38,6 +38,7 @@ from .growing_dataset_callback import GrowingDatasetCallback
 from .frame_transforms import (
     ResizeFrames, FrameCompose, probe_output_shape,
 )
+from .lerobot_shard_source import LeRobotShardSource
 
 # Lazy imports for optional dependencies (lerobot, lightning)
 def __getattr__(name):
@@ -114,6 +115,8 @@ __all__ = [
     'ResizeFrames',
     'FrameCompose',
     'probe_output_shape',
+    # Live, lazy LeRobot shard source
+    'LeRobotShardSource',
     # Shuffle buffer (video pipeline)
     'ShuffleBuffer',
     'ProducerPool',
