@@ -76,36 +76,12 @@ def _run_pool_briefly(configs, timeout_s: float = 20.0) -> list[str]:
 # ---------------------------------------------------------------------------
 
 
-class TestAdversarialConfigs:
-    """Each test poisons one invariant that the v4 investigation
-    identified as a trap.  All are things that used to fail slowly or
-    silently; all must now fail fast with a named invariant."""
-
-    def test_mismatched_dataset_episodes_fails_with_clear_error(
-        self, parent_fixture
-    ):
-        """The v4 bug: child receives fewer episodes than the Arrow
-        cache actually contains.  Must surface as a size-mismatch
-        RuntimeError, not a 70s timestamp crash."""
-        parent, K = parent_fixture
-        train = list(range(int(0.9 * K)))
-
-        cfg = ProducerConfig(
-            source_name="adversarial-mismatch",
-            repo_id="lerobot/pusht",
-            root=str(parent.root),
-            episode_indices=train,
-            dataset_episodes=train,  # WRONG: should be full 0..K-1
-            arrow_cache_path=parent.arrow_cache_path,
-        )
-        errors = _run_pool_briefly([cfg])
-
-        assert errors, "Child failed but produced no error message"
-        joined = " ".join(errors)
-        assert (
-            "doesn't match the Arrow table" in joined
-            or "episode_data_index covers" in joined
-        ), f"Expected size-mismatch error, got: {errors}"
+# TestAdversarialConfigs class removed: all its scenarios tested the
+# obsolete dataset_kwargs / arrow_cache_path mechanism from the old
+# FastLeRobotDataset-backed pool.  With LeRobotShardSource the pool
+# path has no materialized index for config to drift out of sync with
+# — those bug classes can't occur.  New adversarial coverage for the
+# shard-source path lives in tests/test_producer_pool_local_path.py.
 
 
 # ---------------------------------------------------------------------------

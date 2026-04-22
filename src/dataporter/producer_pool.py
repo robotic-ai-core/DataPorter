@@ -39,40 +39,34 @@ logger = logging.getLogger(__name__)
 class ProducerConfig:
     """Picklable configuration for a data source producer.
 
-    All fields are primitives — no dataset objects, no closures.
-    The spawned child process creates its own dataset from these params.
+    All fields are primitives — no dataset objects, no closures.  The
+    spawned child process uses these params to construct a
+    :class:`LeRobotShardSource` and iterate over the episodes.
 
-    Two related but distinct episode lists:
+    Episode semantics:
 
-    - ``dataset_episodes``: the full list of episodes present in the parent's
-      Arrow cache.  Passed to the child's ``FastLeRobotDataset(episodes=...)``
-      so ``get_episode_data_index`` produces boundaries that match every
-      episode in the Arrow table.  When this disagrees with what's actually
-      in the cache, ``check_timestamps_sync`` fails at every unmasked
-      episode boundary (negative diff where ``ts → 0.0``).
-    - ``episode_indices``: the subset the producer iterates over (e.g. the
-      train split).  Used only for the work queue — never as the child
-      dataset's ``episodes=`` kwarg.
+    - ``episode_indices``: **raw episode ids** the producer iterates over
+      (train split).  Pool's work queue yields these values directly;
+      the child's decode function looks them up in the shard source
+      by raw id.
 
-    ``episode_offset`` shifts raw episode indices into a source-unique
-    namespace before writing to the ShuffleBuffer.  This prevents key
-    collisions when multiple sources share the same raw episode indices
-    (e.g. both start at 0).
+    - ``episode_offset``: added to each raw id to form the ShuffleBuffer
+      key.  Prevents key collisions when multiple sources share the
+      same raw-id space (e.g. two datasets both starting at ep 0).
 
-    ``arrow_cache_path`` is the path to the parent's pre-built Arrow IPC
-    cache file.  When set, the spawned child loads this file directly via
-    ``Dataset.from_file()`` — instant, no 10k-parquet rebuild.
+    The child constructs a new :class:`LeRobotShardSource` at startup —
+    it's O(1) work (info.json + tasks.jsonl, ~0.1ms) so there's no
+    arrow-cache juggling like the old ``FastLeRobotDataset`` flow.
     """
     source_name: str
     repo_id: str
-    root: str
+    source_root: str
     episode_indices: list[int]
-    dataset_episodes: list[int] | None = None
     weight: float = 1.0
     seed: int = 42
-    tolerance_s: float | None = None
+    tolerance_s: float = 1e-4
+    video_backend: str = "pyav"
     episode_offset: int = 0
-    arrow_cache_path: str | None = None
     # Optional producer-side frame transform.  Applied to each decoded
     # episode tensor BEFORE it lands in the ShuffleBuffer — so the buffer
     # allocates shm at the transform's output resolution rather than
@@ -81,80 +75,41 @@ class ProducerConfig:
     # :mod:`dataporter.frame_transforms`, not a lambda.
     producer_transform: Callable | None = None
 
-    def dataset_kwargs(self) -> dict:
-        """Build FastLeRobotDataset kwargs from this config.
-
-        Single source of truth for the root/tolerance_s/episodes/
-        arrow_cache_path extraction — prevents the SameFileError bug
-        class where a new kwarg is added in one place but missed in
-        another.
-
-        ``episodes=`` is sourced from ``dataset_episodes`` (the full list
-        in the Arrow cache) so ``get_episode_data_index`` masks every
-        real boundary.  Falls back to ``episode_indices`` for legacy
-        callers that iterate the entire dataset.
-        """
-        from pathlib import Path
-        kwargs = {"root": Path(self.root)}
-        if self.tolerance_s is not None:
-            kwargs["tolerance_s"] = self.tolerance_s
-        if self.arrow_cache_path is not None:
-            kwargs["arrow_cache_path"] = self.arrow_cache_path
-            # Parent has already validated the Arrow cache's timestamps.
-            # Re-running check_timestamps_sync (802k rows) is wasted work,
-            # and any parent↔child self.episodes disagreement surfaces as
-            # a clear size-mismatch RuntimeError in FastLeRobotDataset
-            # instead of a cryptic tolerance ValueError 800k rows later.
-            kwargs["skip_timestamp_validation"] = True
-        episodes = (
-            self.dataset_episodes
-            if self.dataset_episodes is not None
-            else self.episode_indices
-        )
-        if episodes:
-            kwargs["episodes"] = list(episodes)
-        return kwargs
-
     @classmethod
     def from_source(
         cls,
         source: dict,
-        full_ds,
+        shard_source,
         iteration_episodes: list[int],
         episode_offset: int = 0,
         producer_transform: Callable | None = None,
     ) -> "ProducerConfig":
-        """Build a ProducerConfig from a parent dataset + iteration subset.
-
-        Pulls ``root``, ``dataset_episodes``, and ``arrow_cache_path`` off
-        the parent dataset so callers can't forget to keep them in sync.
-        The parent dataset is the single source of truth for what's in
-        the Arrow cache; the caller only provides the subset the producer
-        should iterate (typically the train episodes).
+        """Build a ProducerConfig from a shard source + iteration subset.
 
         Args:
             source: Source dict with ``repo_id``, ``weight``, optional
-                ``tolerance_s``.
-            full_ds: The parent ``FastLeRobotDataset`` — must already be
-                loaded so ``full_ds.episodes`` and ``full_ds.arrow_cache_path``
-                are populated.
-            iteration_episodes: Episode indices the producer cycles over
-                (e.g. the train split).
-            episode_offset: Shift applied to keys written to the
-                ShuffleBuffer so multi-source namespaces don't collide.
+                ``tolerance_s`` / ``video_backend``.
+            shard_source: A :class:`LeRobotShardSource` whose ``root``
+                will be passed to the spawn child (child rebuilds its
+                own source from the root — the object itself is not
+                passed, only the path).
+            iteration_episodes: RAW episode ids the producer cycles over
+                (typically the train split of currently-ready eps).
+            episode_offset: Shift applied to raw ids when writing to
+                the ShuffleBuffer so multi-source namespaces don't
+                collide.
+            producer_transform: Optional picklable transform applied to
+                decoded frames before buffer.put.
         """
         return cls(
             source_name=source["repo_id"],
             repo_id=source["repo_id"],
-            root=str(full_ds.root),
+            source_root=str(shard_source.root),
             episode_indices=list(iteration_episodes),
-            dataset_episodes=(
-                list(full_ds.episodes) if full_ds.episodes else None
-            ),
             weight=source.get("weight", 1.0),
-            tolerance_s=source.get("tolerance_s"),
+            tolerance_s=source.get("tolerance_s", 1e-4),
+            video_backend=source.get("video_backend", "pyav"),
             episode_offset=episode_offset,
-            arrow_cache_path=full_ds.arrow_cache_path,
             producer_transform=producer_transform,
         )
 
@@ -266,11 +221,8 @@ def _spawn_pool_entry(
             first_ep = cfg.episode_indices[0] if cfg.episode_indices else 0
             logger.info(
                 f"[child] smoke test starting: {cfg.source_name} "
-                f"ep {first_ep} (root={cfg.root}, "
-                f"arrow_cache_path={cfg.arrow_cache_path!r}, "
-                f"episodes_count={len(cfg.episode_indices)}, "
-                f"dataset_episodes_count="
-                f"{len(cfg.dataset_episodes) if cfg.dataset_episodes else None})"
+                f"ep {first_ep} (source_root={cfg.source_root}, "
+                f"episodes_count={len(cfg.episode_indices)})"
             )
 
             # Phase 1 — construction (no timeout, visible via instrumentation).
@@ -301,7 +253,7 @@ def _spawn_pool_entry(
                         f"Smoke test: decode of {cfg.source_name} "
                         f"ep {first_ep} hung for {_DECODE_TIMEOUT_S}s. "
                         f"Video decode may be blocked on symlinked blobs. "
-                        f"root={cfg.root}"
+                        f"source_root={cfg.source_root}"
                     )
 
         logger.info(
@@ -323,94 +275,57 @@ def _spawn_pool_entry(
 def _make_child_decode_fn(config: ProducerConfig) -> Callable[[int], torch.Tensor]:
     """Create a decode function inside the child process.
 
-    Lazily initializes a fresh FastLeRobotDataset on first call —
-    the child gets its own Arrow mmap, independent of the parent.
+    Uses :class:`LeRobotShardSource` (live, lazy disk view) rather than
+    the old ``FastLeRobotDataset`` — ~0.1ms construction vs ~500s on
+    18k-episode datasets, and no materialized episode set to maintain.
 
-    Resolves symlinks in ``config.root`` so the child process sees
-    real paths (symlink chains from hub-cache mode may not resolve
-    correctly in spawned contexts).
+    Accepts RAW episode ids (from ``config.episode_indices``) directly;
+    no positional/raw translation needed because the source is raw-indexed
+    throughout.
     """
-    from pathlib import Path
-
     _state = {}
 
     import time as _time
 
     def prime() -> None:
-        """Eagerly construct the FastLeRobotDataset.
+        """Eagerly construct the LeRobotShardSource.
 
-        Exposed as ``decode.prime`` so the smoke test can do construction
-        in the main thread (no timeout — construction can take minutes on
-        large datasets and isn't decode work) before running the decode
-        phase under a ThreadPoolExecutor with the 30s decode budget.
-
-        Emits a heartbeat every 30s while construction is in-flight so
-        operators can tell "still working" from "actually hung" — on
-        18k-episode datasets this phase is ~8 minutes of CPU-bound work
-        and silent progress looks indistinguishable from a deadlock.
+        Exposed as ``decode.prime`` for symmetry with the older flow —
+        the source itself is ~0.1ms to build, so this is essentially a
+        no-op except for logging.  Kept as a phase separator so the
+        smoke test's 30s decode timeout can't swallow unrelated setup.
         """
-        if "ds" in _state:
+        if "source" in _state:
             return
-        from .fast_lerobot_dataset import FastLeRobotDataset
-        import threading as _threading
+        from .lerobot_shard_source import LeRobotShardSource
 
         logger.info(
             f"[child:{config.source_name}] constructing "
-            f"FastLeRobotDataset "
-            f"(arrow_cache_path={'SET' if config.arrow_cache_path else 'None'}, "
-            f"episodes={len(config.episode_indices)})"
+            f"LeRobotShardSource(root={config.source_root})"
         )
-        t_ds = _time.monotonic()
-        _heartbeat_stop = _threading.Event()
-
-        def _heartbeat() -> None:
-            while not _heartbeat_stop.wait(timeout=30.0):
-                logger.info(
-                    f"[child:{config.source_name}] still constructing, "
-                    f"elapsed {_time.monotonic() - t_ds:.0f}s"
-                )
-
-        _heartbeat_thread = _threading.Thread(
-            target=_heartbeat, daemon=True,
-            name=f"prime-heartbeat-{config.source_name}",
-        )
-        _heartbeat_thread.start()
-        try:
-            _state["ds"] = FastLeRobotDataset(
-                config.repo_id,
-                delta_timestamps={"observation.image": [0.0]},
-                **config.dataset_kwargs(),
-            )
-        finally:
-            _heartbeat_stop.set()
-            _heartbeat_thread.join(timeout=1.0)
+        t0 = _time.monotonic()
+        source = LeRobotShardSource(config.source_root)
+        _state["source"] = source
         logger.info(
-            f"[child:{config.source_name}] FastLeRobotDataset "
-            f"constructed in {_time.monotonic() - t_ds:.1f}s "
-            f"(total_rows={len(_state['ds'].hf_dataset)}, "
-            f"episodes_in_index="
-            f"{len(_state['ds'].episode_data_index['from'])})"
+            f"[child:{config.source_name}] LeRobotShardSource "
+            f"constructed in {(_time.monotonic() - t0) * 1000:.1f}ms"
         )
 
     def decode(ep_idx: int) -> torch.Tensor:
         prime()
-        ds = _state["ds"]
+        source = _state["source"]
 
-        if not ds.meta.video_keys:
+        video_keys = source.video_keys
+        if not video_keys:
             raise RuntimeError(
                 f"Dataset {config.source_name} has no video keys — "
                 "cannot decode frames"
             )
-        vid_key = ds.meta.video_keys[0]
-        # ep_idx from the work queue is POSITIONAL (index into the
-        # dataset's filtered episode list).  episode_data_index is also
-        # positional.  get_video_file_path wants the RAW id — translate.
-        pos = ep_idx
-        raw_ep_id = ds._raw_ep_ids()[pos]
-        ep_start = ds.episode_data_index["from"][pos].item()
-        ep_end = ds.episode_data_index["to"][pos].item()
-        num_frames = ep_end - ep_start
-        video_path = ds.root / ds.meta.get_video_file_path(raw_ep_id, vid_key)
+        vid_key = video_keys[0]
+        # ep_idx is the RAW episode id — source methods take raw directly.
+        raw_ep_id = int(ep_idx)
+        num_frames = source.episode_frame_count(raw_ep_id)
+        video_path = source.episode_video_path(raw_ep_id, vid_key)
         # Resolve symlinks — HF hub-cache stores video files as
         # symlinks to ../../blobs/<hash>. pyav/ffmpeg may hang on
         # symlinked paths in spawned process contexts.
@@ -422,7 +337,7 @@ def _make_child_decode_fn(config: ProducerConfig) -> Callable[[int], torch.Tenso
         t_decode = _time.monotonic()
         frames = decode_episode_frames(
             video_path, num_frames,
-            ds.fps, ds.tolerance_s, ds.video_backend,
+            source.fps, config.tolerance_s, config.video_backend,
         )
         decode_dt = _time.monotonic() - t_decode
         if config.producer_transform is not None:

@@ -159,12 +159,39 @@ class LeRobotShuffleBufferDataset(Dataset):
         # Pre-compute delta_indices (frame offsets from delta_timestamps).
         self._delta_indices: dict[str, list[int]] | None = None
         if delta_timestamps:
-            fps = self._sources[0]["dataset"].fps
+            fps = self._source_fps(self._sources[0])
             self._delta_indices = {
                 key: [round(d * fps) for d in deltas]
                 for key, deltas in delta_timestamps.items()
             }
             self._fps = fps
+
+    # ------------------------------------------------------------------
+    # Source abstraction — transitional.  A source dict may carry either:
+    # - ``shard_source`` (preferred; new path): a LeRobotShardSource.
+    # - ``dataset`` (legacy/tests): a FastLeRobotDataset (or MagicMock
+    #   matching that shape).  Supported for backwards compat until
+    #   callers migrate.
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _source_shard(src: dict):
+        return src.get("shard_source")
+
+    @staticmethod
+    def _source_fps(src: dict) -> int:
+        shard = src.get("shard_source")
+        if shard is not None:
+            return int(shard.fps)
+        return int(src["dataset"].fps)
+
+    def _episode_frame_count(self, src: dict, raw_ep: int) -> int:
+        shard = self._source_shard(src)
+        if shard is not None:
+            return int(shard.episode_frame_count(raw_ep))
+        # Legacy FastLeRobotDataset path.
+        edi = src["dataset"].episode_data_index
+        return int(edi["to"][raw_ep] - edi["from"][raw_ep])
 
     # ------------------------------------------------------------------
     # Growing-set API
@@ -262,15 +289,11 @@ class LeRobotShuffleBufferDataset(Dataset):
         total = 0
         for src_idx, src in enumerate(self._sources):
             offset = self._ep_offsets[src_idx]
-            ep_data_index = src["dataset"].episode_data_index
             for keyed_ep in new_train:
                 if self._ep_to_source.get(keyed_ep) != src_idx:
                     continue
                 raw_ep = keyed_ep - offset
-                total += int(
-                    ep_data_index["to"][raw_ep]
-                    - ep_data_index["from"][raw_ep]
-                )
+                total += self._episode_frame_count(src, raw_ep)
         self._epoch_length = total
 
         # Forward to the pool so new decodes sample the admitted set.
@@ -286,14 +309,22 @@ class LeRobotShuffleBufferDataset(Dataset):
         """
         if len(self._sources) == 1:
             return 0
-        # Pick the source whose offset gives a raw_ep within that
-        # dataset's episode_data_index range.
+        # Pick the source whose offset puts raw_ep into a legal range
+        # for that source.  We use the shard source's own knowledge
+        # when available, fall back to the FastLeRobotDataset shape.
         for src_idx, src in enumerate(self._sources):
             offset = self._ep_offsets[src_idx]
             raw_ep = keyed_ep - offset
-            ep_data_index = src["dataset"].episode_data_index
-            if 0 <= raw_ep < len(ep_data_index["from"]):
-                return src_idx
+            if raw_ep < 0:
+                continue
+            shard = self._source_shard(src)
+            if shard is not None:
+                if raw_ep < shard.total_episodes:
+                    return src_idx
+            else:
+                ep_data_index = src["dataset"].episode_data_index
+                if raw_ep < len(ep_data_index["from"]):
+                    return src_idx
         return None
 
     # ------------------------------------------------------------------
@@ -330,39 +361,71 @@ class LeRobotShuffleBufferDataset(Dataset):
             )
 
         source = self._sources[src_idx]
-        dataset = source["dataset"]
+        shard = self._source_shard(source)
 
         # 3. Pick random sample index within episode
-        original_ep_idx = ep_idx - self._ep_offsets[src_idx]
-        ep_data_index = dataset.episode_data_index
-        ep_start = int(ep_data_index["from"][original_ep_idx])
-        ep_end = int(ep_data_index["to"][original_ep_idx])
-        num_frames_in_ep = ep_end - ep_start
+        raw_ep = ep_idx - self._ep_offsets[src_idx]
+        num_frames_in_ep = self._episode_frame_count(source, raw_ep)
+        frame_in_ep = self._rng.randint(0, num_frames_in_ep - 1)
 
-        sample_idx = ep_start + self._rng.randint(0, num_frames_in_ep - 1)
-
-        # 4. Fetch non-video data from HF dataset
-        item = dataset.hf_dataset[sample_idx]
-
-        if self._delta_indices is not None:
-            query_indices = {}
-            padding = {}
-            for key, delta_idx in self._delta_indices.items():
-                indices = [
-                    max(ep_start, min(ep_end - 1, sample_idx + d))
-                    for d in delta_idx
-                ]
-                query_indices[key] = indices
-                padding[f"{key}_is_pad"] = torch.BoolTensor([
-                    (sample_idx + d < ep_start) or (sample_idx + d >= ep_end)
-                    for d in delta_idx
-                ])
-
-            item = {**item, **padding}
-
-            query_result = dataset._query_hf_dataset(query_indices)
-            for key, val in query_result.items():
-                item[key] = val
+        # 4. Fetch non-video data.  Shard-source path is per-episode
+        # (frame_in_ep is a local index); legacy FastLeRobotDataset
+        # path uses global frame indices computed from episode_data_index.
+        if shard is not None:
+            item = shard.load_episode_row_torch(raw_ep, frame_in_ep)
+            # For delta_timestamps windowing, all indices are LOCAL to
+            # the episode and clamped to [0, num_frames_in_ep - 1].
+            if self._delta_indices is not None:
+                padding: dict[str, torch.Tensor] = {}
+                for key, delta_idx in self._delta_indices.items():
+                    local_indices = [
+                        max(0, min(num_frames_in_ep - 1, frame_in_ep + d))
+                        for d in delta_idx
+                    ]
+                    padding[f"{key}_is_pad"] = torch.BoolTensor([
+                        (frame_in_ep + d < 0)
+                        or (frame_in_ep + d >= num_frames_in_ep)
+                        for d in delta_idx
+                    ])
+                    # Windowed non-video data pulled from the same
+                    # episode's parquet (skip video keys — filled from
+                    # frames_uint8 below).
+                    if key in self._image_keys:
+                        continue
+                    window = shard.load_episode_window_torch(
+                        raw_ep, local_indices,
+                    )
+                    if key in window:
+                        item[key] = window[key]
+                item = {**item, **padding}
+            sample_idx = frame_in_ep           # LOCAL — for video frame extraction below
+            ep_start = 0
+            ep_end = num_frames_in_ep
+        else:
+            # Legacy FastLeRobotDataset path.
+            dataset = source["dataset"]
+            ep_data_index = dataset.episode_data_index
+            ep_start = int(ep_data_index["from"][raw_ep])
+            ep_end = int(ep_data_index["to"][raw_ep])
+            sample_idx = ep_start + frame_in_ep      # GLOBAL frame idx
+            item = dataset.hf_dataset[sample_idx]
+            if self._delta_indices is not None:
+                query_indices = {}
+                padding = {}
+                for key, delta_idx in self._delta_indices.items():
+                    indices = [
+                        max(ep_start, min(ep_end - 1, sample_idx + d))
+                        for d in delta_idx
+                    ]
+                    query_indices[key] = indices
+                    padding[f"{key}_is_pad"] = torch.BoolTensor([
+                        (sample_idx + d < ep_start) or (sample_idx + d >= ep_end)
+                        for d in delta_idx
+                    ])
+                item = {**item, **padding}
+                query_result = dataset._query_hf_dataset(query_indices)
+                for key, val in query_result.items():
+                    item[key] = val
 
         # 5. Extract video frame window from sampled frames
         frame_offset_in_ep = sample_idx - ep_start
@@ -383,7 +446,10 @@ class LeRobotShuffleBufferDataset(Dataset):
                 )
 
         task_idx = item["task_index"].item() if hasattr(item["task_index"], "item") else int(item["task_index"])
-        item["task"] = dataset.meta.tasks[task_idx]
+        if shard is not None:
+            item["task"] = shard.tasks().get(task_idx, "")
+        else:
+            item["task"] = dataset.meta.tasks[task_idx]
 
         # 6. Apply per-source transform
         transform = source.get("transform")

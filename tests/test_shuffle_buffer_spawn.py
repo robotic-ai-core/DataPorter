@@ -220,37 +220,79 @@ class TestVideoPathResolution:
     """
 
     def test_decode_fn_resolves_video_path(self, tmp_path):
-        """decode_video_frames receives a resolved (non-symlink) path."""
-        from unittest.mock import patch, MagicMock
-        from dataporter.producer_pool import _make_child_decode_fn, ProducerConfig
+        """decode_video_frames receives a resolved (non-symlink) path.
 
-        # Create a symlink chain like HF hub-cache
+        Builds a minimal v2.1 LeRobot layout with the video file as a
+        symlink (mirroring HF hub-cache blob storage), then verifies
+        the shard-source-backed decode fn resolves the symlink before
+        handing the path to pyav.
+        """
+        import json
+        from unittest.mock import patch
+        from pathlib import Path
+
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+
+        from dataporter.producer_pool import (
+            _make_child_decode_fn, ProducerConfig,
+        )
+
+        # Minimal v2.1 meta/ — just enough for LeRobotShardSource to
+        # construct and resolve the video path.
+        meta = tmp_path / "meta"
+        meta.mkdir()
+        info = {
+            "codebase_version": "v2.1",
+            "data_path": (
+                "data/chunk-{episode_chunk:03d}/"
+                "episode_{episode_index:06d}.parquet"
+            ),
+            "video_path": (
+                "videos/chunk-{episode_chunk:03d}/{video_key}/"
+                "episode_{episode_index:06d}.mp4"
+            ),
+            "fps": 10,
+            "total_episodes": 1,
+            "total_frames": 10,
+            "chunks_size": 1000,
+            "features": {
+                "observation.image": {
+                    "dtype": "video", "shape": [3, 96, 96],
+                },
+            },
+        }
+        (meta / "info.json").write_text(json.dumps(info))
+        (meta / "episodes.jsonl").write_text(
+            json.dumps({
+                "episode_index": 0, "length": 10, "tasks": ["t"],
+            }) + "\n"
+        )
+        (meta / "tasks.jsonl").write_text(
+            json.dumps({"task_index": 0, "task": "t"}) + "\n"
+        )
+
+        # Parquet stub (shard source opens it only if rows are requested;
+        # decode_fn doesn't touch it, but the path must exist for
+        # readiness checks if anything upstream calls them).
+        data_dir = tmp_path / "data" / "chunk-000"
+        data_dir.mkdir(parents=True)
+        pq.write_table(
+            pa.table({"frame_index": list(range(10))}),
+            data_dir / "episode_000000.parquet",
+        )
+
+        # Symlinked video file — hub-cache style.
         blobs = tmp_path / "blobs"
         blobs.mkdir()
-        real_video = blobs / "abc123"  # no extension
+        real_video = blobs / "abc123"        # no extension
         real_video.write_bytes(b"fake mp4")
-
         vid_dir = tmp_path / "videos" / "chunk-000" / "observation.image"
         vid_dir.mkdir(parents=True)
         symlink = vid_dir / "episode_000000.mp4"
         symlink.symlink_to(real_video)
 
-        # Mock FastLeRobotDataset
-        mock_ds = MagicMock()
-        mock_ds.meta.video_keys = ["observation.image"]
-        mock_ds.meta.get_video_file_path.return_value = (
-            "videos/chunk-000/observation.image/episode_000000.mp4"
-        )
-        mock_ds.episode_data_index = {
-            "from": torch.tensor([0]),
-            "to": torch.tensor([10]),
-        }
-        mock_ds.fps = 10
-        mock_ds.tolerance_s = 1e-4
-        mock_ds.video_backend = "pyav"
-        mock_ds.root = tmp_path
-
-        captured_paths = []
+        captured_paths: list[str] = []
 
         def fake_decode(video_path, *args, **kwargs):
             captured_paths.append(str(video_path))
@@ -259,23 +301,18 @@ class TestVideoPathResolution:
         config = ProducerConfig(
             source_name="test",
             repo_id="test/repo",
-            root=str(tmp_path),
+            source_root=str(tmp_path),
             episode_indices=[0],
         )
-
         decode_fn = _make_child_decode_fn(config)
 
         with patch(
-            "dataporter.fast_lerobot_dataset.FastLeRobotDataset",
-            return_value=mock_ds,
-        ), patch(
             "lerobot.common.datasets.video_utils.decode_video_frames",
             side_effect=fake_decode,
         ):
             decode_fn(0)
 
         assert len(captured_paths) == 1
-        from pathlib import Path
         decoded_path = Path(captured_paths[0])
         assert not decoded_path.is_symlink(), (
             f"decode_video_frames received a symlink: {decoded_path}. "

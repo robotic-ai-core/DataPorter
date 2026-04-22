@@ -356,3 +356,71 @@ class LeRobotShardSource:
         """
         table = self.load_episode_rows(raw_ep)
         return table.take(frame_indices)
+
+    # ------------------------------------------------------------------
+    # Torch-tensor convenience wrappers
+    #
+    # Consumers (e.g. LeRobotShuffleBufferDataset) want dict[str, Tensor]
+    # like LeRobet's ``hf_transform_to_torch``-applied ``hf_dataset[idx]``
+    # yields.  These helpers run the equivalent conversion per row /
+    # per window so the consumer doesn't have to know about pyarrow.
+    # ------------------------------------------------------------------
+
+    def load_episode_row_torch(
+        self, raw_ep: int, frame_idx: int,
+    ) -> dict[str, Any]:
+        """Single row → dict of torch tensors (same shape as the old
+        ``dataset.hf_dataset[sample_idx]`` return).
+        """
+        row_dict = self.load_episode_row_dict(raw_ep, frame_idx)
+        return _row_dict_to_torch(row_dict)
+
+    def load_episode_window_torch(
+        self, raw_ep: int, frame_indices: list[int],
+    ) -> dict[str, Any]:
+        """Multi-row window → dict of stacked torch tensors."""
+        table = self.load_episode_window(raw_ep, frame_indices)
+        return _window_table_to_torch(table)
+
+
+# ---------------------------------------------------------------------------
+# Tensor conversion helpers (mirrors LeRobet's hf_transform_to_torch but
+# applied per-row or per-window so we don't need a live transform on a
+# materialized hf_dataset).
+# ---------------------------------------------------------------------------
+
+
+def _row_dict_to_torch(row_dict: dict[str, Any]) -> dict[str, Any]:
+    """Convert a single row (column→scalar/list) into torch tensors."""
+    import torch
+
+    out: dict[str, Any] = {}
+    for key, val in row_dict.items():
+        if isinstance(val, list):
+            out[key] = torch.tensor(val)
+        elif isinstance(val, (int, float, bool)):
+            out[key] = torch.tensor(val)
+        else:
+            # Non-tensor types pass through unchanged (e.g. str, None).
+            out[key] = val
+    return out
+
+
+def _window_table_to_torch(table: "pa.Table") -> dict[str, Any]:
+    """Convert a multi-row pyarrow Table into dict[str, stacked tensors]."""
+    import torch
+
+    out: dict[str, Any] = {}
+    for name in table.column_names:
+        col = table.column(name).to_pylist()   # list of values, one per row
+        if not col:
+            out[name] = torch.tensor([])
+            continue
+        first = col[0]
+        if isinstance(first, list):
+            out[name] = torch.tensor(col)
+        elif isinstance(first, (int, float, bool)):
+            out[name] = torch.tensor(col)
+        else:
+            out[name] = col
+    return out

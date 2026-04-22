@@ -560,46 +560,61 @@ class BlendedLeRobotDataModule(L.LightningDataModule):
         sources_for_dataset = []
         cumulative_offset = 0
 
+        from .lerobot_shard_source import LeRobotShardSource
+
         for source, train_ep_indices, val_idx, full_ds in full_datasets:
             ep_data_index = full_ds.episode_data_index
 
-            # Max frames per episode across this source
-            for ep_idx in train_ep_indices:
+            # Translate positional train_ep_indices → RAW ids.  The pool
+            # and the shard-source-backed consumer both use raw ids now;
+            # old positional indexing is gone.
+            if full_ds.episodes is not None:
+                train_raw_eps = [
+                    int(full_ds.episodes[i]) for i in train_ep_indices
+                ]
+            else:
+                train_raw_eps = [int(i) for i in train_ep_indices]
+
+            # Max frames per episode across this source (used to size
+            # the ShuffleBuffer's max_frames allocation).
+            for pos in train_ep_indices:
                 ep_len = int(
-                    ep_data_index["to"][ep_idx]
-                    - ep_data_index["from"][ep_idx]
+                    ep_data_index["to"][pos]
+                    - ep_data_index["from"][pos]
                 )
                 max_frames = max(max_frames, ep_len)
 
-            # Build ProducerConfig via the from_source factory — it pulls
-            # root, dataset_episodes, and arrow_cache_path off full_ds so
-            # they can't drift out of sync with the parent's Arrow cache.
-            if full_ds.arrow_cache_path:
-                logger.info(
-                    f"Arrow cache for {source['repo_id']}: "
-                    f"{full_ds.arrow_cache_path}"
-                )
+            # Build the live shard source (constant-time construction,
+            # no materialized episode_data_index) for both the pool
+            # child and the consumer's per-episode row/window access.
+            shard_source = LeRobotShardSource(full_ds.root)
+
             config = ProducerConfig.from_source(
                 source=source,
-                full_ds=full_ds,
-                iteration_episodes=train_ep_indices,
+                shard_source=shard_source,
+                iteration_episodes=train_raw_eps,
                 episode_offset=cumulative_offset,
                 producer_transform=self.producer_transform,
             )
             producers.append(config)
 
-            # Build source dict for LeRobotShuffleBufferDataset
+            # Build source dict for LeRobotShuffleBufferDataset.  The
+            # new ``shard_source`` field is what the consumer uses for
+            # lazy per-episode access; ``dataset`` is retained so
+            # legacy map-style consumers and helpers keep working.
             transform = self.get_train_transform(source)
             sources_for_dataset.append({
                 "dataset": full_ds,
+                "shard_source": shard_source,
                 "source_name": source["repo_id"],
-                "train_episode_indices": train_ep_indices,
+                "train_episode_indices": train_raw_eps,
                 "episode_offset": cumulative_offset,
                 "transform": transform,
             })
 
-            # Advance offset past this source's episodes
-            cumulative_offset += len(train_ep_indices)
+            # Advance offset past this source's raw-id space so keys
+            # from different sources don't collide in the buffer.
+            cumulative_offset += shard_source.total_episodes + 1
 
         # Create buffer + pool
         buffer = ShuffleBuffer(
