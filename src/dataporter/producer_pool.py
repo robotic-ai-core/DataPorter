@@ -219,7 +219,24 @@ def _spawn_pool_entry(
     Errors are sent to ``error_queue`` (if provided) so the parent
     process can surface them in the training log — child-process
     logger output may not reach the parent's log handler.
+
+    INFO-level logging is force-configured on entry: spawn children start
+    with fresh logging state (default root level = WARNING), so without
+    ``basicConfig(force=True)`` our milestone logs were silently dropped.
     """
+    import logging as _logging
+    _logging.basicConfig(
+        level=_logging.INFO,
+        format="%(asctime)s [child-producer] %(message)s",
+        force=True,
+    )
+    import time as _time
+    _child_start = _time.monotonic()
+    logger.info(
+        f"[child] spawn started; {len(configs)} source(s), "
+        f"total_workers={total_workers}, warmup_target={warmup_target}"
+    )
+
     def _report_error(msg: str) -> None:
         logger.error(msg)
         if error_queue is not None:
@@ -237,18 +254,25 @@ def _spawn_pool_entry(
 
             first_ep = cfg.episode_indices[0] if cfg.episode_indices else 0
             logger.info(
-                f"[child] Smoke test: {cfg.source_name} ep {first_ep}..."
+                f"[child] smoke test starting: {cfg.source_name} "
+                f"ep {first_ep} (root={cfg.root}, "
+                f"arrow_cache_path={cfg.arrow_cache_path!r}, "
+                f"episodes_count={len(cfg.episode_indices)}, "
+                f"dataset_episodes_count="
+                f"{len(cfg.dataset_episodes) if cfg.dataset_episodes else None})"
             )
             import concurrent.futures
             with concurrent.futures.ThreadPoolExecutor(1) as ex:
+                smoke_t0 = _time.monotonic()
                 future = ex.submit(fn, first_ep)
                 try:
                     frames = future.result(timeout=_DECODE_TIMEOUT_S)
                     if frames is None:
                         raise RuntimeError("decode returned None")
                     logger.info(
-                        f"[child] Smoke test OK: {cfg.source_name} "
-                        f"ep {first_ep} → {frames.shape}"
+                        f"[child] smoke test OK: {cfg.source_name} "
+                        f"ep {first_ep} → {frames.shape} in "
+                        f"{_time.monotonic() - smoke_t0:.1f}s"
                     )
                 except concurrent.futures.TimeoutError:
                     raise RuntimeError(
@@ -258,6 +282,10 @@ def _spawn_pool_entry(
                         f"root={cfg.root}"
                     )
 
+        logger.info(
+            f"[child] all smoke tests passed in "
+            f"{_time.monotonic() - _child_start:.1f}s; entering async loop"
+        )
         asyncio.run(_run_spawn_pool(
             buffer, configs, total_workers,
             warmup_target, warmup_event, stop_event,
@@ -284,18 +312,30 @@ def _make_child_decode_fn(config: ProducerConfig) -> Callable[[int], torch.Tenso
 
     _state = {}
 
+    import time as _time
+
     def decode(ep_idx: int) -> torch.Tensor:
         if "ds" not in _state:
             from .fast_lerobot_dataset import FastLeRobotDataset
 
+            logger.info(
+                f"[child:{config.source_name}] constructing "
+                f"FastLeRobotDataset "
+                f"(arrow_cache_path={'SET' if config.arrow_cache_path else 'None'}, "
+                f"episodes={len(config.episode_indices)})"
+            )
+            t_ds = _time.monotonic()
             _state["ds"] = FastLeRobotDataset(
                 config.repo_id,
                 delta_timestamps={"observation.image": [0.0]},
                 **config.dataset_kwargs(),
             )
             logger.info(
-                f"[child] Loaded {config.source_name} "
-                f"({'Arrow cache' if config.arrow_cache_path else config.root})"
+                f"[child:{config.source_name}] FastLeRobotDataset "
+                f"constructed in {_time.monotonic() - t_ds:.1f}s "
+                f"(total_rows={len(_state['ds'].hf_dataset)}, "
+                f"episodes_in_index="
+                f"{len(_state['ds'].episode_data_index['from'])})"
             )
         ds = _state["ds"]
 
@@ -317,15 +357,31 @@ def _make_child_decode_fn(config: ProducerConfig) -> Callable[[int], torch.Tenso
         # Resolve symlinks — HF hub-cache stores video files as
         # symlinks to ../../blobs/<hash>. pyav/ffmpeg may hang on
         # symlinked paths in spawned process contexts.
+        t_resolve = _time.monotonic()
         video_path = video_path.resolve()
+        resolve_dt = _time.monotonic() - t_resolve
 
         from .fast_lerobot_dataset import decode_episode_frames
+        t_decode = _time.monotonic()
         frames = decode_episode_frames(
             video_path, num_frames,
             ds.fps, ds.tolerance_s, ds.video_backend,
         )
+        decode_dt = _time.monotonic() - t_decode
         if config.producer_transform is not None:
             frames = config.producer_transform(frames)
+        # Only log the first decode per source to avoid chatty output
+        # in the hot path.  `first_decode_logged` is set after the first
+        # successful return.
+        if not _state.get("first_decode_logged"):
+            logger.info(
+                f"[child:{config.source_name}] first decode OK: "
+                f"ep {raw_ep_id} → {tuple(frames.shape)} "
+                f"(resolve={resolve_dt * 1000:.1f}ms, "
+                f"decode={decode_dt * 1000:.0f}ms, "
+                f"video_path={video_path})"
+            )
+            _state["first_decode_logged"] = True
         return frames
 
     return decode
