@@ -30,6 +30,7 @@ from typing import Callable
 
 import torch
 
+from ._producer_pool_base import BaseProducerPool
 from .shuffle_buffer import ShuffleBuffer
 
 logger = logging.getLogger(__name__)
@@ -627,23 +628,28 @@ def _episode_iterator(episode_indices: list[int], rng: random.Random):
 # ProducerPool
 # ---------------------------------------------------------------------------
 
-class ProducerPool:
+class ProducerPool(BaseProducerPool):
     """Manages background episode decoding into a ShuffleBuffer.
 
     Two modes:
 
-    1. **Spawn mode** (default when ``configs`` provided): spawns a fresh
-       child process with its own datasets and ThreadPoolExecutor per
-       source. No inherited state, no fork deadlocks, true parallelism.
-
+    1. **Spawn mode** (default when ``configs`` provided): spawns a
+       fresh child process with its own shard source and
+       ThreadPoolExecutor per source.  No inherited state, no fork
+       deadlocks, true parallelism.
     2. **Thread mode** (fallback when ``producers`` provided): daemon
-       thread in the main process. Simpler but shares GIL. Used when
-       decode_fn closures aren't picklable.
+       thread in the main process.  Simpler but shares the GIL.  Used
+       when the decode closure isn't picklable (mostly tests).
+
+    Lifecycle (``start`` / ``stop`` / ``wait_for_warmup`` /
+    ``update_episodes`` / ``is_alive`` / error-queue drain) is
+    inherited from :class:`BaseProducerPool`.  This subclass owns only
+    the mode selection and :meth:`_create_worker`.
 
     Args:
         buffer: The ShuffleBuffer to fill.
-        configs: List of ProducerConfig (spawn mode). Picklable.
-        producers: List of AsyncProducer (thread mode). Not picklable.
+        configs: List of ProducerConfig (spawn mode).  Picklable.
+        producers: List of AsyncProducer (thread mode).  Not picklable.
         total_workers: Total decode threads distributed across sources.
         warmup_target: Fill buffer to this level before signaling ready.
     """
@@ -677,8 +683,7 @@ class ProducerPool:
         self._total_workers = total_workers
         self._warmup_target = warmup_target or buffer.capacity
         self._use_spawn = configs is not None
-
-        self._worker = None  # Process or Thread
+        self._worker = None
 
         if self._use_spawn:
             ctx = mp.get_context("spawn")
@@ -686,8 +691,6 @@ class ProducerPool:
             self._stop_event = ctx.Event()
             self._error_queue = ctx.Queue()
             # Parent → child control channel for update_episodes().
-            # Messages are (source_name, new_episode_list) tuples; the
-            # child swaps its per-source iterator when one arrives.
             self._update_queue = ctx.Queue()
         else:
             import threading
@@ -696,19 +699,14 @@ class ProducerPool:
             self._error_queue = None
             self._update_queue = None
 
-    def start(self) -> None:
-        """Start the producer (spawn process or daemon thread)."""
-        if self._worker is not None and (
-            hasattr(self._worker, 'is_alive') and self._worker.is_alive()
-        ):
-            raise RuntimeError("ProducerPool already running")
-
-        self._stop_event.clear()
-        self._warmup_event.clear()
-
+    def _create_worker(self):
+        """Spawn a fresh ``Process`` (spawn mode) or ``Thread`` (thread
+        mode) bound to this pool's config.  Inherits ``start``/``stop``
+        etc. from :class:`BaseProducerPool`.
+        """
         if self._use_spawn:
             ctx = mp.get_context("spawn")
-            self._worker = ctx.Process(
+            return ctx.Process(
                 target=_spawn_pool_entry,
                 args=(
                     self._buffer,
@@ -723,114 +721,16 @@ class ProducerPool:
                 daemon=True,
                 name="producer-pool",
             )
-        else:
-            import threading
-            self._worker = threading.Thread(
-                target=_run_thread_pool,
-                args=(
-                    self._buffer,
-                    self._producers,
-                    self._warmup_target,
-                    self._warmup_event,
-                    self._stop_event,
-                ),
-                daemon=True,
-                name="producer-pool",
-            )
-
-        self._worker.start()
-
-    def wait_for_warmup(self, timeout: float = 1200.0) -> None:
-        """Block until warmup_target items are in the buffer.
-
-        If the child process reported an error (via the error queue),
-        raises RuntimeError with the child's message so it appears in
-        the parent's training log — child-process logger output often
-        goes to stderr and doesn't reach the parent's log handler.
-
-        Default timeout is 1200s (20min).  FastLeRobotDataset
-        construction in the child scales with episode count
-        (~0.025s/episode on typical hardware) — at 18k episodes that's
-        ~500s just to build the dataset, before any decode or buffer
-        warmup happens.  300s (the previous default) was too tight and
-        fired spuriously on large datasets even when the child was
-        working normally.
-        """
-        if not self._warmup_event.wait(timeout=timeout):
-            # Check for child errors before raising generic timeout
-            child_error = self._drain_error_queue()
-            if child_error:
-                raise RuntimeError(
-                    f"ProducerPool child failed: {child_error}"
-                )
-            raise TimeoutError(
-                f"ProducerPool didn't fill {self._warmup_target} items "
-                f"in {timeout}s (have {len(self._buffer)})"
-            )
-        # Even on success, check for errors (child may have set warmup
-        # event in its finally block after an error)
-        child_error = self._drain_error_queue()
-        if child_error:
-            raise RuntimeError(
-                f"ProducerPool child failed: {child_error}"
-            )
-
-    def _drain_error_queue(self) -> str | None:
-        """Read the first error from the child's error queue, if any."""
-        if self._error_queue is None:
-            return None
-        try:
-            return self._error_queue.get_nowait()
-        except Exception:
-            return None
-
-    def stop(self) -> None:
-        """Stop the producer."""
-        self._stop_event.set()
-        if self._worker is not None:
-            self._worker.join(timeout=10)
-            if hasattr(self._worker, 'terminate') and self._worker.is_alive():
-                self._worker.terminate()
-            self._worker = None
-
-    def update_episodes(
-        self, source_name: str, new_episodes: list[int],
-    ) -> None:
-        """Swap the work-queue for a running source atomically.
-
-        Sends a message to the spawn child; the child's update poller
-        replaces ``iterators[source_name]`` with a fresh iterator over
-        ``new_episodes``.  Currently-dispatched decode tasks finish on
-        the old list; subsequent dispatches use the new list.
-
-        No-op (with warning) in thread mode — update semantics aren't
-        needed there because thread-mode callers typically rebuild the
-        pool between epochs.
-
-        Args:
-            source_name: ``ProducerConfig.source_name`` for the source
-                to update.
-            new_episodes: Full episode-id list for that source (not a
-                delta; the iterator is replaced).
-        """
-        if not self._use_spawn or self._update_queue is None:
-            logger.warning(
-                "ProducerPool.update_episodes: no-op in thread mode "
-                "(use spawn mode with ProducerConfig for live updates)"
-            )
-            return
-        if not self.is_alive:
-            logger.warning(
-                "ProducerPool.update_episodes: worker not running; "
-                "start() the pool first or the message will be lost"
-            )
-        try:
-            self._update_queue.put_nowait(
-                (source_name, list(new_episodes)),
-            )
-        except Exception as e:
-            logger.warning(f"update_episodes: failed to enqueue: {e}")
-
-    @property
-    def is_alive(self) -> bool:
-        return self._worker is not None and self._worker.is_alive()
+        import threading
+        return threading.Thread(
+            target=_run_thread_pool,
+            args=(
+                self._buffer,
+                self._producers,
+                self._warmup_target,
+                self._warmup_event,
+                self._stop_event,
+            ),
+            daemon=True,
+            name="producer-pool",
+        )
