@@ -171,6 +171,18 @@ class BlendedLeRobotDataModule(L.LightningDataModule):
         cache_frames: If True, cache decoded video frames in memory.
         cache_budget_gb: Per-worker memory budget for frame cache in GB.
         train_split_ratio: Fraction of episodes for training (default 0.9).
+        buffer_rotation_per_samples: K for sample-gated rotation.
+            ``None`` (default) disables the gate — the right choice for
+            video since each put delivers a full episode (~100 frames)
+            while each sample is one frame; the put-count vs
+            sample-count ratio is definitionally ≠ 1 and the K=1 gate
+            would misfire.  Opt in with e.g. ``frames_per_episode`` for
+            deterministic rotation, or leave ``None`` for the
+            time-throttle fallback.
+        producer_pool_workers: Decode worker threads inside the
+            producer pool child.  Default 4.  Independent from
+            ``num_workers`` (DataLoader workers in the parent
+            process); raise to scale decode throughput.
     """
 
     def __init__(
@@ -200,7 +212,8 @@ class BlendedLeRobotDataModule(L.LightningDataModule):
         tolerance_s: float | None = None,
         self_refresh_every_n_items: int | None = None,
         nominal_total_frames: int | None = None,
-        buffer_rotation_per_samples: int | None = 1,
+        buffer_rotation_per_samples: int | None = None,
+        producer_pool_workers: int = 4,
     ):
         super().__init__()
 
@@ -280,16 +293,34 @@ class BlendedLeRobotDataModule(L.LightningDataModule):
             if nominal_total_frames is not None else None
         )
         # K — samples consumed per producer put at steady state.
-        # Default 1 = "rotate one slot per consumer sample drawn," the
-        # correct production default (natural decode-rate rotation
-        # under fast consumers; consumer-side blocking surfaces
-        # decode bottlenecks as low train/step_time).  ``None``
-        # disables the gate entirely and falls back to time-throttle
-        # — mostly a testing escape hatch.
+        #
+        # Default ``None`` for video: each buffer slot holds one
+        # decoded episode (~100+ frames), so one put delivers ~100
+        # samples of useful data.  The K=1 gate, designed around text
+        # where slot == sample, over-fires on video because it
+        # compares put-count to sample-count as if each put were one
+        # sample — ``samples_consumed`` runs ~100× faster than
+        # ``write_head``, trips the gate at ``capacity*K`` ahead, and
+        # crashes training with a spurious "pool may be dead" error
+        # even when the producer is happily over-provisioned on
+        # frames.
+        #
+        # With ``None`` the pool falls back to a light time-throttle
+        # (50 ms sleep when buffer full) — matches the pre-gate
+        # behavior that produced real training results.  Opt in to
+        # ``K=frames_per_episode`` or similar if you want sample-
+        # gated rotation; for text the natural K=1 lives at the
+        # ``TokenShuffleBuffer`` level, not here.
         self.buffer_rotation_per_samples = (
             None if buffer_rotation_per_samples is None
             else int(buffer_rotation_per_samples)
         )
+        # Producer pool concurrency — threads inside the spawned
+        # pool child that decode episodes in parallel.  Independent
+        # from ``num_workers`` (DataLoader workers in the parent).
+        # Raise to improve the decode-rate / sample-rate ratio when
+        # decode is the bottleneck; watch CPU usage.
+        self.producer_pool_workers = int(producer_pool_workers)
         # Split predicate.  Default: 90/10 by modulo-10 on raw episode id.
         # Stable across refreshes; an episode's train/val assignment never
         # changes as the admitted set grows.
@@ -669,7 +700,8 @@ class BlendedLeRobotDataModule(L.LightningDataModule):
             rotation_per_samples=self.buffer_rotation_per_samples,
         )
         self._producer_pool = ProducerPool(
-            buffer, configs=producers, total_workers=4,
+            buffer, configs=producers,
+            total_workers=self.producer_pool_workers,
         )
         self._producer_pool.start()
         logger.info(
