@@ -169,11 +169,33 @@ class LeRobotShuffleBufferDataset(Dataset):
         # source dict; admit them immediately so ``__len__`` and sampling
         # work without a refresh() call.  Growing-mode callers pass
         # prefetchers instead and leave train_episode_indices off.
+        #
+        # Defensive train/val isolation: if the caller passed any
+        # val-side raw ids in ``train_episode_indices`` (typically a bug
+        # in the DataModule's split computation), filter them out and
+        # log a loud warning.  Silent pass-through would ship
+        # contamination into the train buffer with no alarm — see
+        # ``tests/test_train_val_isolation.py`` for the full contract.
         initial_by_source: dict[str, list[int]] = {}
         for src_idx, src in enumerate(self._sources):
             eps = list(src.get("train_episode_indices", []))
-            if eps:
-                initial_by_source[self._source_names[src_idx]] = eps
+            if not eps:
+                continue
+            kept = [e for e in eps if self._split_fn(e)]
+            dropped = [e for e in eps if not self._split_fn(e)]
+            if dropped:
+                logger.warning(
+                    "LeRobotShuffleBufferDataset: source %r had %d "
+                    "val-side raw ids in train_episode_indices "
+                    "(first: %s); filtering them out so they don't "
+                    "contaminate the train buffer. This typically "
+                    "indicates a bug in the caller's split computation.",
+                    self._source_names[src_idx],
+                    len(dropped),
+                    dropped[:5],
+                )
+            if kept:
+                initial_by_source[self._source_names[src_idx]] = kept
         if initial_by_source:
             self._admit_by_source(initial_by_source)
 

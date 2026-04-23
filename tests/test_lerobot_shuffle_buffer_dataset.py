@@ -31,8 +31,13 @@ class _MockShardSource:
 
     Satisfies the narrow interface the consumer uses:
     ``fps``, ``total_episodes``, ``episode_frame_count``,
-    ``load_episode_row_torch``, ``load_episode_window_torch``, ``tasks``.
-    Deterministic per-(ep, frame) content so tests can assert exact values.
+    ``list_ready_episodes``, ``load_episode_row_torch``,
+    ``load_episode_window_torch``, ``tasks``.  Deterministic
+    per-(ep, frame) content so tests can assert exact values.
+
+    ``list_ready_episodes`` defaults to "all declared episodes are
+    ready"; set ``_ready_source`` to a callable to make readiness
+    driven by an external state (e.g. a test prefetcher).
     """
 
     def __init__(
@@ -49,10 +54,16 @@ class _MockShardSource:
         self.root = Path("/tmp/_mock_shard_source")
         self._rng_seed = seed
         self._num_tasks = num_tasks
+        self._ready_source = None   # optional callable → list[int]
 
     @property
     def total_episodes(self) -> int:
         return self._num_episodes
+
+    def list_ready_episodes(self) -> list[int]:
+        if self._ready_source is not None:
+            return sorted(set(self._ready_source()))
+        return list(range(self._num_episodes))
 
     def episode_frame_count(self, raw_ep: int) -> int:
         return self._frames_per_episode
