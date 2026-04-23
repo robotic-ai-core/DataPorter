@@ -335,8 +335,12 @@ def _build_dataset(
     # Wire shard readiness to the prefetcher's scan — the new
     # consumer queries shard.list_ready_episodes().
     mini_source._ready_source = prefetcher.ready_episodes
+    # gate_enabled=False: this test suite uses a mock _RecordingPool, so
+    # no real producer is running to balance sample() calls against put()
+    # calls — the flow-balance gate would block after ~frame_slack samples.
     buffer = ShuffleBuffer(
         capacity=16, max_frames=8, channels=3, height=8, width=8,
+        gate_enabled=False,
     )
     sources = [{
         "shard_source": mini_source,

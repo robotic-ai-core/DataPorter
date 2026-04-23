@@ -201,6 +201,7 @@ class TestBufferKeyCollision:
         """
         buf = ShuffleBuffer(
             capacity=10, max_frames=5, channels=3, height=4, width=4,
+            gate_enabled=False,
         )
 
         # Source A: offset=0, Source B: offset=1
@@ -248,6 +249,7 @@ class TestSourceAttributionAccuracy:
         """
         buf = ShuffleBuffer(
             capacity=20, max_frames=10, channels=3, height=4, width=4,
+            gate_enabled=False,
         )
         ds_a = _make_mock_dataset(num_episodes=5, frames_per_episode=10)
         ds_b = _make_mock_dataset(num_episodes=5, frames_per_episode=10)
@@ -318,9 +320,13 @@ class TestCompositionRatio:
         Uses non-overlapping episode ranges to avoid the key collision
         bugs. Validates that weighted round-robin dispatch in ProducerPool
         produces the intended blend ratio when decode speeds are identical.
+
+        Gate disabled because we sample 1000x after pool.stop() to measure
+        steady-state ratio — a flow-balance gate would block that drain.
         """
         buf = ShuffleBuffer(
             capacity=60, max_frames=5, channels=3, height=4, width=4,
+            gate_enabled=False,
         )
 
         def decode_a(ep_idx: int) -> torch.Tensor:

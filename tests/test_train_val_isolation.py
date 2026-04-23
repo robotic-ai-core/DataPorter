@@ -102,7 +102,7 @@ class TestInitTimeFilter:
         shard = _make_mock_shard_source(num_episodes=20, frames_per_episode=10)
         buf = ShuffleBuffer(
             capacity=4, max_frames=10, channels=1, height=4, width=4,
-            rotation_per_samples=None,
+            gate_enabled=False,
         )
         return LeRobotShuffleBufferDataset(
             buffer=buf,
@@ -201,7 +201,7 @@ class TestRefreshFiltersVal:
         shard._ready_source = pf.ready_episodes
         buf = ShuffleBuffer(
             capacity=4, max_frames=10, channels=1, height=4, width=4,
-            rotation_per_samples=None,
+            gate_enabled=False,
         )
         ds = LeRobotShuffleBufferDataset(
             buffer=buf,
@@ -272,7 +272,7 @@ class TestRefreshFiltersVal:
         shard._ready_source = pf.ready_episodes
         buf = ShuffleBuffer(
             capacity=4, max_frames=10, channels=1, height=4, width=4,
-            rotation_per_samples=None,
+            gate_enabled=False,
         )
         ds = LeRobotShuffleBufferDataset(
             buffer=buf,
@@ -336,7 +336,7 @@ class TestEndToEndBufferIsTrainOnly:
 
         buf = ShuffleBuffer(
             capacity=6, max_frames=32, channels=3, height=32, width=32,
-            rotation_per_samples=1,
+            gate_enabled=True,
         )
         cfg = ProducerConfig.from_source(
             source={"repo_id": "synth", "weight": 1.0},
@@ -445,7 +445,7 @@ class TestPoolDecodeNeverVal:
 
         buf = ShuffleBuffer(
             capacity=6, max_frames=32, channels=3, height=32, width=32,
-            rotation_per_samples=1,
+            gate_enabled=True,
         )
         cfg = ProducerConfig.from_source(
             source={"repo_id": "synth", "weight": 1.0},
@@ -565,7 +565,7 @@ class TestDataModuleSplitAlignment:
         )
         buf = ShuffleBuffer(
             capacity=4, max_frames=10, channels=1, height=4, width=4,
-            rotation_per_samples=None,
+            gate_enabled=False,
         )
         with caplog.at_level(
             logging.WARNING,

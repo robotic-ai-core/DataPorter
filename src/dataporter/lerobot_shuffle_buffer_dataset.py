@@ -28,6 +28,7 @@ from typing import Callable
 import torch
 from torch.utils.data import Dataset
 
+from .sample_reader import SampleReader
 from .shuffle_buffer import ShuffleBuffer
 
 logger = logging.getLogger(__name__)
@@ -223,15 +224,18 @@ class LeRobotShuffleBufferDataset(Dataset):
                 f"source_name (collision would break update_episodes routing)"
             )
 
-        # Pre-compute delta_indices (frame offsets from delta_timestamps).
-        self._delta_indices: dict[str, list[int]] | None = None
-        if delta_timestamps:
-            fps = int(self._sources[0]["shard_source"].fps)
-            self._delta_indices = {
-                key: [round(d * fps) for d in deltas]
-                for key, deltas in delta_timestamps.items()
-            }
-            self._fps = fps
+        # One :class:`SampleReader` per source owns the delta-window +
+        # padding + task-lookup logic.  The consumer's job is narrowed
+        # to routing: pick an episode from the buffer, map it to a
+        # source, pick a frame, pass to the reader.
+        self._sample_readers: list[SampleReader] = [
+            SampleReader(
+                src["shard_source"],
+                delta_timestamps=delta_timestamps,
+                image_keys=self._image_keys,
+            )
+            for src in self._sources
+        ]
 
     # ------------------------------------------------------------------
     # Growing-set API
@@ -462,62 +466,15 @@ class LeRobotShuffleBufferDataset(Dataset):
         num_frames_in_ep = int(shard.episode_frame_count(raw_ep))
         frame_in_ep = self._rng.randint(0, num_frames_in_ep - 1)
 
-        # 4. Fetch non-video data (per-episode, local frame indices).
-        item = shard.load_episode_row_torch(raw_ep, frame_in_ep)
-        if self._delta_indices is not None:
-            padding: dict[str, torch.Tensor] = {}
-            for key, delta_idx in self._delta_indices.items():
-                padding[f"{key}_is_pad"] = torch.BoolTensor([
-                    (frame_in_ep + d < 0)
-                    or (frame_in_ep + d >= num_frames_in_ep)
-                    for d in delta_idx
-                ])
-                # Windowed non-video data pulled from the same
-                # episode's parquet (skip video keys — filled from
-                # frames_uint8 below).
-                if key in self._image_keys:
-                    continue
-                local_indices = [
-                    max(0, min(num_frames_in_ep - 1, frame_in_ep + d))
-                    for d in delta_idx
-                ]
-                window = shard.load_episode_window_torch(
-                    raw_ep, local_indices,
-                )
-                if key in window:
-                    item[key] = window[key]
-            item = {**item, **padding}
-
-        # 5. Extract video frame window from sampled frames.  Indices are
-        # LOCAL to the episode and clamped to the actually-decoded frame
-        # count (episodes.jsonl can disagree with the mp4 at the margin).
-        decoded_n = len(frames_uint8)
-        for vid_key in self._image_keys:
-            if self._delta_indices is not None and vid_key in self._delta_indices:
-                frame_indices = [
-                    min(
-                        max(0, frame_in_ep + d),
-                        min(num_frames_in_ep, decoded_n) - 1,
-                    )
-                    for d in self._delta_indices[vid_key]
-                ]
-                item[vid_key] = (
-                    frames_uint8[frame_indices].to(torch.float32) / 255.0
-                )
-            else:
-                rel_idx = min(frame_in_ep, decoded_n - 1)
-                item[vid_key] = (
-                    frames_uint8[rel_idx].unsqueeze(0).to(torch.float32) / 255.0
-                )
-
-        task_idx = (
-            item["task_index"].item()
-            if hasattr(item["task_index"], "item")
-            else int(item["task_index"])
+        # 4. Delegate full sample construction to this source's reader.
+        #    The reader handles row data, windowed non-video fields,
+        #    padding masks, video-frame window extraction from the
+        #    supplied buffer tensor, and task-string lookup.
+        item = self._sample_readers[src_idx].read(
+            raw_ep, frame_in_ep, frames_uint8=frames_uint8,
         )
-        item["task"] = shard.tasks().get(task_idx, "")
 
-        # 6. Apply per-source transform
+        # 5. Apply per-source transform
         transform = source.get("transform")
         if transform is not None:
             item = transform(item)

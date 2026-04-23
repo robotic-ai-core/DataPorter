@@ -34,18 +34,17 @@ class ShuffleBuffer:
     Pre-allocates a fixed-size tensor buffer in shared memory. The
     producer fills it with ``put()``, workers read with ``sample()``.
 
-    Rotation is sample-gated (not time-gated): every ``rotation_per_samples``
-    consumer samples allows exactly one producer put at steady state.
+    Rotation is flow-balance-gated: the gate tracks actual frames
+    written to the buffer and actual samples drawn, blocking either
+    side when one races more than ``capacity * max_frames`` units
+    ahead of the other.  No tuning parameter — the gate scales with
+    the real production rate, not an estimate.
 
-    - Slow consumer (K samples/sec < decode throughput): pool-side gate
-      blocks the producer until the consumer draws K more samples.  No
-      wasted decodes, no CPU burn during training stalls.
-    - Fast consumer (K samples/sec > decode throughput): consumer-side
-      gate blocks ``sample()`` if the consumer has raced more than
-      ``capacity * K`` samples ahead of the pool's puts.  Training
-      throughput drops to decode rate, making the decode bottleneck
-      visible to the user as low ``train/step_time`` — the UX signal
-      to increase ``total_workers``.
+    - Consumer races ahead: ``sample()`` blocks until producer
+      catches up.  Surfaces true decode bottlenecks as an
+      actionable RuntimeError after 30s.
+    - Producer races ahead: pool loop blocks until consumer draws.
+      Prevents runaway CPU during training pauses (validation).
 
     Args:
         capacity: Max number of items (episodes) in the buffer.
@@ -53,16 +52,10 @@ class ShuffleBuffer:
         channels: Number of image channels.
         height: Frame height.
         width: Frame width.
-        rotation_per_samples: K — samples consumed per producer put at
-            steady state.  ``None`` (default) disables the gate and
-            falls back to a light time throttle; tests and direct
-            buffer uses without a pool should stick with the default.
-            Set to 1 for "replace one slot per sample drawn" —
-            equivalent to "no artificial throttle, natural decode-
-            rate rotation."  Larger values deliberately slow rotation
-            (serve K samples per decoded episode before eviction).
-            Production code (e.g. ``BlendedLeRobotDataModule``)
-            typically passes an explicit integer here.
+        gate_enabled: When ``False``, the rotation gate is disabled
+            (no blocking on either side).  Direct-buffer tests that
+            sample without a pool need this; production callers
+            leave it ``True``.
     """
 
     def __init__(
@@ -72,14 +65,13 @@ class ShuffleBuffer:
         channels: int,
         height: int,
         width: int,
-        rotation_per_samples: int | None = None,
+        gate_enabled: bool = True,
     ):
         self._capacity = capacity
         self._max_frames = max_frames
-        # Shared rotation controller (counter + gate logic).  Same
-        # instance semantic as TokenShuffleBuffer — both buffers get
-        # identical rotation behavior from one code path.
-        self._gate = RotationGate(rotation_per_samples)
+        # Shared rotation controller — same semantic for video and
+        # text, both buffers hold a RotationGate via composition.
+        self._gate = RotationGate(enabled=gate_enabled)
 
         # Pre-flight: verify /dev/shm can hold the buffer
         buffer_bytes = capacity * max_frames * channels * height * width
@@ -132,20 +124,15 @@ class ShuffleBuffer:
     def capacity(self) -> int:
         return self._capacity
 
-    # ------------------------------------------------------------------
-    # Back-compat accessors — the producer pool reads these directly.
-    # ``_rotation_k`` and ``_samples_consumed`` are forwarded from the
-    # shared :class:`RotationGate` so calling code doesn't need to
-    # change when the gate is refactored.
-    # ------------------------------------------------------------------
+    @property
+    def max_frames(self) -> int:
+        return self._max_frames
 
     @property
-    def _rotation_k(self) -> int | None:
-        return self._gate.rotation_k
-
-    @property
-    def _samples_consumed(self):
-        return self._gate._samples_consumed
+    def frame_slack(self) -> int:
+        """One-buffer-worth of frames — the gate's slack on either
+        side of the flow balance."""
+        return self._capacity * self._max_frames
 
     def __len__(self) -> int:
         return min(int(self._count), self._capacity)
@@ -157,6 +144,8 @@ class ShuffleBuffer:
         """Write frames to the next slot. Returns evicted key or None.
 
         SINGLE WRITER ONLY — called exclusively by ProducerPool.
+        Reports ``n_frames`` to the rotation gate so flow-balance
+        tracking is exact regardless of episode length variance.
         """
         if isinstance(frames, dict):
             frames = frames["frames"]
@@ -178,6 +167,10 @@ class ShuffleBuffer:
         self._keys[slot] = key
         self._write_head[0] = int(self._write_head) + 1
         self._count[0] = min(int(self._count) + 1, self._capacity)
+
+        # Publish the actual frame count to the gate so the producer /
+        # consumer gates can see real production, not an estimate.
+        self._gate.record_put(n_frames)
 
         return evicted
 
@@ -201,10 +194,10 @@ class ShuffleBuffer:
         if n == 0:
             raise IndexError("ShuffleBuffer is empty")
 
-        # Consumer-side gate — delegated to the shared RotationGate.
+        # Consumer-side gate: block if consumer is more than one
+        # buffer-worth of frames ahead of real production.
         self._gate.wait_if_consumer_too_far_ahead(
-            write_head_getter=lambda: int(self._write_head),
-            capacity=self._capacity,
+            self.frame_slack,
             buffer_name="ShuffleBuffer",
         )
 
@@ -216,8 +209,8 @@ class ShuffleBuffer:
         n_frames = int(self._lengths[slot])
         frames = self._buffer[slot, :n_frames]
 
-        # Publish the sample to the gate's counter AFTER the read so
-        # the producer-side gate only sees committed samples.
+        # Increment samples_consumed AFTER the read so the producer
+        # gate only sees committed samples.
         self._gate.record_sample()
 
         return key, frames

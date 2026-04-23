@@ -501,15 +501,21 @@ def test_update_episodes_admits_new_episode_live(tmp_path):
         pool.update_episodes("synth", [0, 1, 7])
 
         # Wait for ep 7 to show up in buffer keys (bounded poll).
-        # No ``buf.clear()`` needed: the pool rotates contents via
-        # FIFO eviction now that backpressure is throttle-not-park.
+        # Drive consumer samples so the flow-balance gate doesn't
+        # park the producer once the buffer is full.
+        import random as _random
+        rng = _random.Random(0)
         deadline = time.monotonic() + 30.0
         saw_7 = False
         while time.monotonic() < deadline:
             if 7 in buf.keys():
                 saw_7 = True
                 break
-            time.sleep(0.2)
+            try:
+                buf.sample(rng)
+            except IndexError:
+                pass
+            time.sleep(0.1)
     finally:
         pool.stop()
 
@@ -607,16 +613,22 @@ def test_partial_then_grow_consumer_refresh(tmp_path):
             f"got {new_len}"
         )
 
-        # Wait for new keys to appear in the buffer.  The pool rotates
-        # on its own (backpressure is throttle-not-park), so no
-        # explicit drain is needed.
+        # Wait for new keys to appear in the buffer.  The flow-balance
+        # gate blocks the producer when it's a full buffer-worth ahead
+        # of consumer draws; consume samples while polling so the pool
+        # keeps rotating.
         deadline = time.monotonic() + 30.0
         seen_new: set[int] = set()
         while time.monotonic() < deadline:
             seen_new.update(set(buf.keys()) & {2, 3, 4})
             if seen_new:
                 break
-            time.sleep(0.2)
+            # Drive consumer to unblock the producer gate.
+            try:
+                consumer[0]
+            except Exception:
+                pass
+            time.sleep(0.05)
         assert seen_new, (
             f"new eps never appeared in buffer after refresh; "
             f"seen={seen_new}"
@@ -681,10 +693,11 @@ def test_multi_source_offset_keeps_key_spaces_disjoint(tmp_path):
     pool.start()
     try:
         pool.wait_for_warmup(timeout=30.0)
-        # Accumulate keys across several drain cycles so both source
-        # namespaces populate.  The pool rotates via FIFO eviction so
-        # we observe both sources by polling over time — no manual
-        # buffer drain required.
+        # Accumulate keys across several cycles so both source
+        # namespaces populate.  Drive consumer samples each iteration
+        # so the flow-balance gate keeps the producer running.
+        import random as _random
+        rng = _random.Random(0)
         observed_keys: set[int] = set()
         deadline = time.monotonic() + 10.0
         while time.monotonic() < deadline and not (
@@ -692,7 +705,11 @@ def test_multi_source_offset_keeps_key_spaces_disjoint(tmp_path):
             and any(k >= 1000 for k in observed_keys)
         ):
             observed_keys.update(k for k in buf.keys() if k >= 0)
-            time.sleep(0.2)
+            try:
+                buf.sample(rng)
+            except IndexError:
+                pass
+            time.sleep(0.1)
     finally:
         pool.stop()
 
@@ -887,19 +904,25 @@ def _build_pool_and_consumer(tmp_path, initial_eps: list[int]):
 def _wait_for_keys(buf, wanted: set[int], timeout: float = 30.0) -> set[int]:
     """Poll the buffer for ``wanted`` keys until deadline.
 
-    Relies on the pool rotating its FIFO ring buffer (throttle-not-park
-    backpressure).  Before that fix this helper had to call
-    ``buf.clear()`` to unstick the pool — a workaround that hid the
-    production park bug.  Workaround removed; the helper is now a
-    pure observer.
+    Drives consumer samples each iteration so the flow-balance gate
+    doesn't block the producer.  Under the new gate, producer waits
+    when frames_produced is more than one buffer-worth ahead of
+    samples_consumed; without a consumer sampling, the producer
+    would park after filling the buffer.
     """
+    import random as _random
+    rng = _random.Random(0)
     seen: set[int] = set()
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         seen.update(set(buf.keys()) & wanted)
         if seen >= wanted:
             return seen
-        time.sleep(0.2)
+        try:
+            buf.sample(rng)
+        except IndexError:
+            pass
+        time.sleep(0.1)
     return seen
 
 
@@ -1093,8 +1116,17 @@ def test_buffer_rotates_after_fill(tmp_path):
         # Buffer is full at this point (warmup_target == capacity).
         initial_head = int(buf._write_head)
         initial_keys = set(buf.keys())
-        # Wait for rotation to actually happen.
-        time.sleep(3.0)
+        # Drive consumer samples — the flow-balance gate couples
+        # producer rate to consumer rate, so rotation requires
+        # active sampling.  100 samples × ~50ms/sleep pair = 5s.
+        import random as _random
+        rng = _random.Random(0)
+        for _ in range(100):
+            try:
+                buf.sample(rng)
+            except IndexError:
+                pass
+            time.sleep(0.03)
         final_head = int(buf._write_head)
         final_keys = set(buf.keys())
     finally:
@@ -1103,13 +1135,15 @@ def test_buffer_rotates_after_fill(tmp_path):
     # write_head monotonically counts puts — it MUST have advanced.
     assert final_head > initial_head, (
         f"buffer parked after fill: write_head stayed at {initial_head} "
-        f"for 3s (pool did not rotate the ring)"
+        f"despite consumer sampling — sample-gated rotation broken"
     )
-    # We expect at least several rotations over 3s with a 3-slot buffer
-    # and ~100ms/decode; be generous (≥3 extra puts).
+    # At 100 samples consumed and each put delivering ~20 frames,
+    # gate permits ~5 puts to keep the balance (5 × 20 = 100).
+    # Accept anywhere from 3+ to prove rotation works.
     assert final_head - initial_head >= 3, (
-        f"buffer rotation too slow: only {final_head - initial_head} "
-        f"puts in 3s (initial_head={initial_head}, final={final_head})"
+        f"buffer rotation too slow: {final_head - initial_head} puts "
+        f"after 100 consumer samples (initial={initial_head}, "
+        f"final={final_head})"
     )
     # The observable contents should have at least one key we didn't
     # see at fill time — proving the ring actually overwrote.
@@ -1151,14 +1185,20 @@ def test_update_episodes_reaches_buffer_without_clear(tmp_path):
     try:
         pool.wait_for_warmup(timeout=30.0)
         pool.update_episodes("synth", [0, 1, 7])
-        # Poll buffer WITHOUT clearing — if the pool parks after fill,
-        # ep 7 will never land.
+        # Poll buffer WITHOUT clearing — drive consumer samples each
+        # iteration so the flow-balance gate doesn't park the producer.
+        import random as _random
+        rng = _random.Random(0)
         deadline = time.monotonic() + 30.0
         saw_7 = False
         while time.monotonic() < deadline:
             if 7 in buf.keys():
                 saw_7 = True
                 break
+            try:
+                buf.sample(rng)
+            except IndexError:
+                pass
             time.sleep(0.2)
     finally:
         pool.stop()

@@ -61,7 +61,13 @@ class TestShuffleBuffer:
 
     def test_sample_uniform_distribution(self):
         """All items in buffer should be sampled roughly equally."""
-        buf = ShuffleBuffer(capacity=5, max_frames=3, channels=3, height=8, width=8)
+        # gate_enabled=False: direct-buffer test samples 1000x from
+        # 5 puts with no producer pool — the default flow-balance
+        # gate would block waiting for frames_produced to advance.
+        buf = ShuffleBuffer(
+            capacity=5, max_frames=3, channels=3, height=8, width=8,
+            gate_enabled=False,
+        )
         for i in range(5):
             buf.put(i, _make_frames(3))
 
@@ -417,7 +423,11 @@ class TestRandomness:
 
     def test_sample_covers_buffer(self):
         """Repeated sampling should cover most of the buffer contents."""
-        buf = ShuffleBuffer(capacity=30, max_frames=3, channels=3, height=8, width=8)
+        # gate_enabled=False: direct-buffer test with no pool.
+        buf = ShuffleBuffer(
+            capacity=30, max_frames=3, channels=3, height=8, width=8,
+            gate_enabled=False,
+        )
         for i in range(30):
             buf.put(i, _make_frames(3, c=3, h=8, w=8))
 

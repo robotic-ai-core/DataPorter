@@ -41,10 +41,13 @@ class TokenShuffleBuffer:
       - ``_write_head``   ``[1]`` int64 — total puts across the lifetime
       - ``_count``        ``[1]`` int64 — number of occupied slots
 
-    Rotation is sample-gated via :class:`RotationGate` — same contract
-    as :class:`ShuffleBuffer` on the video side, so both pipelines get
-    identical rotation semantics from a single shared code path.  See
-    ``_rotation_gate.py`` for the producer/consumer gate details.
+    Rotation is flow-balance-gated via :class:`RotationGate` — same
+    contract as :class:`ShuffleBuffer` on the video side, so both
+    pipelines get identical rotation semantics from one shared code
+    path.  Each put records ``n_frames=1`` (one document per put);
+    each sample records one unit of consumption.  At the text
+    granularity, 1 put = 1 sample-worth, so the gate behaves like
+    a natural one-to-one flow balance.
 
     Args:
         capacity: Max number of items in the buffer.
@@ -53,15 +56,9 @@ class TokenShuffleBuffer:
         vocab_size: Optional vocab-size sanity check at ``put()`` time.
             When set, tokens ≥ vocab_size raise ValueError — catches
             tokenizer misconfiguration early rather than at embedding lookup.
-        rotation_per_samples: K — samples consumed per producer put at
-            steady state.  Default 1 = "rotate one slot per sample
-            drawn" — natural for text because each slot holds exactly
-            one document / training example, so K=1 means "each doc
-            is served once before eviction" (maximum diversity, no
-            repetition).  Set to ``None`` for direct-buffer tests or
-            contexts with no producer pool present; the gate would
-            otherwise block forever waiting for ``write_head`` to
-            advance.  See :class:`RotationGate`.
+        gate_enabled: When ``False``, disables the rotation gate
+            (no blocking on either side).  Direct-buffer tests that
+            sample without a producer pool need this.
     """
 
     def __init__(
@@ -70,7 +67,7 @@ class TokenShuffleBuffer:
         seq_len: int,
         pad_token_id: int = 0,
         vocab_size: int | None = None,
-        rotation_per_samples: int | None = 1,
+        gate_enabled: bool = True,
     ):
         if capacity < 1:
             raise ValueError(f"capacity must be >= 1, got {capacity}")
@@ -81,7 +78,7 @@ class TokenShuffleBuffer:
         self._seq_len = seq_len
         self._pad_token_id = int(pad_token_id)
         self._vocab_size = vocab_size
-        self._gate = RotationGate(rotation_per_samples)
+        self._gate = RotationGate(enabled=gate_enabled)
 
         # Pre-flight /dev/shm check
         token_bytes = capacity * seq_len * 4   # int32
@@ -143,19 +140,12 @@ class TokenShuffleBuffer:
     def seq_len(self) -> int:
         return self._seq_len
 
-    # ------------------------------------------------------------------
-    # Back-compat accessors — the producer pool reads these directly.
-    # Forwarded from :class:`RotationGate`; keeps the pool code
-    # buffer-type-agnostic.
-    # ------------------------------------------------------------------
-
     @property
-    def _rotation_k(self) -> int | None:
-        return self._gate.rotation_k
-
-    @property
-    def _samples_consumed(self):
-        return self._gate._samples_consumed
+    def frame_slack(self) -> int:
+        """One-buffer-worth — the gate's slack on either side of the
+        flow balance.  Each text put is one document (= one sample-
+        worth of content), so this is simply ``capacity``."""
+        return self._capacity
 
     def __len__(self) -> int:
         return min(int(self._count), self._capacity)
@@ -246,6 +236,11 @@ class TokenShuffleBuffer:
         self._write_head[0] = int(self._write_head) + 1
         self._count[0] = min(int(self._count) + 1, self._capacity)
 
+        # Each text put = one document = one sample-unit of content.
+        # Record 1 frame so the flow-balance gate tracks content
+        # in the same unit as ``sample()``'s out-count.
+        self._gate.record_put(1)
+
         return evicted
 
     # ------------------------------------------------------------------
@@ -269,8 +264,7 @@ class TokenShuffleBuffer:
             raise IndexError("TokenShuffleBuffer is empty")
 
         self._gate.wait_if_consumer_too_far_ahead(
-            write_head_getter=lambda: int(self._write_head),
-            capacity=self._capacity,
+            self.frame_slack,
             buffer_name="TokenShuffleBuffer",
         )
 
@@ -300,8 +294,7 @@ class TokenShuffleBuffer:
             raise IndexError("TokenShuffleBuffer is empty")
 
         self._gate.wait_if_consumer_too_far_ahead(
-            write_head_getter=lambda: int(self._write_head),
-            capacity=self._capacity,
+            self.frame_slack,
             buffer_name="TokenShuffleBuffer",
         )
 

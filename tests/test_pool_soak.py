@@ -113,7 +113,13 @@ def test_pool_soak_30s(tmp_path):
     try:
         pool.wait_for_warmup(timeout=30.0)
 
-        # Sample write_head + buffer keys every ~2s across the window.
+        # Sample write_head + buffer keys every ~2s across the window,
+        # while driving the consumer side to satisfy the flow-balance
+        # gate.  With the frame-count gate enabled, an idle consumer
+        # correctly stalls the producer after ~frame_slack frames; to
+        # observe sustained rotation we must sample in lockstep.
+        import random
+        rng = random.Random(0)
         duration_s = 30.0
         poll_s = 2.0
         samples_head: list[int] = []
@@ -121,10 +127,17 @@ def test_pool_soak_30s(tmp_path):
         deadline = time.monotonic() + duration_s
         samples_head.append(int(buf._write_head))
         samples_keys.append({k for k in buf.keys() if k >= 0})
+        next_snapshot = time.monotonic() + poll_s
         while time.monotonic() < deadline:
-            time.sleep(poll_s)
-            samples_head.append(int(buf._write_head))
-            samples_keys.append({k for k in buf.keys() if k >= 0})
+            try:
+                buf.sample(rng)
+            except IndexError:
+                pass
+            if time.monotonic() >= next_snapshot:
+                samples_head.append(int(buf._write_head))
+                samples_keys.append({k for k in buf.keys() if k >= 0})
+                next_snapshot = time.monotonic() + poll_s
+            time.sleep(0.001)
 
         # Invariant 1: write_head kept advancing throughout.  A
         # parked pool would show one big jump (during warmup) then

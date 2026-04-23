@@ -80,12 +80,26 @@ def assert_buffer_rotates(
             include per-interval deltas so the failure mode is
             obvious (stuck-at-0 vs. slow-but-moving).
     """
+    import random as _random
+    rng = _random.Random(0)
     initial = int(buffer._write_head)
     samples: list[int] = [initial]
     deadline = time.monotonic() + duration_s
+    # Drive consumer samples aggressively — the flow-balance gate
+    # unblocks one producer put per ``n_frames`` consumer samples
+    # (slot's frame count).  Without rapid sampling the pool can
+    # still be blocked at slack-balance even in a 2s window.
+    last_snapshot = time.monotonic() + poll_interval_s
     while time.monotonic() < deadline:
-        time.sleep(poll_interval_s)
-        samples.append(int(buffer._write_head))
+        try:
+            buffer.sample(rng)
+        except IndexError:
+            pass
+        if time.monotonic() >= last_snapshot:
+            samples.append(int(buffer._write_head))
+            last_snapshot = time.monotonic() + poll_interval_s
+        time.sleep(0.001)
+    samples.append(int(buffer._write_head))
     delta = samples[-1] - samples[0]
     if delta < min_write_head_delta:
         deltas = [b - a for a, b in zip(samples, samples[1:])]

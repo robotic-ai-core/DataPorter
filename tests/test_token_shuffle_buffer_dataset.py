@@ -40,12 +40,12 @@ def test_padded_returns_fixed_shape():
 
 
 def test_unpadded_returns_variable_length():
-    # rotation_per_samples=None: this test samples 10x from 2 puts with
+    # gate_enabled=False: this test samples 10x from 2 puts with
     # no producer pool — the default K=1 gate would block waiting for
     # write_head to advance.  Disable the gate explicitly for direct-
     # buffer unit tests.
     buf = TokenShuffleBuffer(
-        capacity=4, seq_len=16, rotation_per_samples=None,
+        capacity=4, seq_len=16, gate_enabled=False,
     )
     buf.put(0, torch.tensor([1, 2, 3], dtype=torch.int32))
     buf.put(1, torch.tensor([1, 2, 3, 4, 5, 6, 7], dtype=torch.int32))

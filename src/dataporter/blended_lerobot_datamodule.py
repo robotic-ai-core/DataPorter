@@ -14,16 +14,16 @@ from __future__ import annotations
 
 import logging
 import re
-import time
 from pathlib import Path
 from typing import Callable
 
 import lightning as L
-from torch.utils.data import ConcatDataset, Subset, WeightedRandomSampler
+from torch.utils.data import ConcatDataset, Dataset, WeightedRandomSampler
 
 from .dataset_wrappers import AugmentedDataset, KeyFilterDataset
-from .fast_lerobot_dataset import FastLeRobotDataset
+from .lerobot_shard_source import LeRobotShardSource
 from .resumable import ResumableDataLoader, resolve_num_workers
+from .shard_source_val_dataset import ShardSourceValDataset
 
 logger = logging.getLogger(__name__)
 
@@ -171,18 +171,17 @@ class BlendedLeRobotDataModule(L.LightningDataModule):
         cache_frames: If True, cache decoded video frames in memory.
         cache_budget_gb: Per-worker memory budget for frame cache in GB.
         train_split_ratio: Fraction of episodes for training (default 0.9).
-        buffer_rotation_per_samples: K for sample-gated rotation.
-            ``None`` (default) disables the gate — the right choice for
-            video since each put delivers a full episode (~100 frames)
-            while each sample is one frame; the put-count vs
-            sample-count ratio is definitionally ≠ 1 and the K=1 gate
-            would misfire.  Opt in with e.g. ``frames_per_episode`` for
-            deterministic rotation, or leave ``None`` for the
-            time-throttle fallback.
         producer_pool_workers: Decode worker threads inside the
             producer pool child.  Default 4.  Independent from
             ``num_workers`` (DataLoader workers in the parent
             process); raise to scale decode throughput.
+
+    Rotation semantics are flow-balance-driven: the buffer tracks
+    actual frames written vs samples drawn (one frame per sample)
+    and throttles whichever side races more than one buffer-worth
+    ahead of the other.  No tuning knob — the gate is correct for
+    any episode length distribution by construction.  See
+    :class:`RotationGate` for details.
     """
 
     def __init__(
@@ -212,7 +211,6 @@ class BlendedLeRobotDataModule(L.LightningDataModule):
         tolerance_s: float | None = None,
         self_refresh_every_n_items: int | None = None,
         nominal_total_frames: int | None = None,
-        buffer_rotation_per_samples: int | None = None,
         producer_pool_workers: int = 4,
     ):
         super().__init__()
@@ -292,29 +290,6 @@ class BlendedLeRobotDataModule(L.LightningDataModule):
             int(nominal_total_frames)
             if nominal_total_frames is not None else None
         )
-        # K — samples consumed per producer put at steady state.
-        #
-        # Default ``None`` for video: each buffer slot holds one
-        # decoded episode (~100+ frames), so one put delivers ~100
-        # samples of useful data.  The K=1 gate, designed around text
-        # where slot == sample, over-fires on video because it
-        # compares put-count to sample-count as if each put were one
-        # sample — ``samples_consumed`` runs ~100× faster than
-        # ``write_head``, trips the gate at ``capacity*K`` ahead, and
-        # crashes training with a spurious "pool may be dead" error
-        # even when the producer is happily over-provisioned on
-        # frames.
-        #
-        # With ``None`` the pool falls back to a light time-throttle
-        # (50 ms sleep when buffer full) — matches the pre-gate
-        # behavior that produced real training results.  Opt in to
-        # ``K=frames_per_episode`` or similar if you want sample-
-        # gated rotation; for text the natural K=1 lives at the
-        # ``TokenShuffleBuffer`` level, not here.
-        self.buffer_rotation_per_samples = (
-            None if buffer_rotation_per_samples is None
-            else int(buffer_rotation_per_samples)
-        )
         # Producer pool concurrency — threads inside the spawned
         # pool child that decode episodes in parallel.  Independent
         # from ``num_workers`` (DataLoader workers in the parent).
@@ -375,25 +350,29 @@ class BlendedLeRobotDataModule(L.LightningDataModule):
         if len(self._sources) <= 1:
             return raw_timestamps
 
-        import tempfile
-        from lerobot.common.datasets.lerobot_dataset import (
-            LeRobotDatasetMetadata,
-        )
-
         available_per_source = []
         for source in self._sources:
-            kwargs = {}
+            # Prefer a direct ``info.json`` read via LeRobotShardSource
+            # when the source has a local root — avoids the
+            # LeRobotDatasetMetadata code path that calls
+            # ``get_repo_versions`` (HF API) even for local layouts.
             if "root" in source:
-                kwargs["root"] = source["root"]
+                shard = LeRobotShardSource(source["root"])
+                available = set(shard.features.keys())
             else:
-                # Probe in a temp dir so metadata-only downloads don't
-                # pollute the HF cache (which would leave an empty data/
-                # directory that breaks LeRobotDataset's download logic).
-                kwargs["root"] = Path(
-                    tempfile.mkdtemp(prefix="lerobot_meta_probe_")
+                import tempfile
+                from lerobot.common.datasets.lerobot_dataset import (
+                    LeRobotDatasetMetadata,
                 )
-            meta = LeRobotDatasetMetadata(source["repo_id"], **kwargs)
-            available = set(meta.features.keys())
+                # Probe in a temp dir so metadata-only downloads don't
+                # pollute the HF cache (which would leave an empty
+                # data/ directory that breaks LeRobotDataset's
+                # download logic).
+                kwargs = {"root": Path(
+                    tempfile.mkdtemp(prefix="lerobot_meta_probe_")
+                )}
+                meta = LeRobotDatasetMetadata(source["repo_id"], **kwargs)
+                available = set(meta.features.keys())
             available.update(
                 k.replace("_path", "") for k in available
                 if k.endswith("_path")
@@ -493,92 +472,82 @@ class BlendedLeRobotDataModule(L.LightningDataModule):
         )
 
     # ------------------------------------------------------------------
-    # Source kwargs (single source of truth)
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _source_to_dataset_kwargs(source: dict) -> dict:
-        """Extract FastLeRobotDataset kwargs from a source dict.
-
-        Centralizes the root/tolerance_s/episodes extraction so the
-        SameFileError-prevention logic (passing episodes to restrict
-        download_episodes' allow_patterns) lives in one place.
-        """
-        kwargs = {}
-        if "root" in source:
-            kwargs["root"] = source["root"]
-        if "tolerance_s" in source:
-            kwargs["tolerance_s"] = source["tolerance_s"]
-        if "_available_episodes" in source:
-            kwargs["episodes"] = source["_available_episodes"]
-        return kwargs
-
-    # ------------------------------------------------------------------
     # Source loading
     # ------------------------------------------------------------------
 
+    def _resolve_source_root(self, source: dict) -> Path:
+        """Return the filesystem root for a source.
+
+        Sources can declare a ``"root"`` (static local layout, used by
+        prefetched caches too once the writer has placed files) or just
+        a ``"repo_id"`` (HF cache is the canonical root).  For the
+        HF-only case we build the standard cache path.
+        """
+        if "root" in source:
+            return Path(source["root"])
+        # HF cache layout: <HF_HOME>/hub/datasets--<org>--<repo>/snapshots/<rev>
+        # LeRobotDatasetMetadata resolves this by downloading metadata
+        # files, which is the minimum-work probe to get the right
+        # snapshot hash.  The prefetcher does this on its own path when
+        # ``prefetch=True`` is configured; fall back to that behaviour.
+        repo_id = source["repo_id"]
+        raise RuntimeError(
+            f"Source {repo_id!r} has no ``root`` — set ``prefetch=True`` "
+            f"so the prefetcher populates a local root before setup, or "
+            f"pass an explicit ``root`` pointing at an existing LeRobot "
+            f"v2.1 layout.  The shard-source-based pipeline no longer "
+            f"constructs a FastLeRobotDataset at setup time (that used "
+            f"to handle HF-cache resolution implicitly)."
+        )
+
     def _load_and_split_source(
         self, source: dict, delta_timestamps: dict,
-    ) -> tuple[list[int], list[int], FastLeRobotDataset]:
-        """Load a single source dataset and split into train/val.
+    ) -> tuple[list[tuple[int, int]], list[tuple[int, int]], LeRobotShardSource]:
+        """Load a single source and split into train/val frame pairs.
+
+        Uses :class:`LeRobotShardSource` (O(1) construction, lazy
+        metadata) instead of :class:`FastLeRobotDataset` (heavyweight,
+        materializes ``episode_data_index`` and the HuggingFace Arrow
+        cache at construction).  For an 18k-episode dataset this drops
+        setup time from ~7 minutes to a few seconds.
 
         Returns:
-            (train_episode_indices, val_sample_indices, full_dataset)
+            ``(train_pairs, val_pairs, shard_source)`` where each pair
+            is ``(raw_ep_id, frame_in_ep)``.  Downstream paths either
+            dedup pairs to raw episode ids (ShuffleBuffer path,
+            episode-level decoding) or feed them straight into
+            :class:`ShardSourceValDataset` (val + legacy map-style
+            train).
         """
-        kwargs = self._source_to_dataset_kwargs(source)
+        root = (
+            Path(source["root"]) if "root" in source
+            else self._resolve_source_root(source)
+        )
+        shard = LeRobotShardSource(root)
 
-        # Retry on HF rate limit (429)
-        for attempt in range(3):
-            try:
-                # Per-source frame_buffer_capacity overrides global default
-                buf_cap = source.get(
-                    "frame_buffer_capacity", self.frame_buffer_capacity
-                )
-                dataset = FastLeRobotDataset(
-                    source["repo_id"],
-                    cache_frames=self.cache_frames,
-                    cache_budget_gb=self.cache_budget_gb,
-                    frame_buffer_capacity=buf_cap,
-                    delta_timestamps=delta_timestamps,
-                    **kwargs,
-                )
-                break
-            except Exception as e:
-                if "429" in str(e) and attempt < 2:
-                    wait = 310
-                    logger.warning(
-                        f"HF rate limited loading {source['repo_id']}, "
-                        f"retrying in {wait}s (attempt {attempt + 1}/3)"
-                    )
-                    time.sleep(wait)
-                else:
-                    raise
+        # Split + pair computation uses RAW episode ids — matches the
+        # downstream consumer's contract.  Readiness comes from the
+        # shard's disk scan (prefetcher-aware, since the prefetcher is
+        # the writer for this root).
+        ready_raw_eps = shard.list_ready_episodes()
+        # Fall back to ``_available_episodes`` if a caller pre-populated
+        # it; matches the legacy kwarg behaviour for external callers
+        # still driving the prefetcher themselves.
+        override = source.get("_available_episodes")
+        if override is not None:
+            ready_raw_eps = sorted(set(override))
 
-        episode_index = dataset.episode_data_index
-        num_episodes = len(episode_index["from"])
+        train_pairs: list[tuple[int, int]] = []
+        val_pairs: list[tuple[int, int]] = []
+        for raw_ep in ready_raw_eps:
+            n_frames = int(shard.episode_frame_count(raw_ep))
+            pairs = [(raw_ep, f) for f in range(n_frames)]
+            if self.split_fn(raw_ep):
+                train_pairs.extend(pairs)
+            else:
+                val_pairs.extend(pairs)
 
-        # Split by the DataModule's ``split_fn`` — same predicate we
-        # later forward to :class:`LeRobotShuffleBufferDataset`, so the
-        # Dataset's defensive init-time filter stays silent under
-        # correct DataModule usage.
-        #
-        # Previously this was ``list(range(train_episodes))`` (first-N
-        # by ratio), which disagreed with the modulo-based split_fn
-        # the Dataset uses — the defensive filter then stripped ~10%
-        # of episodes and emitted a noisy false-positive warning.
-        # Single source of truth now: ``split_fn``.
-        train_ep_indices = [
-            pos for pos in range(num_episodes) if self.split_fn(pos)
-        ]
-        val_indices = []
-        for ep_idx in range(num_episodes):
-            if self.split_fn(ep_idx):
-                continue
-            start = int(episode_index["from"][ep_idx])
-            end = int(episode_index["to"][ep_idx])
-            val_indices.extend(range(start, end))
-
-        return train_ep_indices, val_indices, dataset
+        return train_pairs, val_pairs, shard
 
     # ------------------------------------------------------------------
     # Shuffle buffer setup
@@ -593,35 +562,50 @@ class BlendedLeRobotDataModule(L.LightningDataModule):
         1. ShuffleBuffer (pre-allocated shared memory)
         2. ProducerPool (background video decode, weighted scheduling)
         3. LeRobotShuffleBufferDataset (complete samples from buffer)
-        """
-        from .shuffle_buffer import ShuffleBuffer
-        from .producer_pool import ProducerConfig, ProducerPool
-        from .lerobot_shuffle_buffer_dataset import LeRobotShuffleBufferDataset
-        from .frame_transforms import probe_output_shape
 
-        # Determine max_frames and frame dimensions across all sources
-        max_frames = 0
-        # Probe frame shape from first source's metadata
-        first_ds = full_datasets[0][3]
-        vid_keys = first_ds.meta.video_keys
+        Consumes the ``(train_pairs, val_pairs, shard)`` shape returned
+        by :meth:`_load_and_split_source` — no FastLeRobotDataset
+        involvement on this path.
+        """
+        from .frame_transforms import probe_output_shape
+        from .lerobot_shuffle_buffer_dataset import LeRobotShuffleBufferDataset
+        from .producer_pool import ProducerConfig, ProducerPool
+        from .shuffle_buffer import ShuffleBuffer
+
+        # Probe frame shape from the first source's shard metadata.
+        first_shard: LeRobotShardSource = full_datasets[0][3]
+        vid_keys = first_shard.video_keys
         if vid_keys:
-            # LeRobot metadata stores shape as (H, W, C)
-            shape = first_ds.meta.features[vid_keys[0]].get("shape", (96, 96, 3))
-            source_height, source_width, channels = shape[0], shape[1], shape[2]
+            # LeRobot info.json stores video shape in one of two
+            # conventions across the ecosystem: ``[H, W, C]`` (real
+            # hub datasets) or ``[C, H, W]`` (some synthetic fixtures
+            # and legacy exports).  The ``names`` field is
+            # authoritative when present; otherwise fall back to the
+            # small-leading-dim heuristic (channels are 1/3/4).
+            feat = first_shard.features.get(vid_keys[0], {})
+            shape = list(feat.get("shape", [96, 96, 3]))
+            names = feat.get("names")
+            if names == ["channels", "height", "width"] or (
+                names is None and shape[0] in (1, 3, 4)
+            ):
+                channels, source_height, source_width = (
+                    int(shape[0]), int(shape[1]), int(shape[2]),
+                )
+            else:
+                source_height, source_width, channels = (
+                    int(shape[0]), int(shape[1]), int(shape[2]),
+                )
         else:
             source_height, source_width, channels = 96, 96, 3
 
         # Producer-side transform: probe its output shape so the
         # ShuffleBuffer allocates shm at training (post-transform)
-        # resolution.  No transform → source resolution.
-        # input_shape is (T, C, H, W); we only need the spatial dims for
-        # the buffer.  max_frames is determined below.
+        # resolution.
         source_spatial = (channels, source_height, source_width)
         if self.producer_transform is not None:
             out_spatial = probe_output_shape(
                 self.producer_transform, (1, *source_spatial),
             )
-            # (T=1, C, H', W') → pull C, H, W
             _, channels, height, width = out_spatial
             logger.info(
                 f"ShuffleBuffer: producer_transform={self.producer_transform!r} "
@@ -629,53 +613,40 @@ class BlendedLeRobotDataModule(L.LightningDataModule):
             )
         else:
             height, width = source_height, source_width
-        producers = []
-        sources_for_dataset = []
+
+        producers: list = []
+        sources_for_dataset: list[dict] = []
         cumulative_offset = 0
+        max_frames = 0
+        total_train_samples = 0
 
-        from .lerobot_shard_source import LeRobotShardSource
+        for source, train_pairs, _val_pairs, shard in full_datasets:
+            # Unique raw episode ids across the train split for this
+            # source.  Pool decodes whole episodes; the consumer samples
+            # frames-within-episodes at sampling time.
+            train_raw_eps = sorted({raw_ep for raw_ep, _ in train_pairs})
 
-        for source, train_ep_indices, val_idx, full_ds in full_datasets:
-            ep_data_index = full_ds.episode_data_index
-
-            # Translate positional train_ep_indices → RAW ids.  The pool
-            # and the shard-source-backed consumer both use raw ids now;
-            # old positional indexing is gone.
-            if full_ds.episodes is not None:
-                train_raw_eps = [
-                    int(full_ds.episodes[i]) for i in train_ep_indices
-                ]
-            else:
-                train_raw_eps = [int(i) for i in train_ep_indices]
-
-            # Max frames per episode across this source (used to size
-            # the ShuffleBuffer's max_frames allocation).
-            for pos in train_ep_indices:
-                ep_len = int(
-                    ep_data_index["to"][pos]
-                    - ep_data_index["from"][pos]
+            # Size the ShuffleBuffer's per-slot allocation to the
+            # longest episode we'll actually decode.
+            for raw_ep in train_raw_eps:
+                max_frames = max(
+                    max_frames, int(shard.episode_frame_count(raw_ep)),
                 )
-                max_frames = max(max_frames, ep_len)
 
-            # Build the live shard source (constant-time construction,
-            # no materialized episode_data_index) for both the pool
-            # child and the consumer's per-episode row/window access.
-            shard_source = LeRobotShardSource(full_ds.root)
+            total_train_samples += len(train_pairs)
 
             config = ProducerConfig.from_source(
                 source=source,
-                shard_source=shard_source,
+                shard_source=shard,
                 iteration_episodes=train_raw_eps,
                 episode_offset=cumulative_offset,
                 producer_transform=self.producer_transform,
             )
             producers.append(config)
 
-            # Build source dict for LeRobotShuffleBufferDataset — the
-            # shard source backs all per-episode row/window access.
             transform = self.get_train_transform(source)
             sources_for_dataset.append({
-                "shard_source": shard_source,
+                "shard_source": shard,
                 "source_name": source["repo_id"],
                 "train_episode_indices": train_raw_eps,
                 "episode_offset": cumulative_offset,
@@ -683,12 +654,8 @@ class BlendedLeRobotDataModule(L.LightningDataModule):
             })
 
             # Advance offset past this source's raw-id space so buffer
-            # keys from different sources stay disjoint.  Routing in the
-            # consumer uses source_name (not offset-range inference) so
-            # the exact stride beyond non-overlap doesn't matter, but
-            # partitioning the id space avoids surprises if a downstream
-            # caller ever does offset-based lookup.
-            cumulative_offset += shard_source.total_episodes + 1
+            # keys from different sources stay disjoint.
+            cumulative_offset += shard.total_episodes + 1
 
         # Create buffer + pool
         buffer = ShuffleBuffer(
@@ -697,7 +664,6 @@ class BlendedLeRobotDataModule(L.LightningDataModule):
             channels=channels,
             height=height,
             width=width,
-            rotation_per_samples=self.buffer_rotation_per_samples,
         )
         self._producer_pool = ProducerPool(
             buffer, configs=producers,
@@ -705,22 +671,11 @@ class BlendedLeRobotDataModule(L.LightningDataModule):
         )
         self._producer_pool.start()
         logger.info(
-            f"ShuffleBuffer pipeline started: capacity={self.shuffle_buffer_capacity}, "
+            f"ShuffleBuffer pipeline started: "
+            f"capacity={self.shuffle_buffer_capacity}, "
             f"max_frames={max_frames}, sources={len(producers)}"
         )
         self._producer_pool.wait_for_warmup()
-
-        # Create training dataset
-        # epoch_length: use total training samples across all sources
-        # as a reasonable epoch size
-        total_train_samples = 0
-        for source, train_ep_indices, val_idx, full_ds in full_datasets:
-            ep_data_index = full_ds.episode_data_index
-            for ep_idx in train_ep_indices:
-                total_train_samples += int(
-                    ep_data_index["to"][ep_idx]
-                    - ep_data_index["from"][ep_idx]
-                )
 
         self.train_dataset = LeRobotShuffleBufferDataset(
             buffer=buffer,
@@ -735,7 +690,7 @@ class BlendedLeRobotDataModule(L.LightningDataModule):
             refresh_every_n_items=self.self_refresh_every_n_items,
             nominal_total_frames=self.nominal_total_frames,
         )
-        self._train_sampler = None  # No sampler needed
+        self._train_sampler = None
 
     # ------------------------------------------------------------------
     # Setup / teardown
@@ -801,20 +756,20 @@ class BlendedLeRobotDataModule(L.LightningDataModule):
                 self.delta_timestamps, full_datasets,
             )
         else:
-            # Standard path: Subset + WeightedRandomSampler
+            # Legacy standard path: map-style Dataset + optional
+            # WeightedRandomSampler.  Same primitive as val — each
+            # source's train frames become a :class:`ShardSourceValDataset`
+            # over ``train_pairs``.  No FastLeRobotDataset involvement.
             train_subsets = []
             train_weights = []
 
-            for source, train_ep_idx, val_idx, full_ds in full_datasets:
-                # Expand episode indices to sample indices
-                ep_data_index = full_ds.episode_data_index
-                train_indices = []
-                for ep_idx in train_ep_idx:
-                    start = int(ep_data_index["from"][ep_idx])
-                    end = int(ep_data_index["to"][ep_idx])
-                    train_indices.extend(range(start, end))
-
-                train_sub = Subset(full_ds, train_indices)
+            image_keys = self.get_image_keys()
+            for source, train_pairs, _val_pairs, shard in full_datasets:
+                train_sub: Dataset = ShardSourceValDataset(
+                    shard, train_pairs,
+                    delta_timestamps=self.delta_timestamps,
+                    image_keys=image_keys,
+                )
 
                 # Per-source transform
                 transform = self.get_train_transform(source)
@@ -849,28 +804,20 @@ class BlendedLeRobotDataModule(L.LightningDataModule):
 
             self.train_dataset = combined_train
 
-        # ---- Validation dataset (always uses FastLeRobotDataset) ----
-        # Val uses map-style ``Subset(full_ds, val_idx)`` where ``val_idx``
-        # is a list of GLOBAL frame indices computed from
-        # ``episode_data_index`` — an addressing mode the shard source
-        # doesn't materialize.  Migrating val to LeRobotShardSource is
-        # tracked but out of scope until the train path stabilizes; do
-        # not replace this without reworking the val sampler to speak
-        # (episode_id, frame_in_ep) instead of global frame indices.
-        val_parts = []
-        for source, train_ep_idx, val_idx, full_ds in full_datasets:
-            if val_ts is not self.delta_timestamps:
-                kwargs = {"delta_timestamps": val_ts}
-                kwargs.update(self._source_to_dataset_kwargs(source))
-                val_ds = FastLeRobotDataset(
-                    source["repo_id"],
-                    cache_frames=self.cache_frames,
-                    cache_budget_gb=self.cache_budget_gb,
-                    **kwargs,
-                )
-                val_parts.append(Subset(val_ds, val_idx))
-            else:
-                val_parts.append(Subset(full_ds, val_idx))
+        # ---- Validation dataset ----
+        # Backed by :class:`ShardSourceValDataset` — same primitive on
+        # every path, indexed by ``(raw_ep, frame_in_ep)`` pairs that
+        # come straight from :meth:`_load_and_split_source`.  Val uses
+        # ``val_ts`` (either the default delta spec or a caller-
+        # supplied override via ``val_delta_timestamps``).
+        val_parts: list = []
+        image_keys = self.get_image_keys()
+        for source, _train_pairs, val_pairs, shard in full_datasets:
+            val_parts.append(ShardSourceValDataset(
+                shard, val_pairs,
+                delta_timestamps=val_ts,
+                image_keys=image_keys,
+            ))
 
         # Filter val samples to common keys when blending
         common_keys = self._common_sample_keys()
