@@ -1050,3 +1050,125 @@ def test_step_mode_callback_drives_growth_end_to_end(tmp_path):
         )
     finally:
         pool.stop()
+
+
+# ===========================================================================
+# (11) Buffer contents rotate after fill (no-park backpressure)
+# ===========================================================================
+
+
+def test_buffer_rotates_after_fill(tmp_path):
+    """Once the buffer reaches capacity, the pool must NOT park — it
+    must keep decoding and let the ring buffer overwrite oldest slots
+    in FIFO order.  Regression for the overfit symptom where
+    ``while len(buf) >= capacity: sleep`` froze buffer contents to
+    the first fill's ~capacity episodes for the whole training run.
+
+    We observe rotation via ``write_head`` (monotonic put counter):
+    after the buffer fills, write_head must keep increasing over a
+    bounded wait window.  Use a tiny capacity + many iteration_episodes
+    so rotation is rapid and easy to observe.
+    """
+    from dataporter import LeRobotShardSource, ResizeFrames
+    from dataporter.producer_pool import ProducerConfig, ProducerPool
+    from dataporter.shuffle_buffer import ShuffleBuffer
+
+    root = tmp_path / "ds"
+    n_eps = 8
+    _make_dataset(
+        root, ready_eps=list(range(n_eps)), total_episodes=n_eps,
+    )
+    src = LeRobotShardSource(root)
+
+    # Capacity 3 << n_eps means the pool has to keep overwriting.
+    buf = ShuffleBuffer(
+        capacity=3, max_frames=32, channels=3, height=32, width=32,
+    )
+    cfg = ProducerConfig.from_source(
+        source={"repo_id": "synth", "weight": 1.0},
+        shard_source=src,
+        iteration_episodes=list(range(n_eps)),
+        producer_transform=ResizeFrames(32, 32),
+    )
+    pool = ProducerPool(buf, configs=[cfg], total_workers=2, warmup_target=3)
+    pool.start()
+    try:
+        pool.wait_for_warmup(timeout=30.0)
+        # Buffer is full at this point (warmup_target == capacity).
+        initial_head = int(buf._write_head)
+        initial_keys = set(buf.keys())
+        # Wait for rotation to actually happen.
+        time.sleep(3.0)
+        final_head = int(buf._write_head)
+        final_keys = set(buf.keys())
+    finally:
+        pool.stop()
+
+    # write_head monotonically counts puts — it MUST have advanced.
+    assert final_head > initial_head, (
+        f"buffer parked after fill: write_head stayed at {initial_head} "
+        f"for 3s (pool did not rotate the ring)"
+    )
+    # We expect at least several rotations over 3s with a 3-slot buffer
+    # and ~100ms/decode; be generous (≥3 extra puts).
+    assert final_head - initial_head >= 3, (
+        f"buffer rotation too slow: only {final_head - initial_head} "
+        f"puts in 3s (initial_head={initial_head}, final={final_head})"
+    )
+    # The observable contents should have at least one key we didn't
+    # see at fill time — proving the ring actually overwrote.
+    assert final_keys != initial_keys or len(initial_keys) < n_eps, (
+        f"buffer keys unchanged after rotation: {final_keys} — ring "
+        f"buffer semantics broken"
+    )
+
+
+def test_update_episodes_reaches_buffer_without_clear(tmp_path):
+    """With the no-park backpressure, ``update_episodes`` can deliver
+    a new episode into the buffer without the test having to call
+    ``buf.clear()`` to unstick the pool.  Mirror of
+    ``test_update_episodes_admits_new_episode_live`` but proving the
+    pool rotates on its own.
+    """
+    from dataporter import LeRobotShardSource, ResizeFrames
+    from dataporter.producer_pool import ProducerConfig, ProducerPool
+    from dataporter.shuffle_buffer import ShuffleBuffer
+
+    root = tmp_path / "ds"
+    _make_dataset(root, ready_eps=[0, 1], total_episodes=10)
+    src = LeRobotShardSource(root)
+
+    buf = ShuffleBuffer(
+        capacity=4, max_frames=32, channels=3, height=32, width=32,
+    )
+    cfg = ProducerConfig.from_source(
+        source={"repo_id": "synth", "weight": 1.0},
+        shard_source=src,
+        iteration_episodes=[0, 1],
+        producer_transform=ResizeFrames(32, 32),
+    )
+    pool = ProducerPool(buf, configs=[cfg], total_workers=2, warmup_target=2)
+    # Pre-land ep 7 on disk so update_episodes can reach a decodable file.
+    _write_episode_parquet(root, 7, n_frames=20)
+    _write_episode_mp4(root, 7, n_frames=20, height=32, width=32, fps=30)
+    pool.start()
+    try:
+        pool.wait_for_warmup(timeout=30.0)
+        pool.update_episodes("synth", [0, 1, 7])
+        # Poll buffer WITHOUT clearing — if the pool parks after fill,
+        # ep 7 will never land.
+        deadline = time.monotonic() + 30.0
+        saw_7 = False
+        while time.monotonic() < deadline:
+            if 7 in buf.keys():
+                saw_7 = True
+                break
+            time.sleep(0.2)
+    finally:
+        pool.stop()
+
+    assert saw_7, (
+        f"ep 7 never reached buffer after update_episodes without "
+        f"an explicit buf.clear() — pool may be parking at full; "
+        f"final keys={buf.keys()}"
+    )

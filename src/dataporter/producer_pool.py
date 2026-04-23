@@ -535,8 +535,26 @@ async def _run_spawn_pool(
                 new_task = asyncio.create_task(_decode_one(name, ep_idx))
                 pending.add(new_task)
 
-        # Backpressure: pause dispatching when buffer is full
-        while len(buffer) >= buffer.capacity and not stop_event.is_set():
+        # Backpressure: throttle — DON'T park — when buffer is full.
+        #
+        # ``ShuffleBuffer.put`` is a ring buffer whose write-head
+        # monotonically increments and overwrites slots modulo
+        # ``capacity`` regardless of ``_count`` (FIFO eviction is
+        # built in).  An ``if``-then-yield here caps the decode rate
+        # to ~1/sleep_s when full while still letting the outer loop
+        # harvest completed tasks and put fresh frames — rotating the
+        # buffer's contents so training keeps seeing new episodes.
+        #
+        # An earlier ``while`` here parked the pool indefinitely after
+        # the first fill-up: samplers don't decrement ``_count`` so
+        # ``len(buffer)`` stayed at ``capacity`` forever, the outer
+        # loop never re-entered ``asyncio.wait``, and training ran
+        # against a frozen snapshot of the first ``capacity`` decoded
+        # episodes — effectively overfitting on a small subset.  See
+        # the equivalent fix in the thread-mode ``_run_thread_pool``
+        # below; text's ``TextProducerPool`` has a similar break-out
+        # after 5s on the same pattern.
+        if len(buffer) >= buffer.capacity and not stop_event.is_set():
             await asyncio.sleep(0.05)
 
     # Cancel remaining tasks
@@ -601,7 +619,11 @@ def _run_thread_pool(
                 f"ProducerPool warmup complete: {len(buffer)} items in buffer"
             )
 
-        while len(buffer) >= buffer.capacity and not stop_event.is_set():
+        # Backpressure: throttle, don't park — same rationale as the
+        # spawn-mode pool above.  ShuffleBuffer.put() ring-buffers via
+        # write_head; letting the outer loop keep progressing rotates
+        # the contents so training sees fresh episodes over time.
+        if len(buffer) >= buffer.capacity and not stop_event.is_set():
             time.sleep(0.05)
 
 
