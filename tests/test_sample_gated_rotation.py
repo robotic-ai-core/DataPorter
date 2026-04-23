@@ -26,7 +26,8 @@ import time
 import pytest
 import torch
 
-from dataporter.shuffle_buffer import ShuffleBuffer, _SAMPLE_TIMEOUT_S
+from dataporter.shuffle_buffer import ShuffleBuffer, _SAMPLE_TIMEOUT_S  # noqa: F401
+from dataporter import _rotation_gate as _rg
 
 
 # ---------------------------------------------------------------------------
@@ -117,28 +118,19 @@ class TestConsumerGate:
         samples 1..4 pass (gaps 0..2); the 5th call finds gap=3 > 2
         and blocks until ``write_head`` advances.
 
-        We shrink the timeout so the test runs in ~1s.
+        We shrink the timeout (on ``_rotation_gate`` — the single
+        source of truth) so the test runs in ~1s.
         """
-        import dataporter.shuffle_buffer as sb
-        original = sb._SAMPLE_TIMEOUT_S
-        sb._SAMPLE_TIMEOUT_S = 0.8
+        original = _rg.SAMPLE_TIMEOUT_S
+        _rg.SAMPLE_TIMEOUT_S = 0.8
         try:
             buf = ShuffleBuffer(
                 capacity=2, max_frames=2, channels=1, height=4, width=4,
                 rotation_per_samples=1,
             )
-            # Put once — write_head = 1.
             buf.put(0, torch.zeros((2, 1, 4, 4), dtype=torch.uint8))
             import random as _random
             rng = _random.Random(0)
-            # First 4 samples OK: gap on entry is 0, 1, 2, 2
-            # (atomic order).  Actually: samples starts 0, after
-            # N calls samples==N.  Entry gap = samples - K*puts:
-            #  call 1 entry: 0-1 = -1
-            #  call 2 entry: 1-1 = 0
-            #  call 3 entry: 2-1 = 1
-            #  call 4 entry: 3-1 = 2  (still <= 2)
-            #  call 5 entry: 4-1 = 3  (> 2 → block)
             for _ in range(4):
                 buf.sample(rng)
             t0 = time.monotonic()
@@ -146,11 +138,11 @@ class TestConsumerGate:
                 buf.sample(rng)
             elapsed = time.monotonic() - t0
             assert 0.5 < elapsed < 3.0, (
-                f"timeout should fire around {sb._SAMPLE_TIMEOUT_S}s, "
+                f"timeout should fire around {_rg.SAMPLE_TIMEOUT_S}s, "
                 f"actual {elapsed:.2f}s"
             )
         finally:
-            sb._SAMPLE_TIMEOUT_S = original
+            _rg.SAMPLE_TIMEOUT_S = original
 
     def test_consumer_unblocks_when_pool_catches_up(self):
         """If ``write_head`` advances while the consumer is blocked,

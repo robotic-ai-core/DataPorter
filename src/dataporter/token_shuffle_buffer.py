@@ -27,6 +27,8 @@ import random
 
 import torch
 
+from ._rotation_gate import RotationGate
+
 
 class TokenShuffleBuffer:
     """Shared-memory ring buffer for variable-length tokenized sequences.
@@ -39,6 +41,11 @@ class TokenShuffleBuffer:
       - ``_write_head``   ``[1]`` int64 — total puts across the lifetime
       - ``_count``        ``[1]`` int64 — number of occupied slots
 
+    Rotation is sample-gated via :class:`RotationGate` — same contract
+    as :class:`ShuffleBuffer` on the video side, so both pipelines get
+    identical rotation semantics from a single shared code path.  See
+    ``_rotation_gate.py`` for the producer/consumer gate details.
+
     Args:
         capacity: Max number of items in the buffer.
         seq_len: Fixed sequence length (sequences are padded or truncated).
@@ -46,6 +53,11 @@ class TokenShuffleBuffer:
         vocab_size: Optional vocab-size sanity check at ``put()`` time.
             When set, tokens ≥ vocab_size raise ValueError — catches
             tokenizer misconfiguration early rather than at embedding lookup.
+        rotation_per_samples: K — samples consumed per producer put at
+            steady state.  ``None`` (default) disables the gate and
+            falls back to the text pool's time-throttle; production
+            callers (``BlendedTextDataModule`` / similar) should pass
+            an integer.  See :class:`RotationGate`.
     """
 
     def __init__(
@@ -54,6 +66,7 @@ class TokenShuffleBuffer:
         seq_len: int,
         pad_token_id: int = 0,
         vocab_size: int | None = None,
+        rotation_per_samples: int | None = None,
     ):
         if capacity < 1:
             raise ValueError(f"capacity must be >= 1, got {capacity}")
@@ -64,6 +77,7 @@ class TokenShuffleBuffer:
         self._seq_len = seq_len
         self._pad_token_id = int(pad_token_id)
         self._vocab_size = vocab_size
+        self._gate = RotationGate(rotation_per_samples)
 
         # Pre-flight /dev/shm check
         token_bytes = capacity * seq_len * 4   # int32
@@ -124,6 +138,20 @@ class TokenShuffleBuffer:
     @property
     def seq_len(self) -> int:
         return self._seq_len
+
+    # ------------------------------------------------------------------
+    # Back-compat accessors — the producer pool reads these directly.
+    # Forwarded from :class:`RotationGate`; keeps the pool code
+    # buffer-type-agnostic.
+    # ------------------------------------------------------------------
+
+    @property
+    def _rotation_k(self) -> int | None:
+        return self._gate.rotation_k
+
+    @property
+    def _samples_consumed(self):
+        return self._gate._samples_consumed
 
     def __len__(self) -> int:
         return min(int(self._count), self._capacity)
@@ -236,6 +264,12 @@ class TokenShuffleBuffer:
         if n == 0:
             raise IndexError("TokenShuffleBuffer is empty")
 
+        self._gate.wait_if_consumer_too_far_ahead(
+            write_head_getter=lambda: int(self._write_head),
+            capacity=self._capacity,
+            buffer_name="TokenShuffleBuffer",
+        )
+
         head = int(self._write_head)
         slot = (head - n + rng.randint(0, n - 1)) % self._capacity
 
@@ -243,6 +277,8 @@ class TokenShuffleBuffer:
         key = int(self._keys[slot])
         tokens = self._tokens[slot, :length].clone()
         mask = self._loss_mask[slot, :length].clone()
+
+        self._gate.record_sample()
 
         return key, tokens, mask, length
 
@@ -259,6 +295,12 @@ class TokenShuffleBuffer:
         if n == 0:
             raise IndexError("TokenShuffleBuffer is empty")
 
+        self._gate.wait_if_consumer_too_far_ahead(
+            write_head_getter=lambda: int(self._write_head),
+            capacity=self._capacity,
+            buffer_name="TokenShuffleBuffer",
+        )
+
         head = int(self._write_head)
         slot = (head - n + rng.randint(0, n - 1)) % self._capacity
 
@@ -266,6 +308,8 @@ class TokenShuffleBuffer:
         key = int(self._keys[slot])
         tokens = self._tokens[slot].clone()
         mask = self._loss_mask[slot].clone()
+
+        self._gate.record_sample()
 
         return key, tokens, mask, length
 
@@ -288,3 +332,4 @@ class TokenShuffleBuffer:
         self._keys.fill_(-1)
         self._write_head.fill_(0)
         self._count.fill_(0)
+        self._gate.reset()

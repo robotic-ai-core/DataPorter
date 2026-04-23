@@ -285,19 +285,42 @@ def _spawn_pool_entry(
                         if tokens.numel() == 0:
                             continue
 
-                        # Back-pressure: wait when the buffer is full so
-                        # we don't tokenize-and-discard.  Capped wait —
-                        # if workers aren't consuming, producer logs and
-                        # keeps pushing (eviction will happen).
-                        spin_start = time.monotonic()
-                        while len(buffer) >= buffer.capacity:
+                        # Back-pressure: sample-gated rotation.  When
+                        # the buffer is full, wait until the consumer
+                        # has drawn K more samples (K = buffer's
+                        # ``rotation_per_samples``) before the next
+                        # put.  If K is None, fall back to the
+                        # historic time-throttle with 5s ceiling.  The
+                        # sample-gated path is the production default
+                        # — matches the video pipeline's
+                        # ``_run_spawn_pool`` behavior.
+                        rot_k = buffer._rotation_k
+                        if (
+                            rot_k is not None
+                            and len(buffer) >= buffer.capacity
+                        ):
+                            last_put_samples = int(
+                                buffer._samples_consumed.value
+                            )
+                            while (
+                                int(buffer._samples_consumed.value)
+                                - last_put_samples < rot_k
+                                and not stop_event.is_set()
+                            ):
+                                stop_event.wait(timeout=0.01)
                             if stop_event.is_set():
                                 return
-                            if (time.monotonic() - spin_start) > 5.0:
-                                break
-                            stop_event.wait(
-                                timeout=config.drop_if_buffer_full_s
-                            )
+                        elif rot_k is None and len(buffer) >= buffer.capacity:
+                            # Legacy time-throttle.
+                            spin_start = time.monotonic()
+                            while len(buffer) >= buffer.capacity:
+                                if stop_event.is_set():
+                                    return
+                                if (time.monotonic() - spin_start) > 5.0:
+                                    break
+                                stop_event.wait(
+                                    timeout=config.drop_if_buffer_full_s
+                                )
 
                         buffer.put(doc_idx, tokens, mask)
                         doc_idx += 1
