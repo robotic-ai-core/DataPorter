@@ -200,6 +200,7 @@ class BlendedLeRobotDataModule(L.LightningDataModule):
         tolerance_s: float | None = None,
         self_refresh_every_n_items: int | None = None,
         nominal_total_frames: int | None = None,
+        buffer_rotation_per_samples: int | None = 1,
     ):
         super().__init__()
 
@@ -277,6 +278,17 @@ class BlendedLeRobotDataModule(L.LightningDataModule):
         self.nominal_total_frames = (
             int(nominal_total_frames)
             if nominal_total_frames is not None else None
+        )
+        # K — samples consumed per producer put at steady state.
+        # Default 1 = "rotate one slot per consumer sample drawn," the
+        # correct production default (natural decode-rate rotation
+        # under fast consumers; consumer-side blocking surfaces
+        # decode bottlenecks as low train/step_time).  ``None``
+        # disables the gate entirely and falls back to time-throttle
+        # — mostly a testing escape hatch.
+        self.buffer_rotation_per_samples = (
+            None if buffer_rotation_per_samples is None
+            else int(buffer_rotation_per_samples)
         )
         # Split predicate.  Default: 90/10 by modulo-10 on raw episode id.
         # Stable across refreshes; an episode's train/val assignment never
@@ -641,6 +653,7 @@ class BlendedLeRobotDataModule(L.LightningDataModule):
             channels=channels,
             height=height,
             width=width,
+            rotation_per_samples=self.buffer_rotation_per_samples,
         )
         self._producer_pool = ProducerPool(
             buffer, configs=producers, total_workers=4,

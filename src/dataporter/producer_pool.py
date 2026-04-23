@@ -408,6 +408,13 @@ async def _run_spawn_pool(
     _consecutive_failures = 0
     _last_failure_msg = ""
 
+    # Sample-gated rotation: record how many consumer samples had been
+    # drawn at the time of the last put, so we can wait for K more
+    # before the next put when the buffer is full.  K comes from the
+    # buffer's ``rotation_per_samples``.
+    _rotation_k = buffer._rotation_k
+    _last_put_samples = int(buffer._samples_consumed.value)
+
     async def _decode_one(source_name: str, ep_idx: int) -> tuple[str, int, torch.Tensor | None]:
         """Dispatch one decode with timeout to catch hanging ffmpeg."""
         nonlocal _consecutive_failures, _last_failure_msg
@@ -535,26 +542,39 @@ async def _run_spawn_pool(
                 new_task = asyncio.create_task(_decode_one(name, ep_idx))
                 pending.add(new_task)
 
-        # Backpressure: throttle — DON'T park — when buffer is full.
+        # Sample-gated rotation: when the buffer is full, wait until
+        # the consumer has drawn K more samples before the next put.
+        # K == rotation_per_samples on the buffer.  ``K is None``
+        # disables the gate — only used when the buffer is run
+        # without a consumer (direct-buffer tests).
         #
-        # ``ShuffleBuffer.put`` is a ring buffer whose write-head
-        # monotonically increments and overwrites slots modulo
-        # ``capacity`` regardless of ``_count`` (FIFO eviction is
-        # built in).  An ``if``-then-yield here caps the decode rate
-        # to ~1/sleep_s when full while still letting the outer loop
-        # harvest completed tasks and put fresh frames — rotating the
-        # buffer's contents so training keeps seeing new episodes.
+        # Slow consumer: gate blocks the pool naturally — decode
+        # tracks consumer rate, no CPU waste, deterministic rotation.
         #
-        # An earlier ``while`` here parked the pool indefinitely after
-        # the first fill-up: samplers don't decrement ``_count`` so
-        # ``len(buffer)`` stayed at ``capacity`` forever, the outer
-        # loop never re-entered ``asyncio.wait``, and training ran
-        # against a frozen snapshot of the first ``capacity`` decoded
-        # episodes — effectively overfitting on a small subset.  See
-        # the equivalent fix in the thread-mode ``_run_thread_pool``
-        # below; text's ``TextProducerPool`` has a similar break-out
-        # after 5s on the same pattern.
-        if len(buffer) >= buffer.capacity and not stop_event.is_set():
+        # Fast consumer: the counter races ahead, gate is never
+        # binding on this side, pool runs at native decode rate.  The
+        # consumer-side gate inside ``ShuffleBuffer.sample`` throttles
+        # the consumer instead, making the decode bottleneck visible.
+        #
+        # Warmup: only activates when buffer is full (``len(buffer)
+        # >= buffer.capacity``); during fill, puts happen freely so
+        # warmup latency is unaffected.
+        if (
+            _rotation_k is not None
+            and len(buffer) >= buffer.capacity
+            and not stop_event.is_set()
+        ):
+            while (
+                int(buffer._samples_consumed.value) - _last_put_samples
+                < _rotation_k
+                and not stop_event.is_set()
+            ):
+                await asyncio.sleep(0.01)
+            _last_put_samples = int(buffer._samples_consumed.value)
+        elif _rotation_k is None and len(buffer) >= buffer.capacity:
+            # No gate → fall back to a light time-throttle so a
+            # no-consumer buffer doesn't spin at 100% CPU.  Won't
+            # happen in production (pools always have consumers).
             await asyncio.sleep(0.05)
 
     # Cancel remaining tasks
@@ -591,6 +611,11 @@ def _run_thread_pool(
     consecutive_failures = 0
     max_consecutive = 50
 
+    # Sample-gated rotation state — tracked across outer-while
+    # iterations; same semantic as _run_spawn_pool above.
+    rot_k = buffer._rotation_k
+    last_put_samples = int(buffer._samples_consumed.value)
+
     while not stop_event.is_set():
         name = dispatcher.next()
         ep_idx = next(iterators[name])
@@ -619,11 +644,22 @@ def _run_thread_pool(
                 f"ProducerPool warmup complete: {len(buffer)} items in buffer"
             )
 
-        # Backpressure: throttle, don't park — same rationale as the
-        # spawn-mode pool above.  ShuffleBuffer.put() ring-buffers via
-        # write_head; letting the outer loop keep progressing rotates
-        # the contents so training sees fresh episodes over time.
-        if len(buffer) >= buffer.capacity and not stop_event.is_set():
+        # Sample-gated rotation — same semantic as _run_spawn_pool
+        # above (see comment there).  ``rot_k is None`` disables the
+        # gate (no-consumer context); fall back to a light time
+        # throttle instead.
+        if (
+            rot_k is not None
+            and len(buffer) >= buffer.capacity
+            and not stop_event.is_set()
+        ):
+            while (
+                int(buffer._samples_consumed.value) - last_put_samples < rot_k
+                and not stop_event.is_set()
+            ):
+                time.sleep(0.01)
+            last_put_samples = int(buffer._samples_consumed.value)
+        elif rot_k is None and len(buffer) >= buffer.capacity:
             time.sleep(0.05)
 
 

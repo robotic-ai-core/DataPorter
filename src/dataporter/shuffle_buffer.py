@@ -20,10 +20,21 @@ Usage::
 
 from __future__ import annotations
 
+import multiprocessing as mp
 import random
+import time
 from typing import Any
 
 import torch
+
+
+# Default timeout (seconds) for the consumer-side sample() gate.
+# If the consumer is more than ``capacity * K`` samples ahead of the
+# pool's puts for this long, sample() raises — it almost always means
+# the pool is dead (decode crash, symlink hang, etc.) rather than
+# simply slow, and hanging training indefinitely would obscure the
+# real failure.
+_SAMPLE_TIMEOUT_S: float = 30.0
 
 
 class ShuffleBuffer:
@@ -32,12 +43,35 @@ class ShuffleBuffer:
     Pre-allocates a fixed-size tensor buffer in shared memory. The
     producer fills it with ``put()``, workers read with ``sample()``.
 
+    Rotation is sample-gated (not time-gated): every ``rotation_per_samples``
+    consumer samples allows exactly one producer put at steady state.
+
+    - Slow consumer (K samples/sec < decode throughput): pool-side gate
+      blocks the producer until the consumer draws K more samples.  No
+      wasted decodes, no CPU burn during training stalls.
+    - Fast consumer (K samples/sec > decode throughput): consumer-side
+      gate blocks ``sample()`` if the consumer has raced more than
+      ``capacity * K`` samples ahead of the pool's puts.  Training
+      throughput drops to decode rate, making the decode bottleneck
+      visible to the user as low ``train/step_time`` — the UX signal
+      to increase ``total_workers``.
+
     Args:
         capacity: Max number of items (episodes) in the buffer.
         max_frames: Max frames per episode (padded with zeros).
         channels: Number of image channels.
         height: Frame height.
         width: Frame width.
+        rotation_per_samples: K — samples consumed per producer put at
+            steady state.  ``None`` (default) disables the gate and
+            falls back to a light time throttle; tests and direct
+            buffer uses without a pool should stick with the default.
+            Set to 1 for "replace one slot per sample drawn" —
+            equivalent to "no artificial throttle, natural decode-
+            rate rotation."  Larger values deliberately slow rotation
+            (serve K samples per decoded episode before eviction).
+            Production code (e.g. ``BlendedLeRobotDataModule``)
+            typically passes an explicit integer here.
     """
 
     def __init__(
@@ -47,9 +81,20 @@ class ShuffleBuffer:
         channels: int,
         height: int,
         width: int,
+        rotation_per_samples: int | None = None,
     ):
         self._capacity = capacity
         self._max_frames = max_frames
+        if rotation_per_samples is None:
+            self._rotation_k: int | None = None
+        else:
+            k = int(rotation_per_samples)
+            if k < 1:
+                raise ValueError(
+                    f"rotation_per_samples must be ≥ 1 or None, "
+                    f"got {rotation_per_samples!r}"
+                )
+            self._rotation_k = k
 
         # Pre-flight: verify /dev/shm can hold the buffer
         buffer_bytes = capacity * max_frames * channels * height * width
@@ -70,6 +115,14 @@ class ShuffleBuffer:
         self._keys = torch.full((capacity,), -1, dtype=torch.int64).share_memory_()
         self._write_head = torch.zeros(1, dtype=torch.int64).share_memory_()
         self._count = torch.zeros(1, dtype=torch.int64).share_memory_()
+
+        # Shared counter: total consumer samples across all workers.
+        # Used by the sample-gated rotation (both pool-side gate in
+        # _run_spawn_pool and consumer-side gate in sample() below).
+        # mp.Value is process-safe; single-int reads are atomic on
+        # x86 without holding the lock, so gate-checks are cheap.
+        ctx = mp.get_context("spawn")
+        self._samples_consumed = ctx.Value("q", 0)
 
     @staticmethod
     def _check_shm_capacity(required_bytes: int) -> None:
@@ -139,12 +192,24 @@ class ShuffleBuffer:
     def sample(self, rng: random.Random) -> tuple[int, torch.Tensor]:
         """Return (key, frames) for a random occupied slot.
 
-        READ-ONLY — safe to call from any process. Raises IndexError
-        if buffer is empty.
+        Safe to call from any process.  Raises ``IndexError`` if the
+        buffer is empty.  Increments the shared
+        ``_samples_consumed`` counter so the producer's rotation gate
+        can see consumer progress.
+
+        Consumer-side rotation gate: if the consumer has raced more
+        than ``capacity * K`` samples ahead of the pool's puts
+        (``K = rotation_per_samples``), this method blocks until the
+        pool catches up.  Times out after
+        :data:`_SAMPLE_TIMEOUT_S` and raises ``RuntimeError`` — that
+        long a block almost always means the pool is dead (decode
+        crash, ffmpeg hang, etc.) rather than simply slow.
         """
         n = len(self)
         if n == 0:
             raise IndexError("ShuffleBuffer is empty")
+
+        self._wait_for_pool_to_catch_up()
 
         # Occupied slots are the most recent `n` slots
         head = int(self._write_head)
@@ -154,7 +219,64 @@ class ShuffleBuffer:
         n_frames = int(self._lengths[slot])
         frames = self._buffer[slot, :n_frames]
 
+        # Increment the shared counter AFTER reading so the pool's
+        # gate only sees committed samples.  Lock is required for
+        # atomic increment across processes; the hot-path overhead
+        # is ~100 ns per call, negligible vs. the frame copy above.
+        with self._samples_consumed.get_lock():
+            self._samples_consumed.value += 1
+
         return key, frames
+
+    def _wait_for_pool_to_catch_up(self) -> None:
+        """Consumer-side gate — block if consumer is too far ahead.
+
+        The invariant:
+            samples_consumed - K * write_head <= capacity * K
+
+        i.e., the consumer may be at most "one full buffer rotation"
+        ahead of the pool's puts at rotation_per_samples=K.  When
+        the consumer tries to go further ahead, it spin-waits here
+        until the pool commits more puts.
+
+        Exits immediately if the invariant holds (common case — gate
+        is cheap).  Raises after ``_SAMPLE_TIMEOUT_S`` of continuous
+        blocking so a dead pool fails loud instead of hanging
+        training forever.
+
+        No-op when ``rotation_per_samples is None`` (gate disabled —
+        direct-buffer test contexts where there's no pool to gate
+        against).
+        """
+        K = self._rotation_k
+        if K is None:
+            return
+        target_gap = self._capacity * K
+        # mp.Value reads of a single int64 are atomic on x86; skip
+        # the lock for reads to avoid per-sample lock contention.
+        samples = self._samples_consumed.value
+        puts = int(self._write_head)
+        if samples - K * puts <= target_gap:
+            return
+
+        wait_start = time.monotonic()
+        while True:
+            samples = self._samples_consumed.value
+            puts = int(self._write_head)
+            if samples - K * puts <= target_gap:
+                return
+            if time.monotonic() - wait_start > _SAMPLE_TIMEOUT_S:
+                raise RuntimeError(
+                    f"ShuffleBuffer.sample: blocked "
+                    f">{_SAMPLE_TIMEOUT_S:.0f}s waiting for the producer "
+                    f"pool to catch up (samples_consumed={samples}, "
+                    f"write_head={puts}, rotation_per_samples={K}, "
+                    f"capacity={self._capacity}).  Pool may be dead "
+                    f"(check logs for decode errors) OR decode is far "
+                    f"slower than sample rate — increase "
+                    f"total_workers or reduce batch_size."
+                )
+            time.sleep(0.001)
 
     def keys(self) -> list[int]:
         """Return list of keys currently in the buffer."""
@@ -174,3 +296,5 @@ class ShuffleBuffer:
         self._keys.fill_(-1)
         self._write_head.fill_(0)
         self._count.fill_(0)
+        with self._samples_consumed.get_lock():
+            self._samples_consumed.value = 0
