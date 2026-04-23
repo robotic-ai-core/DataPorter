@@ -480,3 +480,121 @@ class TestPoolDecodeNeverVal:
             f"pool decoded val ids: {sorted(val_leaked)}.  "
             f"Full keys={sorted(keys)}"
         )
+
+
+# ---------------------------------------------------------------------------
+# DataModule ↔ Dataset split alignment
+# ---------------------------------------------------------------------------
+
+
+class TestDataModuleSplitAlignment:
+    """Regression: DataModule's ``train_ep_indices`` must already
+    satisfy ``split_fn`` by construction, so the Dataset's
+    init-time defensive filter stays silent.  Previously the
+    DataModule computed ``train_ep_indices = list(range(0, 0.9 * N))``
+    (contiguous prefix) while passing the modulo-based ``split_fn``
+    (``e % 10 != 9``) to the Dataset — the filter then stripped
+    ~10% of the ids and emitted a noisy false-positive warning.
+    """
+
+    def test_default_split_fn_and_indices_agree(self):
+        """For ``train_split_ratio=0.9`` and N=100, the DataModule's
+        computed ``train_ep_indices`` must contain ONLY ids that
+        satisfy the DataModule's own ``split_fn``.
+        """
+        from dataporter.blended_lerobot_datamodule import (
+            _make_default_split_fn,
+        )
+        split_fn = _make_default_split_fn(0.9)
+        num_episodes = 100
+        # Mirror the _load_and_split_source logic post-fix.
+        train_ep_indices = [
+            pos for pos in range(num_episodes) if split_fn(pos)
+        ]
+        # Every admitted id must satisfy split_fn.
+        violators = [e for e in train_ep_indices if not split_fn(e)]
+        assert not violators, (
+            f"train_ep_indices contains ids that violate split_fn: "
+            f"{violators}"
+        )
+        # Size roughly matches the ratio (±1 per decade).
+        assert 88 <= len(train_ep_indices) <= 92, (
+            f"expected ~90 train out of 100, got {len(train_ep_indices)}"
+        )
+
+    def test_custom_ratio_split_fn_and_indices_agree(self):
+        """``train_split_ratio=0.8`` should snap to a cleanly-matching
+        split_fn AND produce train_ep_indices that all satisfy it."""
+        from dataporter.blended_lerobot_datamodule import (
+            _make_default_split_fn,
+        )
+        split_fn = _make_default_split_fn(0.8)
+        num_episodes = 1000
+        train_ep_indices = [
+            pos for pos in range(num_episodes) if split_fn(pos)
+        ]
+        violators = [e for e in train_ep_indices if not split_fn(e)]
+        assert not violators
+        # 80% of 1000 = 800, ±2% tolerance.
+        assert 780 <= len(train_ep_indices) <= 820
+
+    def test_defensive_filter_silent_under_matched_split(self, caplog):
+        """Construct a Dataset with ``train_episode_indices`` derived
+        from a split_fn + that SAME split_fn — the defensive filter
+        must strip nothing and emit no warning.  Regression for the
+        DataModule ↔ Dataset mismatch that used to fire the filter
+        on every setup() call.
+        """
+        import logging
+        from dataporter.lerobot_shuffle_buffer_dataset import (
+            LeRobotShuffleBufferDataset,
+            _default_train_split,
+        )
+        from dataporter.shuffle_buffer import ShuffleBuffer
+        from test_lerobot_shuffle_buffer_dataset import (
+            _make_mock_shard_source,
+        )
+
+        num_episodes = 200
+        split_fn = _default_train_split   # e % 10 != 9
+        train_ep_indices = [
+            e for e in range(num_episodes) if split_fn(e)
+        ]
+        shard = _make_mock_shard_source(
+            num_episodes=num_episodes, frames_per_episode=10,
+        )
+        buf = ShuffleBuffer(
+            capacity=4, max_frames=10, channels=1, height=4, width=4,
+            rotation_per_samples=None,
+        )
+        with caplog.at_level(
+            logging.WARNING,
+            logger="dataporter.lerobot_shuffle_buffer_dataset",
+        ):
+            ds = LeRobotShuffleBufferDataset(
+                buffer=buf,
+                sources=[{
+                    "shard_source": shard,
+                    "source_name": "synth",
+                    "episode_offset": 0,
+                    "transform": None,
+                    "train_episode_indices": train_ep_indices,
+                }],
+                delta_timestamps={},
+                prefetchers=[],
+                producer_pool=None,
+                split_fn=split_fn,
+                image_keys=["observation.image"],
+            )
+
+        # Every ep passed through; size unchanged.
+        assert set(ds._current_train_episodes) == set(train_ep_indices)
+        # No contamination warning in the log.
+        filter_warnings = [
+            r for r in caplog.records
+            if "val-side raw ids in train_episode_indices" in r.message
+        ]
+        assert not filter_warnings, (
+            f"defensive filter fired under matched split: "
+            f"{[r.message for r in filter_warnings]}"
+        )

@@ -525,11 +525,24 @@ class BlendedLeRobotDataModule(L.LightningDataModule):
 
         episode_index = dataset.episode_data_index
         num_episodes = len(episode_index["from"])
-        train_episodes = int(self.train_split_ratio * num_episodes)
 
-        train_ep_indices = list(range(train_episodes))
+        # Split by the DataModule's ``split_fn`` — same predicate we
+        # later forward to :class:`LeRobotShuffleBufferDataset`, so the
+        # Dataset's defensive init-time filter stays silent under
+        # correct DataModule usage.
+        #
+        # Previously this was ``list(range(train_episodes))`` (first-N
+        # by ratio), which disagreed with the modulo-based split_fn
+        # the Dataset uses — the defensive filter then stripped ~10%
+        # of episodes and emitted a noisy false-positive warning.
+        # Single source of truth now: ``split_fn``.
+        train_ep_indices = [
+            pos for pos in range(num_episodes) if self.split_fn(pos)
+        ]
         val_indices = []
-        for ep_idx in range(train_episodes, num_episodes):
+        for ep_idx in range(num_episodes):
+            if self.split_fn(ep_idx):
+                continue
             start = int(episode_index["from"][ep_idx])
             end = int(episode_index["to"][ep_idx])
             val_indices.extend(range(start, end))
