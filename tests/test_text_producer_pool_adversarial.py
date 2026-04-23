@@ -273,40 +273,64 @@ class TestInputAndBackpressure:
         finally:
             pool.stop()
 
-    def test_saturated_buffer_does_not_hang_producer(self, tmp_path):
-        """Small buffer + lots of rows + no consumers → producer must
-        saturate and keep rotating (ring eviction), not deadlock.
-        Verifies the back-pressure wait has a bounded ceiling.
+    def test_saturated_buffer_waits_for_consumer_under_k_gate(self, tmp_path):
+        """Under the new sample-gated rotation (default K=1), a saturated
+        buffer with no consumer MUST block the producer — that's the
+        deterministic contract.  Training speed becomes decode-bounded
+        visibly (low train/step_time) instead of silently overfitting
+        on stale buffer contents.
 
-        Uses a polling window rather than a fixed sleep so the test
-        doesn't flake under CPU-starved parallel pytest runs (12-worker
-        xdist).  Any key rotation within the deadline is enough — we're
-        proving "not deadlocked", not "fast."
+        Pre-flip, the text producer's 5s-timeout backpressure kept
+        rotating the buffer even without a consumer — at ~0.2 puts/sec.
+        That hid the decode-rate ceiling from the user.  The new
+        behavior intentionally stalls the producer, forcing the user to
+        notice the bottleneck.
+
+        This test locks in both behaviors side-by-side.
         """
         _seed_shards(tmp_path, n_shards=3, rows_per_shard=200)
-        # capacity=4 ensures buffer fills almost immediately.
+        # Default K=1: producer blocks once buffer fills.
         buffer, pool = _make_pool(tmp_path, ToyTokenize(), capacity=4, warmup=2)
         pool.start()
         try:
             pool.wait_for_warmup(timeout=20.0)
-            keys_before = set(buffer.keys())
-            assert len(buffer) == buffer.capacity
+            # Buffer may be mid-fill; give it a moment to saturate.
+            deadline = time.monotonic() + 5.0
+            while (
+                len(buffer) < buffer.capacity
+                and time.monotonic() < deadline
+            ):
+                time.sleep(0.1)
+            assert len(buffer) == buffer.capacity, (
+                f"buffer didn't reach capacity: {len(buffer)}/"
+                f"{buffer.capacity}"
+            )
+            keys_at_fill = set(buffer.keys())
 
-            # Poll up to 10s for rotation (generous — a blocked producer
-            # would never rotate, one making any progress will).
-            deadline = time.monotonic() + 10.0
-            rotated = False
-            while time.monotonic() < deadline:
-                if set(buffer.keys()) != keys_before:
-                    rotated = True
-                    break
-                time.sleep(0.3)
+            # Without a consumer sample, rotation must NOT happen.
+            time.sleep(2.0)
+            assert set(buffer.keys()) == keys_at_fill, (
+                "producer rotated under K=1 without any consumer "
+                "samples — sample-gated rotation contract broken"
+            )
+
+            # Draw a consumer sample; the producer should be unblocked
+            # and a new key should rotate in.
+            import random as _random
+            rng = _random.Random(0)
+            buffer.sample(rng)
+            deadline = time.monotonic() + 5.0
+            while (
+                set(buffer.keys()) == keys_at_fill
+                and time.monotonic() < deadline
+            ):
+                time.sleep(0.1)
+            assert set(buffer.keys()) != keys_at_fill, (
+                "producer didn't rotate after consumer sample — "
+                "backpressure gate isn't releasing"
+            )
 
             assert pool.is_alive, "producer died while buffer saturated"
-            assert rotated, (
-                "buffer keys didn't rotate within 10s — producer likely "
-                "blocked on the back-pressure wait"
-            )
         finally:
             pool.stop()
 

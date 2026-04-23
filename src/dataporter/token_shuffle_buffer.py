@@ -54,10 +54,14 @@ class TokenShuffleBuffer:
             When set, tokens ≥ vocab_size raise ValueError — catches
             tokenizer misconfiguration early rather than at embedding lookup.
         rotation_per_samples: K — samples consumed per producer put at
-            steady state.  ``None`` (default) disables the gate and
-            falls back to the text pool's time-throttle; production
-            callers (``BlendedTextDataModule`` / similar) should pass
-            an integer.  See :class:`RotationGate`.
+            steady state.  Default 1 = "rotate one slot per sample
+            drawn" — natural for text because each slot holds exactly
+            one document / training example, so K=1 means "each doc
+            is served once before eviction" (maximum diversity, no
+            repetition).  Set to ``None`` for direct-buffer tests or
+            contexts with no producer pool present; the gate would
+            otherwise block forever waiting for ``write_head`` to
+            advance.  See :class:`RotationGate`.
     """
 
     def __init__(
@@ -66,7 +70,7 @@ class TokenShuffleBuffer:
         seq_len: int,
         pad_token_id: int = 0,
         vocab_size: int | None = None,
-        rotation_per_samples: int | None = None,
+        rotation_per_samples: int | None = 1,
     ):
         if capacity < 1:
             raise ValueError(f"capacity must be >= 1, got {capacity}")
