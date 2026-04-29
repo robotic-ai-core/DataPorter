@@ -88,6 +88,39 @@ def scan_available_episodes(local_dir: Path) -> list[int]:
 _CACHE_SENTINEL = ".dataporter_cache_complete"
 
 
+def _layout_is_complete(root: Path) -> bool:
+    """True iff ``root`` contains a complete LeRobot v2.1 layout.
+
+    "Complete" means ``meta/info.json`` parses, ``meta/episodes.jsonl``
+    exists, and every episode declared by ``info.json:total_episodes``
+    has its parquet (and every video) on disk.  Used by
+    :meth:`BlendedLeRobotDataModule._start_prefetcher` to skip the
+    prefetcher when the directory is already pre-populated (rsync,
+    pre-mounted volume, prior run) — avoids spending HF XET 500/5min
+    rate-limit budget on etag checks for files we already have.
+
+    Cheap to call: lazy ``LeRobotShardSource`` construction is O(1),
+    `list_ready_episodes` is one ``rglob`` + per-episode ``is_file``
+    check (~ms at PushT scale, hundreds of ms at 18k+ scale).
+    """
+    if not (root / "meta" / "info.json").is_file():
+        return False
+    if not (root / "meta" / "episodes.jsonl").is_file():
+        return False
+    try:
+        from .lerobot_shard_source import LeRobotShardSource
+        shard = LeRobotShardSource(root)
+        declared = shard.total_episodes
+        if declared <= 0:
+            return False
+        ready = shard.list_ready_episodes()
+        # Compare as sorted lists to catch sparse-but-equal-count cases
+        # (an unlikely shape but cheap to be exact about).
+        return len(ready) >= declared and ready[-1] >= declared - 1
+    except Exception:
+        return False
+
+
 def hf_cache_repo_path(repo_id: str) -> Path:
     """Return the canonical HF hub cache directory for a dataset repo_id.
 
@@ -414,6 +447,24 @@ class BlendedLeRobotDataModule(L.LightningDataModule):
             )
             shutil.rmtree(stale_nested, ignore_errors=True)
 
+        # Skip the prefetcher entirely when the local dir is already a
+        # complete LeRobot v2.1 layout — sparkinstance ``hf_cache_source``
+        # / pre-mounted volumes / a prior run can leave the directory
+        # fully populated.  Letting ``snapshot_download`` "verify"
+        # anyway hits HF's etag API which counts against the 500/5min
+        # XET rate limit — the bug that prompted this guard.
+        if _layout_is_complete(local_dir):
+            logger.info(
+                f"Prefetch dir {local_dir} is already a complete LeRobot "
+                f"v2.1 layout for {repo_id}; skipping prefetcher (no HF "
+                f"API calls, rate-limit safe)."
+            )
+            source["root"] = str(local_dir)
+            from .lerobot_shard_source import LeRobotShardSource
+            shard = LeRobotShardSource(local_dir)
+            source["_available_episodes"] = shard.list_ready_episodes()
+            return
+
         prefetcher = LeRobotPrefetcher(
             repo_id=repo_id,
             cache_dir=local_dir,
@@ -478,26 +529,31 @@ class BlendedLeRobotDataModule(L.LightningDataModule):
     def _resolve_source_root(self, source: dict) -> Path:
         """Return the filesystem root for a source.
 
-        Sources can declare a ``"root"`` (static local layout, used by
-        prefetched caches too once the writer has placed files) or just
-        a ``"repo_id"`` (HF cache is the canonical root).  For the
-        HF-only case we build the standard cache path.
+        Reached only when a source dict has neither ``"root"`` nor
+        ``prefetch: true`` (the prefetcher would have populated
+        ``"root"`` itself in the latter case).  Always raises with an
+        actionable message — DataPorter doesn't auto-resolve HF cache
+        paths; the caller picks where the data lives.
         """
         if "root" in source:
             return Path(source["root"])
-        # HF cache layout: <HF_HOME>/hub/datasets--<org>--<repo>/snapshots/<rev>
-        # LeRobotDatasetMetadata resolves this by downloading metadata
-        # files, which is the minimum-work probe to get the right
-        # snapshot hash.  The prefetcher does this on its own path when
-        # ``prefetch=True`` is configured; fall back to that behaviour.
         repo_id = source["repo_id"]
         raise RuntimeError(
-            f"Source {repo_id!r} has no ``root`` — set ``prefetch=True`` "
-            f"so the prefetcher populates a local root before setup, or "
-            f"pass an explicit ``root`` pointing at an existing LeRobot "
-            f"v2.1 layout.  The shard-source-based pipeline no longer "
-            f"constructs a FastLeRobotDataset at setup time (that used "
-            f"to handle HF-cache resolution implicitly)."
+            f"Source {repo_id!r} declares neither ``root`` nor "
+            f"``prefetch: true`` — DataPorter has nowhere to read the "
+            f"dataset from.  Pick one:\n"
+            f"  • Set ``root: /path/to/<dataset>/`` if the data is "
+            f"already on disk (rsynced, mounted volume, manually "
+            f"downloaded).  This is the recommended path for jobs "
+            f"with sparkinstance ``hf_cache_source`` / similar pre-"
+            f"staging.\n"
+            f"  • Omit ``prefetch: false`` (the default ``prefetch: "
+            f"true`` runs ``LeRobotPrefetcher`` to download into "
+            f"``/tmp/prefetch/<repo>/``).\n"
+            f"  • Set ``root`` to the HF cache snapshot path if you "
+            f"want to read directly from there: "
+            f"``~/.cache/huggingface/hub/datasets--<org>--<repo>/"
+            f"snapshots/<rev>/``."
         )
 
     def _load_and_split_source(
