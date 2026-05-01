@@ -5,6 +5,7 @@ DataPorter - PyTorch data loading utilities for seamless training resumption and
 __version__ = "0.1.0"
 
 from .converters import KeyBasedDtypeConverter
+from .dtype_coordination import DtypeCoordinator, PrecisionCoordinationMixin
 from .base_wrapper import BaseDatasetWrapper
 from .generic_wrapper import GenericDatasetWrapper, DataLoaderDtypeWrapper
 from .fault_tolerant_wrapper import FaultTolerantDatasetWrapper
@@ -72,6 +73,8 @@ def __getattr__(name):
 
 __all__ = [
     'KeyBasedDtypeConverter',
+    'DtypeCoordinator',
+    'PrecisionCoordinationMixin',
     'BaseDatasetWrapper',
     'GenericDatasetWrapper',
     'DataLoaderDtypeWrapper',

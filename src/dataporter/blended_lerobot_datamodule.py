@@ -21,6 +21,7 @@ import lightning as L
 from torch.utils.data import ConcatDataset, Dataset, WeightedRandomSampler
 
 from .dataset_wrappers import AugmentedDataset, KeyFilterDataset
+from .dtype_coordination import PrecisionCoordinationMixin
 from .lerobot_shard_source import LeRobotShardSource
 from .resumable import ResumableDataLoader, resolve_num_workers
 from .shard_source_val_dataset import ShardSourceValDataset
@@ -172,7 +173,7 @@ def write_cache_sentinel(cache_dir: Path) -> None:
         logger.debug(f"Could not write cache sentinel in {cache_dir}: {e}")
 
 
-class BlendedLeRobotDataModule(L.LightningDataModule):
+class BlendedLeRobotDataModule(PrecisionCoordinationMixin, L.LightningDataModule):
     """Multi-source LeRobot DataModule with weighted blending.
 
     Handles:
@@ -282,6 +283,11 @@ class BlendedLeRobotDataModule(L.LightningDataModule):
         # lets the DataModule compute the buffer shape without probing.
         self.producer_transform = producer_transform
         self.dtype_conversions = dtype_conversions
+        # Wire/working dtype coordinator. Owns both the collate-time
+        # downcast (``wire_converter``) and the post-device-transfer
+        # upcast (``on_after_batch_transfer`` provided by the mixin).
+        # See docs/dtype-coordination.md for the contract.
+        self._init_precision_coordination(dtype_conversions)
         self.train_split_ratio = train_split_ratio
         # Three knobs for the growing-set behaviour.
         # - prefetch_min_episodes: absolute floor for the setup-time gate.
@@ -900,8 +906,6 @@ class BlendedLeRobotDataModule(L.LightningDataModule):
 
     def _build_loader_kwargs(self, batch_size: int, shuffle: bool) -> dict:
         """Build common DataLoader keyword arguments."""
-        from .converters import KeyBasedDtypeConverter
-
         kwargs: dict = {
             "batch_size": batch_size,
             "num_workers": self.num_workers,
@@ -922,13 +926,11 @@ class BlendedLeRobotDataModule(L.LightningDataModule):
                     self.multiprocessing_context
                 )
 
-        if self.dtype_conversions is not None:
-            if isinstance(self.dtype_conversions, list):
-                kwargs["converter"] = KeyBasedDtypeConverter(
-                    self.dtype_conversions
-                )
-            else:
-                kwargs["converter"] = self.dtype_conversions
+        # Wire-time downcast (worker-side, in collate) is owned by the
+        # coordinator. The matching upcast happens in
+        # on_after_batch_transfer (provided by PrecisionCoordinationMixin).
+        if self.dtype_coordinator.wire_converter.dtype_map:
+            kwargs["converter"] = self.dtype_coordinator.wire_converter
 
         return kwargs
 
