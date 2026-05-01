@@ -9,13 +9,36 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+
+# Canonical mapping from YAML/CLI dtype strings to ``torch.dtype``.
+# Module-level so the dtype coordinator (and other callers) can resolve
+# names without instantiating a converter.
+TORCH_DTYPE_NAMES: Dict[str, torch.dtype] = {
+    "float16": torch.float16,
+    "bfloat16": torch.bfloat16,
+    "float32": torch.float32,
+    "float64": torch.float64,
+    "int8": torch.int8,
+    "int16": torch.int16,
+    "int32": torch.int32,
+    "int64": torch.int64,
+    "uint8": torch.uint8,
+    "uint16": torch.uint16,  # Added for token IDs optimization
+    "bool": torch.bool,
+}
+
+
 class KeyBasedDtypeConverter:
     """Simple dtype converter using exact key paths."""
-    
+
+    # Reference the module-level table so any update flows to every
+    # caller (including ``DtypeCoordinator``).
+    torch_dtypes = TORCH_DTYPE_NAMES
+
     def __init__(self, dtype_map: Optional[Union[Dict[str, str], list]] = None):
         """
         Initialize the dtype converter.
-        
+
         Args:
             dtype_map: Either:
                       - Dict mapping key paths to target dtypes (legacy format)
@@ -35,19 +58,6 @@ class KeyBasedDtypeConverter:
                 self.dtype_map[item['path']] = item['dtype']
         else:
             self.dtype_map = dtype_map or {}
-        self.torch_dtypes = {
-            "float16": torch.float16,
-            "bfloat16": torch.bfloat16, 
-            "float32": torch.float32,
-            "float64": torch.float64,
-            "int8": torch.int8,
-            "int16": torch.int16,
-            "int32": torch.int32,
-            "int64": torch.int64,
-            "uint8": torch.uint8,
-            "uint16": torch.uint16,  # Added for token IDs optimization
-            "bool": torch.bool,
-        }
         
         # Store conversion history for debugging (only activated on errors)
         self.conversion_history = []
