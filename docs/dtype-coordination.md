@@ -267,6 +267,11 @@ memory. That's cheap (microseconds at typical batch sizes) compared to doing
 it on CPU. It also means transforms running before collate see whatever
 dtype the dataset produces — they are unaffected by the working dtype.
 
+Note that `tensor.to(dtype)` allocates a new same-shape tensor on the
+device when the dtype changes — it is not in-place. At very large batch
+sizes that's a real (though small) addition to peak GPU memory. Sized
+the same as the input batch's affected tensors.
+
 ## Behavior summary for existing configs
 
 If you have an existing config:

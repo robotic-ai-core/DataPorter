@@ -31,7 +31,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
 
-from .converters import KeyBasedDtypeConverter
+from .converters import TORCH_DTYPE_NAMES, KeyBasedDtypeConverter
 
 logger = logging.getLogger(__name__)
 
@@ -62,21 +62,19 @@ _PRECISION_TO_DTYPE: Dict[str, torch.dtype] = {
 
 
 def _string_to_torch_dtype(name: str) -> torch.dtype:
-    """Resolve a dtype string against ``KeyBasedDtypeConverter.torch_dtypes``.
+    """Resolve a dtype string against the canonical name → ``torch.dtype``
+    table.
 
-    Reuses the converter's table (single source of truth for the supported
-    dtype strings - keeps the wire and working halves in lockstep).
+    Single source of truth: :data:`dataporter.converters.TORCH_DTYPE_NAMES`.
+    Keeps the wire and working halves of the coordinator in lockstep with
+    :class:`KeyBasedDtypeConverter`.
     """
-    table = KeyBasedDtypeConverter.__init__.__defaults__  # noqa: F841 (just to silence)
-    # Build a probe to access the canonical mapping without instantiating
-    # a real converter (which logs and adds noise).
-    probe = KeyBasedDtypeConverter(None)
-    if name not in probe.torch_dtypes:
+    if name not in TORCH_DTYPE_NAMES:
         raise ValueError(
             f"Unsupported dtype string {name!r}. "
-            f"Supported: {sorted(probe.torch_dtypes.keys())}"
+            f"Supported: {sorted(TORCH_DTYPE_NAMES.keys())}"
         )
-    return probe.torch_dtypes[name]
+    return TORCH_DTYPE_NAMES[name]
 
 
 @dataclass(frozen=True)
@@ -113,9 +111,17 @@ class DtypeCoordinator:
 
     rules: Tuple[_Rule, ...]
     wire_converter: KeyBasedDtypeConverter
+    # O(1) path → rule lookup, populated in __post_init__.  Avoids a
+    # linear scan on every leaf tensor in :meth:`apply_working_dtype`.
+    _rule_by_path: Dict[str, _Rule] = field(default_factory=dict, repr=False)
     # Memoize lossy-round-trip warnings so we emit them once per
     # (wire, working, path) triple instead of every batch.
     _warned_pairs: set = field(default_factory=set, repr=False)
+
+    def __post_init__(self) -> None:
+        # Build the lookup dict once; rules are immutable after
+        # construction so this stays correct.
+        self._rule_by_path = {r.path: r for r in self.rules}
 
     @classmethod
     def from_config(
@@ -245,9 +251,20 @@ class DtypeCoordinator:
     # Apply
     # ------------------------------------------------------------------
 
-    def has_rules(self) -> bool:
-        """True if there's anything to do (any rule with a non-keep working)."""
+    def has_working_rules(self) -> bool:
+        """True if any rule needs a working-dtype upcast.
+
+        Rules with ``working: 'keep'`` only own the wire-side downcast
+        (collate-time, via ``wire_converter``); they don't trigger any
+        post-device-transfer work.  This predicate gates the
+        ``on_after_batch_transfer`` walk.
+        """
         return any(r.working_directive != _WORKING_KEEP for r in self.rules)
+
+    # Back-compat alias — ``has_rules`` was the original name.  Keep it
+    # working so external callers and the older test surface don't
+    # break, but prefer ``has_working_rules`` in new code.
+    has_rules = has_working_rules
 
     def apply_working_dtype(
         self,
@@ -334,11 +351,7 @@ class DtypeCoordinator:
         return tensor.to(target)
 
     def _lookup_rule(self, path: str) -> Optional[_Rule]:
-        # Linear scan; rule sets are tiny (handful of paths).
-        for rule in self.rules:
-            if rule.path == path:
-                return rule
-        return None
+        return self._rule_by_path.get(path)
 
     def _maybe_warn_lossy(
         self,
@@ -445,7 +458,7 @@ class PrecisionCoordinationMixin:
         a no-op upcast.
         """
         coord: Optional[DtypeCoordinator] = getattr(self, "dtype_coordinator", None)
-        if coord is None or not coord.has_rules():
+        if coord is None or not coord.has_working_rules():
             return batch
         precision_plugin = None
         trainer = getattr(self, "trainer", None)

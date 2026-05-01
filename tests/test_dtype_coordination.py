@@ -2,14 +2,23 @@
 
 See ``docs/dtype-coordination.md`` for the design rationale this exercises.
 
+The original production-crash repro (fp16 wire + bf16-mixed precision +
+``Int8Conv2d`` from utorch) lives at AutoFPV-side
+``tmp/repro_int8_conv2d_bf16_autocast.py`` — it isn't included here
+because it requires utorch (not a DataPorter dep).  Verifying the
+repro after this fix confirms the end-to-end story; the tests in this
+file pin the contract DataPorter owns.
+
 The test surface is intentionally focused on observable behavior:
 
 - The coordinator's parsed rules.
 - The dtype landed at the model boundary (``apply_working_dtype``).
 - The Lightning ``on_after_batch_transfer`` hook end-to-end.
 
-We avoid touching CUDA in this file; the coordination logic is
-device-independent and the bf16 / fp16 / fp32 dtypes all exist on CPU.
+The mixed-precision end-to-end tests skip on CPU-only CI — Lightning's
+``16-mixed`` / ``bf16-mixed`` plugins are CUDA-bound.  Make sure CI has
+at least one CUDA runner exercising this file or the integration tests
+go silent.
 """
 
 from __future__ import annotations
