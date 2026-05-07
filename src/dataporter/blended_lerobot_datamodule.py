@@ -246,6 +246,7 @@ class BlendedLeRobotDataModule(PrecisionCoordinationMixin, L.LightningDataModule
         self_refresh_every_n_items: int | None = None,
         nominal_total_frames: int | None = None,
         producer_pool_workers: int = 4,
+        per_source_val: bool = False,
     ):
         super().__init__()
 
@@ -264,6 +265,23 @@ class BlendedLeRobotDataModule(PrecisionCoordinationMixin, L.LightningDataModule
             ]
 
         self.repo_id = self._sources[0]["repo_id"]  # backward compat
+
+        # Per-source val: when True and len(sources) > 1, val_dataloader()
+        # returns a list of loaders (one per source) so the model can log
+        # per-source metrics via Lightning's dataloader_idx mechanism.
+        # When False (default) or single-source, val behaves as before:
+        # a single ConcatDataset across all sources.
+        self.per_source_val = bool(per_source_val)
+
+        # Sanitized per-source label used to key per-source val metrics.
+        # Falls back to the last path component of repo_id when the source
+        # dict doesn't provide an explicit "name" field.  Used by
+        # ``val_source_names`` and ``self._per_source_val_datasets``.
+        for src in self._sources:
+            if "name" not in src:
+                src["name"] = src["repo_id"].rsplit("/", 1)[-1]
+        self._per_source_val_datasets: dict | None = None
+
         self._prefetchers: list = []
         self.cache_frames = cache_frames
         self.cache_budget_gb = cache_budget_gb
@@ -739,7 +757,7 @@ class BlendedLeRobotDataModule(PrecisionCoordinationMixin, L.LightningDataModule
         )
         self._producer_pool.wait_for_warmup()
 
-        self.train_dataset = LeRobotShuffleBufferDataset(
+        train_dataset: Dataset = LeRobotShuffleBufferDataset(
             buffer=buffer,
             sources=sources_for_dataset,
             delta_timestamps=delta_timestamps,
@@ -752,6 +770,16 @@ class BlendedLeRobotDataModule(PrecisionCoordinationMixin, L.LightningDataModule
             refresh_every_n_items=self.self_refresh_every_n_items,
             nominal_total_frames=self.nominal_total_frames,
         )
+        # When blending sources with heterogeneous schemas, restrict each
+        # sample to the keys common across all sources so default_collate
+        # doesn't choke on per-source columns (e.g. ``next.reward`` present
+        # on lewm but absent on synthetic-v5).  The val/non-streaming train
+        # paths apply the same filter (see ``setup``).
+        if len(self._sources) > 1:
+            train_dataset = KeyFilterDataset(
+                train_dataset, self._common_sample_keys()
+            )
+        self.train_dataset = train_dataset
         self._train_sampler = None
 
     # ------------------------------------------------------------------
@@ -872,33 +900,49 @@ class BlendedLeRobotDataModule(PrecisionCoordinationMixin, L.LightningDataModule
         # come straight from :meth:`_load_and_split_source`.  Val uses
         # ``val_ts`` (either the default delta spec or a caller-
         # supplied override via ``val_delta_timestamps``).
-        val_parts: list = []
+        per_source_val: dict = {}  # name -> Dataset (post-wrap)
         image_keys = self.get_image_keys()
         for source, _train_pairs, val_pairs, shard in full_datasets:
-            val_parts.append(ShardSourceValDataset(
+            per_source_val[source["name"]] = ShardSourceValDataset(
                 shard, val_pairs,
                 delta_timestamps=val_ts,
                 image_keys=image_keys,
-            ))
+            )
 
-        # Filter val samples to common keys when blending
+        # Filter val samples to common keys when blending so the model's
+        # validation_step (and any default_collate downstream) sees
+        # uniform batch keys across sources.
         common_keys = self._common_sample_keys()
-        if len(val_parts) > 1:
-            val_parts = [
-                KeyFilterDataset(vp, common_keys) for vp in val_parts
-            ]
+        if len(per_source_val) > 1:
+            per_source_val = {
+                name: KeyFilterDataset(ds, common_keys)
+                for name, ds in per_source_val.items()
+            }
 
-        combined_val = (
-            val_parts[0] if len(val_parts) == 1
-            else ConcatDataset(val_parts)
-        )
-
-        # Apply validation transform
+        # Apply validation transform per-source so that downstream
+        # consumers (per-source loaders OR the legacy ConcatDataset) see
+        # the same transformed samples.
         val_transform = self.get_val_transform()
         if val_transform is not None:
-            combined_val = AugmentedDataset(combined_val, val_transform)
+            per_source_val = {
+                name: AugmentedDataset(ds, val_transform)
+                for name, ds in per_source_val.items()
+            }
 
-        self.val_dataset = combined_val
+        # Stash per-source dict for ``val_dataloader`` to consume when
+        # per_source_val=True.  Always populated, even when the legacy
+        # combined val_dataset is what gets handed to the trainer.
+        self._per_source_val_datasets = per_source_val
+
+        # Legacy combined val dataset — preserved for back-compat.  When
+        # ``per_source_val=True`` and len > 1, ``val_dataloader`` returns
+        # a list of loaders built from ``_per_source_val_datasets``
+        # instead of one loader over this combined dataset.
+        val_list = list(per_source_val.values())
+        self.val_dataset = (
+            val_list[0] if len(val_list) == 1
+            else ConcatDataset(val_list)
+        )
 
     # ------------------------------------------------------------------
     # DataLoaders
@@ -960,7 +1004,39 @@ class BlendedLeRobotDataModule(PrecisionCoordinationMixin, L.LightningDataModule
         kwargs = self._build_loader_kwargs(
             self.val_batch_size, shuffle=False
         )
+        # Per-source val: return a list of loaders aligned with
+        # ``val_source_names`` so the model's ``validation_step`` can
+        # branch on ``dataloader_idx`` and log ``val_<metric>/<source>``.
+        # Lightning iterates each loader to completion before moving on
+        # to the next, with ``dataloader_idx`` indicating which source
+        # the current batch came from.
+        if self.per_source_val and len(self._per_source_val_datasets) > 1:
+            return [
+                ResumableDataLoader(ds, **kwargs)
+                for ds in self._per_source_val_datasets.values()
+            ]
         return ResumableDataLoader(self.val_dataset, **kwargs)
+
+    @property
+    def val_source_names(self) -> list[str]:
+        """Names of val sources, aligned with ``val_dataloader``'s index.
+
+        - When ``per_source_val=True`` and len(sources) > 1, this list
+          maps Lightning's ``dataloader_idx`` to a stable source name
+          for per-source metric logging (e.g. ``val_ar_loss/lewm``).
+        - When val returns a single loader (single-source OR
+          ``per_source_val=False``), the list has a single entry —
+          either the source's name, or ``"all"`` for the legacy
+          concat-across-sources behaviour.
+
+        Empty list if ``setup`` has not been called yet.
+        """
+        if self._per_source_val_datasets is None:
+            return []
+        names = list(self._per_source_val_datasets.keys())
+        if self.per_source_val and len(names) > 1:
+            return names
+        return names if len(names) == 1 else ["all"]
 
     # ------------------------------------------------------------------
     # State dict for scientific resumption
