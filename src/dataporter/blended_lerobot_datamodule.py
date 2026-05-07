@@ -20,7 +20,7 @@ from typing import Callable
 import lightning as L
 from torch.utils.data import ConcatDataset, Dataset, WeightedRandomSampler
 
-from .dataset_wrappers import AugmentedDataset, DomainIdDataset, KeyFilterDataset
+from .dataset_wrappers import AugmentedDataset, KeyFilterDataset, SourceTagDataset
 from .dtype_coordination import PrecisionCoordinationMixin
 from .lerobot_shard_source import LeRobotShardSource
 from .resumable import ResumableDataLoader, resolve_num_workers
@@ -396,10 +396,11 @@ class BlendedLeRobotDataModule(PrecisionCoordinationMixin, L.LightningDataModule
         """Return keys common to all samples (for collation compatibility)."""
         keys = set(self.delta_timestamps.keys())
         keys.update(["episode_index", "frame_index", "timestamp", "index", "task_index"])
-        # ``domain_id`` is injected by both data paths (streaming train and
+        # ``source_tag`` is injected by both data paths (streaming train and
         # per-source val) — keep it in the allowlist so KeyFilterDataset
-        # doesn't strip it before collation.
-        keys.add("domain_id")
+        # doesn't strip it before collation.  Matches the convention used
+        # by ``autofpv.data.blended_text_datamodule`` and SampleSpec.
+        keys.add("source_tag")
         return keys
 
     # ------------------------------------------------------------------
@@ -731,7 +732,12 @@ class BlendedLeRobotDataModule(PrecisionCoordinationMixin, L.LightningDataModule
             transform = self.get_train_transform(source)
             sources_for_dataset.append({
                 "shard_source": shard,
-                "source_name": source["repo_id"],
+                # ``source["name"]`` is the canonical sanitized identifier
+                # (user-supplied or last path component of repo_id).  Used
+                # both for internal accounting and for stamping
+                # ``item["source_tag"]`` on every sample so streaming-train
+                # and per-source-val emit the same tag for the same source.
+                "source_name": source["name"],
                 "train_episode_indices": train_raw_eps,
                 "episode_offset": cumulative_offset,
                 "transform": transform,
@@ -906,18 +912,18 @@ class BlendedLeRobotDataModule(PrecisionCoordinationMixin, L.LightningDataModule
         # supplied override via ``val_delta_timestamps``).
         per_source_val: dict = {}  # name -> Dataset (post-wrap)
         image_keys = self.get_image_keys()
-        for src_idx, (source, _train_pairs, val_pairs, shard) in enumerate(
-            full_datasets,
-        ):
+        for source, _train_pairs, val_pairs, shard in full_datasets:
             ds = ShardSourceValDataset(
                 shard, val_pairs,
                 delta_timestamps=val_ts,
                 image_keys=image_keys,
             )
-            # Stamp domain_id matching the streaming-train path's
-            # in-line ``item["domain_id"] = src_idx`` injection so
-            # validation_step sees the same field at the same value.
-            per_source_val[source["name"]] = DomainIdDataset(ds, src_idx)
+            # Stamp source_tag matching the streaming-train path's
+            # in-line ``item["source_tag"] = source["name"]`` injection
+            # so validation_step sees the same field at the same value.
+            per_source_val[source["name"]] = SourceTagDataset(
+                ds, source["name"],
+            )
 
         # Filter val samples to common keys when blending so the model's
         # validation_step (and any default_collate downstream) sees
@@ -1026,6 +1032,28 @@ class BlendedLeRobotDataModule(PrecisionCoordinationMixin, L.LightningDataModule
                 for ds in self._per_source_val_datasets.values()
             ]
         return ResumableDataLoader(self.val_dataset, **kwargs)
+
+    @property
+    def source_tag_to_idx(self) -> dict[str, int]:
+        """Map ``source_tag`` strings to integer indices in declaration order.
+
+        Models that need a numeric handle for embedding lookup
+        (conditional decoder, per-source loss aggregation) can use this
+        to convert the string tags emitted by both data paths into a
+        dense integer index without depending on private attributes:
+
+            tags = batch["source_tag"]              # list[str], length B
+            idx_map = trainer.datamodule.source_tag_to_idx
+            indices = torch.tensor(
+                [idx_map[t] for t in tags],
+                dtype=torch.long, device=device,
+            )
+
+        Indices follow the order of ``self._sources`` (i.e. user
+        declaration order), so ``source_tag_to_idx[name] == src_idx``
+        in the streaming-train path's bookkeeping.
+        """
+        return {src["name"]: i for i, src in enumerate(self._sources)}
 
     @property
     def val_source_names(self) -> list[str]:

@@ -479,11 +479,15 @@ class LeRobotShuffleBufferDataset(Dataset):
         if transform is not None:
             item = transform(item)
 
-        # 6. Domain ID — for conditional-decoder training (Option 1 of the
-        #    blend-distribution-conflict mitigation).  Always emitted; the
-        #    consumer can ignore it when num_domains=1.  Aligned with
-        #    ``BlendedLeRobotDataModule._sources`` declaration order.
-        item["domain_id"] = torch.tensor(src_idx, dtype=torch.long)
+        # 6. Source tag — string identifier matching the convention from
+        #    ``autofpv.data._adapters.StampSourceTag`` /
+        #    ``autofpv.data.sample_spec.SampleSpec``.  Emitted on every
+        #    sample so downstream consumers (per-source loss aggregation,
+        #    conditional decoders, domain-aware augmentation) can route by
+        #    source without needing private indexing schemes.  Models that
+        #    need an integer index for embedding lookup convert via
+        #    ``BlendedLeRobotDataModule.source_tag_to_idx``.
+        item["source_tag"] = self._source_names[src_idx]
 
         return item
 

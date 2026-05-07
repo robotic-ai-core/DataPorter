@@ -3,12 +3,13 @@
 Provides lightweight wrappers that compose with any PyTorch Dataset:
 - KeyFilterDataset: strips samples to a fixed set of keys (for blended collation)
 - AugmentedDataset: applies per-sample transform pipeline
-- DomainIdDataset: stamps a fixed integer domain_id onto every sample
+- SourceTagDataset: stamps a fixed string ``source_tag`` onto every sample,
+  matching the convention used by ``autofpv.data.blended_text_datamodule``
+  and ``autofpv.data.sample_spec``.
 """
 
 from typing import Callable
 
-import torch
 from torch.utils.data import Dataset
 
 
@@ -84,43 +85,50 @@ class AugmentedDataset(Dataset):
         )
 
 
-class DomainIdDataset(Dataset):
-    """Stamp a fixed ``domain_id`` integer onto every sample.
+class SourceTagDataset(Dataset):
+    """Stamp a fixed ``source_tag`` string onto every sample.
+
+    Mirrors the convention from ``autofpv.data._adapters.StampSourceTag``
+    and the ``source_tag`` field in ``autofpv.data.sample_spec.SampleSpec`` —
+    a string identifier per sample that downstream consumers can use for
+    per-source loss aggregation, conditional decoder routing, or
+    domain-aware augmentation.
 
     Used by ``BlendedLeRobotDataModule`` to tag each per-source val
-    dataset with its source index, matching the streaming train path's
-    in-line ``item["domain_id"] = src_idx`` injection.  Models that opt
-    into conditional-decoder training (Option 1 of the blend-
-    distribution-conflict mitigation) read this field from the batch.
+    dataset with its source name, matching the streaming train path's
+    in-line ``item["source_tag"] = source["name"]`` injection.
 
     Args:
         dataset: Inner dataset returning dict samples.
-        domain_id: Integer to stamp under the ``"domain_id"`` key.
+        source_tag: String label to stamp under the ``"source_tag"`` key.
+            Should match a name in the parent datamodule's source list
+            so consumers can map back to indices via
+            ``datamodule.source_tag_to_idx``.
 
     Notes:
-        - Stored as a 0-dim ``torch.long`` tensor so default_collate
-          stacks it cleanly into a ``(B,)`` LongTensor.
+        - Stored as a Python str (not a tensor) — default_collate gathers
+          per-batch into a ``list[str]`` of length B without stacking.
+          Models that need integer indices for embedding lookup can
+          convert via ``datamodule.source_tag_to_idx``.
         - Idempotent on re-wrap — if the inner dataset already provides
-          ``domain_id``, this overwrites it (so the outermost wrapper
-          wins, matching the user's mental model).
+          ``source_tag``, this overwrites it (outermost wrapper wins).
     """
 
-    def __init__(self, dataset: Dataset, domain_id: int):
+    def __init__(self, dataset: Dataset, source_tag: str):
         self.dataset = dataset
-        self.domain_id = int(domain_id)
-        self._tensor = torch.tensor(self.domain_id, dtype=torch.long)
+        self.source_tag = str(source_tag)
 
     def __len__(self) -> int:
         return len(self.dataset)
 
     def __getitem__(self, idx: int) -> dict:
         item = self.dataset[idx]
-        item["domain_id"] = self._tensor.clone()
+        item["source_tag"] = self.source_tag
         return item
 
     def __repr__(self) -> str:
         return (
             f"{self.__class__.__name__}("
             f"dataset={self.dataset}, "
-            f"domain_id={self.domain_id})"
+            f"source_tag={self.source_tag!r})"
         )
