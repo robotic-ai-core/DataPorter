@@ -479,6 +479,12 @@ class LeRobotShuffleBufferDataset(Dataset):
         if transform is not None:
             item = transform(item)
 
+        # 6. Domain ID — for conditional-decoder training (Option 1 of the
+        #    blend-distribution-conflict mitigation).  Always emitted; the
+        #    consumer can ignore it when num_domains=1.  Aligned with
+        #    ``BlendedLeRobotDataModule._sources`` declaration order.
+        item["domain_id"] = torch.tensor(src_idx, dtype=torch.long)
+
         return item
 
     # ------------------------------------------------------------------

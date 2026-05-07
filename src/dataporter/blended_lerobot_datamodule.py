@@ -20,7 +20,7 @@ from typing import Callable
 import lightning as L
 from torch.utils.data import ConcatDataset, Dataset, WeightedRandomSampler
 
-from .dataset_wrappers import AugmentedDataset, KeyFilterDataset
+from .dataset_wrappers import AugmentedDataset, DomainIdDataset, KeyFilterDataset
 from .dtype_coordination import PrecisionCoordinationMixin
 from .lerobot_shard_source import LeRobotShardSource
 from .resumable import ResumableDataLoader, resolve_num_workers
@@ -396,6 +396,10 @@ class BlendedLeRobotDataModule(PrecisionCoordinationMixin, L.LightningDataModule
         """Return keys common to all samples (for collation compatibility)."""
         keys = set(self.delta_timestamps.keys())
         keys.update(["episode_index", "frame_index", "timestamp", "index", "task_index"])
+        # ``domain_id`` is injected by both data paths (streaming train and
+        # per-source val) — keep it in the allowlist so KeyFilterDataset
+        # doesn't strip it before collation.
+        keys.add("domain_id")
         return keys
 
     # ------------------------------------------------------------------
@@ -902,12 +906,18 @@ class BlendedLeRobotDataModule(PrecisionCoordinationMixin, L.LightningDataModule
         # supplied override via ``val_delta_timestamps``).
         per_source_val: dict = {}  # name -> Dataset (post-wrap)
         image_keys = self.get_image_keys()
-        for source, _train_pairs, val_pairs, shard in full_datasets:
-            per_source_val[source["name"]] = ShardSourceValDataset(
+        for src_idx, (source, _train_pairs, val_pairs, shard) in enumerate(
+            full_datasets,
+        ):
+            ds = ShardSourceValDataset(
                 shard, val_pairs,
                 delta_timestamps=val_ts,
                 image_keys=image_keys,
             )
+            # Stamp domain_id matching the streaming-train path's
+            # in-line ``item["domain_id"] = src_idx`` injection so
+            # validation_step sees the same field at the same value.
+            per_source_val[source["name"]] = DomainIdDataset(ds, src_idx)
 
         # Filter val samples to common keys when blending so the model's
         # validation_step (and any default_collate downstream) sees

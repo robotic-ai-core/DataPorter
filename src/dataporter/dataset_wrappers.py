@@ -3,10 +3,12 @@
 Provides lightweight wrappers that compose with any PyTorch Dataset:
 - KeyFilterDataset: strips samples to a fixed set of keys (for blended collation)
 - AugmentedDataset: applies per-sample transform pipeline
+- DomainIdDataset: stamps a fixed integer domain_id onto every sample
 """
 
 from typing import Callable
 
+import torch
 from torch.utils.data import Dataset
 
 
@@ -79,4 +81,46 @@ class AugmentedDataset(Dataset):
             f"{self.__class__.__name__}("
             f"dataset={self.dataset}, "
             f"transform={self.transform})"
+        )
+
+
+class DomainIdDataset(Dataset):
+    """Stamp a fixed ``domain_id`` integer onto every sample.
+
+    Used by ``BlendedLeRobotDataModule`` to tag each per-source val
+    dataset with its source index, matching the streaming train path's
+    in-line ``item["domain_id"] = src_idx`` injection.  Models that opt
+    into conditional-decoder training (Option 1 of the blend-
+    distribution-conflict mitigation) read this field from the batch.
+
+    Args:
+        dataset: Inner dataset returning dict samples.
+        domain_id: Integer to stamp under the ``"domain_id"`` key.
+
+    Notes:
+        - Stored as a 0-dim ``torch.long`` tensor so default_collate
+          stacks it cleanly into a ``(B,)`` LongTensor.
+        - Idempotent on re-wrap — if the inner dataset already provides
+          ``domain_id``, this overwrites it (so the outermost wrapper
+          wins, matching the user's mental model).
+    """
+
+    def __init__(self, dataset: Dataset, domain_id: int):
+        self.dataset = dataset
+        self.domain_id = int(domain_id)
+        self._tensor = torch.tensor(self.domain_id, dtype=torch.long)
+
+    def __len__(self) -> int:
+        return len(self.dataset)
+
+    def __getitem__(self, idx: int) -> dict:
+        item = self.dataset[idx]
+        item["domain_id"] = self._tensor.clone()
+        return item
+
+    def __repr__(self) -> str:
+        return (
+            f"{self.__class__.__name__}("
+            f"dataset={self.dataset}, "
+            f"domain_id={self.domain_id})"
         )
