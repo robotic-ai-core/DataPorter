@@ -19,6 +19,12 @@ from .parquet_dataset import ParquetTokenDataset
 from .stream_dataset import PretrainStreamDataset
 from .types import TextSample
 from .chat import ChatDataset, ChatStreamDataset, apply_chat_template
+from .blending import (
+    BlendedTextDataset,
+    MixingScheduleCallback,
+    PretrainBlendScheduleCallback,
+    WeightedMultiSourceDataset,
+)
 
 __all__ = [
     "TokenChunker",
@@ -28,4 +34,8 @@ __all__ = [
     "ChatDataset",
     "ChatStreamDataset",
     "apply_chat_template",
+    "BlendedTextDataset",
+    "MixingScheduleCallback",
+    "PretrainBlendScheduleCallback",
+    "WeightedMultiSourceDataset",
 ]
