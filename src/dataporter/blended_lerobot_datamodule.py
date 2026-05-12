@@ -24,6 +24,7 @@ from .dataset_wrappers import AugmentedDataset, KeyFilterDataset, SourceTagDatas
 from .dtype_coordination import PrecisionCoordinationMixin
 from .lerobot_shard_source import LeRobotShardSource
 from .resumable import ResumableDataLoader, resolve_num_workers
+from .schemas import Schema
 from .shard_source_val_dataset import ShardSourceValDataset
 
 logger = logging.getLogger(__name__)
@@ -247,8 +248,17 @@ class BlendedLeRobotDataModule(PrecisionCoordinationMixin, L.LightningDataModule
         nominal_total_frames: int | None = None,
         producer_pool_workers: int = 4,
         per_source_val: bool = False,
+        schema_spec: Schema | None = None,
+        schema_validate_every: int | None = None,
     ):
         super().__init__()
+        # Batch contract enforcement (opt-in). When set, every dataloader
+        # returned by this datamodule is wrapped so iteration always
+        # validates the first batch (and every Nth via
+        # ``schema_validate_every``). Schema drift fails loud at the
+        # datamodule boundary instead of silently in the model.
+        self._schema_spec = schema_spec
+        self._schema_validate_every = schema_validate_every
 
         # Normalize to list of source dicts
         if isinstance(repo_id, str):
@@ -1014,7 +1024,7 @@ class BlendedLeRobotDataModule(PrecisionCoordinationMixin, L.LightningDataModule
             dl.load_state_dict(self._pending_dl_state)
             self._pending_dl_state = None
         self._train_dataloader = dl
-        return dl
+        return self._maybe_wrap_with_schema(dl)
 
     def val_dataloader(self):
         kwargs = self._build_loader_kwargs(
@@ -1028,10 +1038,25 @@ class BlendedLeRobotDataModule(PrecisionCoordinationMixin, L.LightningDataModule
         # the current batch came from.
         if self.per_source_val and len(self._per_source_val_datasets) > 1:
             return [
-                ResumableDataLoader(ds, **kwargs)
+                self._maybe_wrap_with_schema(
+                    ResumableDataLoader(ds, **kwargs)
+                )
                 for ds in self._per_source_val_datasets.values()
             ]
-        return ResumableDataLoader(self.val_dataset, **kwargs)
+        return self._maybe_wrap_with_schema(
+            ResumableDataLoader(self.val_dataset, **kwargs)
+        )
+
+    def _maybe_wrap_with_schema(self, loader):
+        """Wrap ``loader`` in a schema-validating iterator when configured.
+
+        No-op when ``schema_spec`` was not supplied at construction.
+        """
+        if self._schema_spec is None:
+            return loader
+        return self._schema_spec.wrap_dataloader(
+            loader, validate_every=self._schema_validate_every,
+        )
 
     @property
     def source_tag_to_idx(self) -> dict[str, int]:
