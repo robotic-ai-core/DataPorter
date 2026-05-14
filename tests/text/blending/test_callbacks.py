@@ -1,9 +1,9 @@
 """Smoke tests for MixingScheduleCallback.
 
 Verifies the schedule math + that the callback no-ops when the target
-``BlendedTextDataset`` is not on the datamodule. The
-``PretrainBlendScheduleCallback`` schedule math is covered in
-``test_multi_pretrain_blend.py`` (ported from autofpv).
+``BlendedTextDataset`` is not on the datamodule. Both the callback and
+``BlendedTextDataset`` are deprecated in Phase 3b; DeprecationWarning
+emission is covered in ``test_wrapper_equivalence.py``.
 """
 
 from __future__ import annotations
@@ -15,6 +15,10 @@ import pytest
 from dataporter.text.blending import (
     BlendedTextDataset,
     MixingScheduleCallback,
+)
+
+pytestmark = pytest.mark.filterwarnings(
+    "ignore::DeprecationWarning"
 )
 
 

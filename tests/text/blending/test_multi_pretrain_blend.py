@@ -1,4 +1,9 @@
-"""Tests for WeightedMultiSourceDataset and PretrainBlendScheduleCallback."""
+"""Tests for WeightedMultiSourceDataset and PretrainBlendScheduleCallback.
+
+Both classes are deprecated in Phase 3b; DeprecationWarning emission is
+covered in ``test_wrapper_equivalence.py``. These tests intentionally
+suppress that warning so legacy behavior coverage stays uncluttered.
+"""
 
 from __future__ import annotations
 
@@ -9,6 +14,10 @@ from torch.utils.data import Dataset
 from dataporter.text.blending import (
     PretrainBlendScheduleCallback,
     WeightedMultiSourceDataset,
+)
+
+pytestmark = pytest.mark.filterwarnings(
+    "ignore::DeprecationWarning"
 )
 
 

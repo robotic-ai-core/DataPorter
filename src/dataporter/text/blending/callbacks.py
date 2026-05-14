@@ -1,5 +1,12 @@
 """Lightning callbacks driving the blended-text schedules.
 
+.. deprecated:: phase-3b
+   Both callbacks here are backward-compat shims. New code should use
+   :class:`dataporter.text.SourceScheduleCallback`, which subsumes both
+   schedule kinds via a single per-source piecewise-linear curve API
+   keyed by ``source_name`` or ``source_idx``. Removal is scheduled for
+   Phase 5.
+
 Two callbacks:
 
 - :class:`MixingScheduleCallback` linearly anneals
@@ -10,10 +17,15 @@ Two callbacks:
 
 Both callbacks discover their target dataset by walking
 ``trainer.datamodule``; if the target isn't found they silently no-op
-so non-blended runs aren't affected.
+so non-blended runs aren't affected. Because the underlying datasets
+are now :class:`ScheduledBlendDataset` wrappers, the legacy write paths
+(``chat_ratio`` setter, ``_weight_tensors[i].fill_(w)``) continue to
+work unchanged — they're just thinner under the hood.
 """
 
 from __future__ import annotations
+
+import warnings
 
 import lightning as L
 
@@ -50,6 +62,13 @@ class MixingScheduleCallback(L.Callback):
         log_every_n_steps: int = 100,
     ):
         super().__init__()
+        warnings.warn(
+            "MixingScheduleCallback is deprecated; use "
+            "dataporter.text.SourceScheduleCallback with a per-source "
+            "schedule on the chat source. Scheduled removal: Phase 5.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         if blend_end_step <= blend_start_step:
             raise ValueError(
                 f"blend_end_step ({blend_end_step}) must be > "
@@ -152,6 +171,13 @@ class PretrainBlendScheduleCallback(L.Callback):
         log_every_n_steps: int = 100,
     ):
         super().__init__()
+        warnings.warn(
+            "PretrainBlendScheduleCallback is deprecated; use "
+            "dataporter.text.SourceScheduleCallback with schedules keyed "
+            "by source_name. Scheduled removal: Phase 5.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         if not schedules:
             raise ValueError("schedules must be non-empty")
         # Normalise every entry to control-point form. Points get sorted
