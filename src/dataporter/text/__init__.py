@@ -23,6 +23,8 @@ from .blending import (
     BlendedTextDataset,
     MixingScheduleCallback,
     PretrainBlendScheduleCallback,
+    ScheduledBlendDataset,
+    SourceScheduleCallback,
     WeightedMultiSourceDataset,
 )
 
@@ -34,6 +36,8 @@ __all__ = [
     "ChatDataset",
     "ChatStreamDataset",
     "apply_chat_template",
+    "ScheduledBlendDataset",
+    "SourceScheduleCallback",
     "BlendedTextDataset",
     "MixingScheduleCallback",
     "PretrainBlendScheduleCallback",

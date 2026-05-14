@@ -1,7 +1,8 @@
 """Smoke tests for BlendedTextDataset.
 
-Confirms the verbatim port works at the new location and that the
-shared-memory chat_ratio plus spec probe still behave as before.
+The class itself is deprecated in Phase 3b; DeprecationWarning emission
+is covered in ``test_wrapper_equivalence.py``. These tests intentionally
+suppress that warning so legacy behavior coverage stays uncluttered.
 """
 
 from __future__ import annotations
@@ -15,6 +16,9 @@ from torch.utils.data import Dataset
 from dataporter.schemas import SchemaError, TextSampleSpec
 from dataporter.text.blending import BlendedTextDataset
 
+pytestmark = pytest.mark.filterwarnings(
+    "ignore:BlendedTextDataset is deprecated:DeprecationWarning"
+)
 
 SEQ_LEN = 8
 PAD = 0
