@@ -156,8 +156,15 @@ data:
         working: "bfloat16"        # explicit target → honored even for ints
 ```
 
-Non-floating dtypes (`uint8`, `int32`, etc.) are never upcasted — `working`
-is silently ignored for them.
+Non-floating dtypes (`uint8`, `int32`, etc.) ignore `working: "match"` so
+token-ID and mask paths stay categorical by default. An explicit float
+target (e.g. `working: "bfloat16"`) is treated as an intentional opt-in
+and is honored — that's the supported way to keep image data as `uint8`
+on the wire and upcast it at the model boundary.
+
+The upcast is a pure dtype cast — values are not rescaled. `uint8`
+pixels arriving at `bfloat16` still hold `[0, 255]`; any normalization
+to `[0, 1]` / `[-1, 1]` belongs in the model.
 
 ## Lightning integration
 
