@@ -339,9 +339,19 @@ class DtypeCoordinator:
         target = self._resolve_target(rule, working_dtype)
         if target is None:
             return tensor
-        # Skip non-floating tensors entirely - working dtype is a
-        # floating-point coordination concept; ints/bools never autocast.
-        if not tensor.is_floating_point():
+        # Non-floating sources (int/bool) are usually categorical labels
+        # (token IDs, attention masks).  Silently autocasting them to a
+        # float would break embedding lookups downstream.  When the
+        # user only said ``working: "match"`` we stay conservative and
+        # skip the cast.  An EXPLICIT target dtype (e.g.
+        # ``working: "bfloat16"``) is an intentional opt-in — honor it,
+        # so workflows that compress pixels to uint8 on the wire and
+        # need them upcast on the GPU keep working without a model-
+        # side cast.
+        if (
+            not tensor.is_floating_point()
+            and rule.working_directive == _WORKING_MATCH
+        ):
             return tensor
         if tensor.dtype == target:
             return tensor
