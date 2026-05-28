@@ -252,6 +252,45 @@ class TestApplyWorkingDtype:
         out = c.apply_working_dtype(b, torch.bfloat16)
         assert out["ids"].dtype == torch.int32
 
+    def test_nonfloat_tensor_with_explicit_working_target_is_upcast(self):
+        """uint8 wire pixels + explicit ``working: bfloat16`` upcasts on GPU.
+
+        Mirrors the workflow where a user compresses image data to uint8
+        on the wire to halve worker-buffer RAM and PCIe transfer cost,
+        then relies on DataPorter to upcast at the model boundary.  The
+        default ``match`` directive stays conservative (preserves the
+        token-id case in
+        :py:meth:`test_nonfloat_tensor_ignores_working`); an explicit
+        target dtype is an intentional opt-in.
+        """
+        c = DtypeCoordinator.from_config([
+            {
+                "path": "observation.image",
+                "dtype": "uint8",
+                "working": "bfloat16",
+            },
+        ])
+        b = {
+            "observation": {
+                "image": torch.randint(0, 256, (2, 3, 4, 4), dtype=torch.uint8),
+            }
+        }
+        out = c.apply_working_dtype(b, torch.float16)
+        # Honored explicit target, NOT the precision-plugin dtype.
+        assert out["observation"]["image"].dtype == torch.bfloat16
+
+    def test_nonfloat_tensor_with_keep_directive_stays_nonfloat(self):
+        """``working: keep`` short-circuits the upcast even for non-float
+        wires — the safety hatch users can reach for if the new
+        explicit-target behaviour ever surprises them.
+        """
+        c = DtypeCoordinator.from_config([
+            {"path": "ids", "dtype": "int32", "working": "keep"},
+        ])
+        b = {"ids": torch.tensor([1, 2, 3], dtype=torch.int32)}
+        out = c.apply_working_dtype(b, torch.bfloat16)
+        assert out["ids"].dtype == torch.int32
+
     def test_path_not_in_batch_is_silent(self):
         c = DtypeCoordinator.from_config([
             {"path": "missing.path", "dtype": "float16"},

@@ -149,7 +149,11 @@ data:
         dtype: "float32"
         working: "keep"            # full precision, no upcast (already fp32)
       - path: "metadata.timestamp"
-        dtype: "uint16"            # non-floating, working has no effect
+        dtype: "uint16"            # non-floating: `match` is silently ignored
+                                   # (set `working: "bfloat16"` to force-upcast)
+      - path: "pixels_uint8"
+        dtype: "uint8"             # wire-side compression for image data
+        working: "bfloat16"        # explicit target → honored even for ints
 ```
 
 Non-floating dtypes (`uint8`, `int32`, etc.) are never upcasted — `working`
@@ -234,7 +238,8 @@ the upcast is a complete no-op — wire dtypes survive to the consumer.
 | Wire `bfloat16` → working `float16`                        | WARN once (lossy round-trip — different exponent ranges) |
 | Wire `float16` → working `bfloat16`                        | WARN once (lossy round-trip — fp16 has more mantissa) |
 | Wire `float64` → working `float16`/`bfloat16`              | WARN once (large dynamic range loss) |
-| Wire `int8`/`uint8` etc. with non-`"keep"` working         | `working` silently ignored on non-float tensors |
+| Wire `int8`/`uint8` etc. with `working: "match"` (default) | `working` silently ignored — protects token-id paths |
+| Wire `int8`/`uint8` etc. with explicit float `working`     | upcast honored — opt-in path for uint8 image pipelines |
 | `dtype` and `working` identical at runtime                 | upcast skipped (`tensor.dtype == target` short-circuit) |
 | Path declared in `dtype_conversions` not present in batch  | silently no-op (matches existing wire behavior) |
 | Path matches but value is not a Tensor                     | silently no-op (matches existing wire behavior) |
@@ -333,7 +338,9 @@ See `tests/test_dtype_coordination.py` for the matrix:
 - lossy round-trip warning (fp16 ↔ bf16) ✓
 - legacy `dtype_conversions` configs with no `working` field still work ✓
 - `working: "keep"` preserves wire dtype ✓
-- non-float wire dtype ignores `working` ✓
+- non-float wire dtype with `working: "match"` stays non-float ✓
+- non-float wire dtype with explicit `working: "<float-dtype>"` is upcast ✓
+- non-float wire dtype with `working: "keep"` stays non-float ✓
 - `BlendedLeRobotDataModule.on_after_batch_transfer` integration ✓
 - The AutoFPV repro at `tmp/repro_int8_conv2d_bf16_autocast.py` runs clean
   after this change.
