@@ -128,6 +128,63 @@ class TestDtypeCoordinatorConfig:
         ])
         assert not c.has_rules()
 
+    def test_normalize_parsed_without_wire(self):
+        """A normalize rule needs no explicit wire dtype: the dataset emits
+        uint8 directly, so there is nothing to downcast at collate time."""
+        c = DtypeCoordinator.from_config([
+            {"path": "observation.image", "working": "match", "normalize": 255.0},
+        ])
+        assert len(c.rules) == 1
+        rule = c.rules[0]
+        assert rule.normalize == 255.0
+        assert rule.wire_dtype is None
+        assert rule.working_directive == "match"
+        # No wire downcast registered (the dataset already emits uint8).
+        assert c.wire_converter.dtype_map == {}
+        # A normalize rule always implies a working-side upcast (it must
+        # produce a float), so it gates the on_after_batch_transfer walk.
+        assert c.has_working_rules()
+        assert c.normalize_paths() == ("observation.image",)
+
+    def test_normalize_with_explicit_uint8_wire_ok(self):
+        """An explicit integer ``wire: uint8`` is allowed alongside normalize."""
+        c = DtypeCoordinator.from_config([
+            {"path": "observation.image", "wire": "uint8",
+             "working": "match", "normalize": 255.0},
+        ])
+        assert c.rules[0].normalize == 255.0
+        assert c.rules[0].wire_dtype == "uint8"
+        # The integer wire IS registered for the collate-time converter.
+        assert c.wire_converter.dtype_map == {"observation.image": "uint8"}
+
+    def test_normalize_nonpositive_raises(self):
+        with pytest.raises(ValueError, match="'normalize' must be a positive number"):
+            DtypeCoordinator.from_config([
+                {"path": "x", "working": "match", "normalize": 0},
+            ])
+
+    def test_normalize_with_float_wire_raises(self):
+        """A floating wire would erase the integer encoding before /scale."""
+        with pytest.raises(ValueError, match="'normalize' requires an integer wire"):
+            DtypeCoordinator.from_config([
+                {"path": "x", "wire": "float16", "working": "match",
+                 "normalize": 255.0},
+            ])
+
+    def test_normalize_with_keep_raises(self):
+        """``working: keep`` can't normalize: the int wire would never upcast."""
+        with pytest.raises(ValueError, match="incompatible with working"):
+            DtypeCoordinator.from_config([
+                {"path": "x", "wire": "uint8", "working": "keep",
+                 "normalize": 255.0},
+            ])
+
+    def test_normalize_paths_empty_without_normalize(self):
+        c = DtypeCoordinator.from_config([
+            {"path": "x", "dtype": "float16"},
+        ])
+        assert c.normalize_paths() == ()
+
 
 # ---------------------------------------------------------------------------
 # Working dtype discovery
@@ -550,3 +607,109 @@ def test_end_to_end_legacy_config_no_working_field():
     trainer.fit(model, datamodule=dm)
     # Legacy config (no working field) gets implicit working='match' -> bf16.
     assert probe.image_dtype == torch.bfloat16
+
+
+# ---------------------------------------------------------------------------
+# uint8 wire: normalize-on-upcast (the 4x-smaller-wire optimization)
+# ---------------------------------------------------------------------------
+
+
+class TestNormalizeWire:
+    """The ``normalize`` directive: a uint8 ``[0, 255]`` wire tensor is upcast
+    to the working float dtype AND divided by the scale on the GPU side, so
+    the model sees the same ``[0, 1]`` floats a float wire would have carried
+    — at 1/4 the bytes.  See ``normalize_paths`` + ``_maybe_upcast``.
+    """
+
+    def _uint8_batch(self):
+        return {
+            "observation": {
+                "image": torch.randint(0, 256, (2, 3, 8, 8), dtype=torch.uint8),
+            }
+        }
+
+    def test_float32_normalize_is_bit_exact_to_dataset_path(self):
+        """uint8 -> float32 / 255 via the coordinator is BIT-IDENTICAL to the
+        dataset's own ``frames.to(float32) / 255`` — the parity anchor that
+        lets us move the /255 off the dataloader without changing a single
+        model input.
+        """
+        c = DtypeCoordinator.from_config([
+            {"path": "observation.image", "working": "float32", "normalize": 255.0},
+        ])
+        b = self._uint8_batch()
+        raw = b["observation"]["image"]
+        expected = raw.to(torch.float32) / 255.0
+        out = c.apply_working_dtype(b, torch.float32)
+        got = out["observation"]["image"]
+        assert got.dtype == torch.float32
+        assert torch.equal(got, expected)
+
+    def test_bf16_normalize_matches_within_tolerance(self):
+        """Under a bf16 trainer the normalized result matches the float32
+        reference to bf16 precision.  bf16 has 8 mantissa bits, so the
+        worst-case rounding error on a ``[0, 1]`` value is below 2^-7.
+        """
+        c = DtypeCoordinator.from_config([
+            {"path": "observation.image", "working": "match", "normalize": 255.0},
+        ])
+        b = self._uint8_batch()
+        reference = b["observation"]["image"].to(torch.float32) / 255.0
+        out = c.apply_working_dtype(b, torch.bfloat16)
+        got = out["observation"]["image"]
+        assert got.dtype == torch.bfloat16
+        assert got.to(torch.float32).max() <= 1.0
+        torch.testing.assert_close(
+            got.to(torch.float32), reference, atol=2 ** -7, rtol=0
+        )
+
+    def test_normalize_without_working_dtype_raises(self):
+        """A ``match`` normalize rule with no resolved working dtype (no
+        Lightning trainer) can't pick a float to divide in — fail loudly
+        rather than silently emit raw uint8 ints or the wrong scale.
+        """
+        c = DtypeCoordinator.from_config([
+            {"path": "observation.image", "working": "match", "normalize": 255.0},
+        ])
+        b = self._uint8_batch()
+        with pytest.raises(
+            ValueError, match="'normalize' needs a resolved working float"
+        ):
+            c.apply_working_dtype(b, None)
+
+    def test_normalize_skips_already_float_tensor(self):
+        """If a path already carries a float tensor, the normalize branch is
+        skipped (no spurious /255) — only an integer wire is normalized.
+        """
+        c = DtypeCoordinator.from_config([
+            {"path": "observation.image", "working": "float32", "normalize": 255.0},
+        ])
+        already_float = torch.rand(2, 3, 8, 8, dtype=torch.float32)
+        b = {"observation": {"image": already_float}}
+        out = c.apply_working_dtype(b, torch.float32)
+        assert torch.equal(out["observation"]["image"], already_float)
+
+    def test_mixin_normalizes_uint8_under_bf16_trainer(self):
+        """End-to-end through the Lightning hook: a uint8 batch under a
+        bf16-mixed trainer lands as normalized bf16 at the model boundary.
+        """
+        dm = _MockDataModule(
+            dtype_conversions=[
+                {"path": "observation.image", "working": "match",
+                 "normalize": 255.0},
+            ],
+            trainer=_FakeTrainer("bf16-mixed"),
+        )
+        b = {
+            "observation": {
+                "image": torch.randint(0, 256, (2, 3, 8, 8), dtype=torch.uint8),
+            }
+        }
+        reference = b["observation"]["image"].to(torch.float32) / 255.0
+        out = dm.on_after_batch_transfer(b, dataloader_idx=0)
+        got = out["observation"]["image"]
+        assert got.dtype == torch.bfloat16
+        assert got.to(torch.float32).max() <= 1.0
+        torch.testing.assert_close(
+            got.to(torch.float32), reference, atol=2 ** -7, rtol=0
+        )

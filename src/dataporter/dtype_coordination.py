@@ -86,11 +86,18 @@ class _Rule:
         wire_dtype: Target dtype at collate time (None = don't downcast).
         working_directive: One of ``"match"``, ``"keep"``, or an explicit
             dtype string. Resolved at runtime against the precision plugin.
+        normalize: Optional positive divisor for the **uint8 wire**. When
+            set, the wire tensor is an integer fixed-point encoding (e.g.
+            uint8 ``[0, 255]``); :meth:`apply_working_dtype` upcasts it to
+            the working float dtype and divides by this scale, yielding the
+            same ``[0, 1]`` floats the dataset would otherwise have produced
+            at collate time — but the wire carries 4× fewer bytes than fp16.
     """
 
     path: str
     wire_dtype: Optional[str]
     working_directive: str
+    normalize: Optional[float] = None
 
 
 @dataclass
@@ -157,11 +164,13 @@ class DtypeCoordinator:
                 # are set so a user can be explicit.
                 wire = entry.get("wire", entry.get("dtype"))
                 working = entry.get("working", _WORKING_MATCH)
+                normalize = entry.get("normalize")
                 rules.append(
                     _Rule(
                         path=path,
                         wire_dtype=wire,
                         working_directive=working,
+                        normalize=normalize,
                     )
                 )
                 if wire is not None:
@@ -186,6 +195,7 @@ class DtypeCoordinator:
         # construction time, not on the first training batch.
         for rule in rules:
             cls._validate_working_directive(rule)
+            cls._validate_normalize(rule)
 
         wire_converter = KeyBasedDtypeConverter(wire_pairs if wire_pairs else None)
         return cls(rules=tuple(rules), wire_converter=wire_converter)
@@ -205,6 +215,39 @@ class DtypeCoordinator:
                 f"working directive {directive!r}. Allowed: {_WORKING_MATCH!r}, "
                 f"{_WORKING_KEEP!r}, or a dtype string. ({e})"
             ) from None
+
+    @staticmethod
+    def _validate_normalize(rule: _Rule) -> None:
+        """Reject contradictory ``normalize`` rules at construction time."""
+        if rule.normalize is None:
+            return
+        if not isinstance(rule.normalize, (int, float)) or rule.normalize <= 0:
+            raise ValueError(
+                f"dtype_conversions entry for path {rule.path!r}: 'normalize' "
+                f"must be a positive number, got {rule.normalize!r}."
+            )
+        # 'normalize' means "integer fixed-point wire -> float / scale on the
+        # working side". A floating wire dtype would erase the integer
+        # encoding at collate time, so the two are mutually exclusive.
+        if rule.wire_dtype is not None:
+            wire = _string_to_torch_dtype(rule.wire_dtype)
+            if wire.is_floating_point:
+                raise ValueError(
+                    f"dtype_conversions entry for path {rule.path!r}: "
+                    f"'normalize' requires an integer wire (omit 'wire' or set "
+                    f"wire: 'uint8'); got floating wire={rule.wire_dtype!r}, "
+                    f"which discards the fixed-point encoding before "
+                    f"normalization."
+                )
+        # 'keep' leaves the wire dtype untouched, but normalization must
+        # produce a float — so an upcast on the working side is mandatory.
+        if rule.working_directive == _WORKING_KEEP:
+            raise ValueError(
+                f"dtype_conversions entry for path {rule.path!r}: 'normalize' "
+                f"is incompatible with working: {_WORKING_KEEP!r} (the integer "
+                f"wire must upcast to a float to be divided). Use working: "
+                f"{_WORKING_MATCH!r} or an explicit float dtype."
+            )
 
     # ------------------------------------------------------------------
     # Discovery
@@ -265,6 +308,18 @@ class DtypeCoordinator:
     # working so external callers and the older test surface don't
     # break, but prefer ``has_working_rules`` in new code.
     has_rules = has_working_rules
+
+    def normalize_paths(self) -> Tuple[str, ...]:
+        """Paths whose wire tensor is an integer fixed-point encoding that
+        :meth:`apply_working_dtype` normalizes to a float (the uint8-wire
+        optimization).
+
+        A datamodule consults this to decide whether the dataset must emit
+        uint8 frames for those paths instead of pre-normalized floats —
+        keeping the normalize rule the single source of truth for the wire
+        format.
+        """
+        return tuple(r.path for r in self.rules if r.normalize is not None)
 
     def apply_working_dtype(
         self,
@@ -337,6 +392,20 @@ class DtypeCoordinator:
         if rule is None:
             return tensor
         target = self._resolve_target(rule, working_dtype)
+        # uint8 wire: an integer fixed-point tensor -> normalized working
+        # float.  Fires while the tensor is still integer; a later walk over
+        # the (now floating) result falls through to the plain upcast.  This
+        # precedes the conservative int-source skip below precisely because
+        # the user opted into the conversion via ``normalize``.
+        if rule.normalize is not None and not tensor.is_floating_point():
+            if target is None:
+                raise ValueError(
+                    f"Dtype coordination at {path!r}: 'normalize' needs a "
+                    f"resolved working float dtype, but none was available "
+                    f"(working_dtype is None). Attach a precision plugin or "
+                    f"set working to an explicit float dtype."
+                )
+            return tensor.to(target) / rule.normalize
         if target is None:
             return tensor
         # Non-floating sources (int/bool) are usually categorical labels

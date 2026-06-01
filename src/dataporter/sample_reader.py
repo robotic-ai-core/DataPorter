@@ -122,12 +122,17 @@ class SampleReader:
         image_keys: list[str] | None = None,
         decode_cache_maxsize: int = 4,
         video_backend: str = "pyav",
+        return_uint8: bool = False,
     ) -> None:
         self._shard = shard_source
         self._image_keys = list(image_keys) if image_keys else [
             "observation.image",
         ]
         self._delta_timestamps = delta_timestamps
+        # uint8 wire: emit raw uint8 [0, 255] frames and defer the
+        # ``/255`` normalization to the GPU (see DtypeCoordinator's
+        # ``normalize`` rule).  Default keeps the float32 [0, 1] contract.
+        self._return_uint8 = return_uint8
 
         # Precompute frame-offset deltas once.  Matches
         # ``lerobot.common.datasets.utils.get_delta_indices`` — single
@@ -288,18 +293,25 @@ class SampleReader:
                     )
                     for d in self._delta_indices[vid_key]
                 ]
-                item[vid_key] = (
-                    frames_uint8[frame_indices].to(torch.float32) / 255.0
-                )
+                item[vid_key] = self._emit_frames(frames_uint8[frame_indices])
             else:
                 rel_idx = min(frame_in_ep, decoded_n - 1)
-                item[vid_key] = (
-                    frames_uint8[rel_idx]
-                    .unsqueeze(0)
-                    .to(torch.float32)
-                    / 255.0
+                item[vid_key] = self._emit_frames(
+                    frames_uint8[rel_idx].unsqueeze(0)
                 )
         return item
+
+    def _emit_frames(self, frames: torch.Tensor) -> torch.Tensor:
+        """Format a ``[n, C, H, W]`` uint8 window for the sample dict.
+
+        Default: float32 ``[0, 1]`` (the historical contract).  Under the
+        uint8 wire (``return_uint8``): the raw uint8 ``[0, 255]`` tensor,
+        leaving the ``/255`` upcast to the GPU-side DtypeCoordinator so the
+        DataLoader wire carries 4× fewer bytes than fp16.
+        """
+        if self._return_uint8:
+            return frames
+        return frames.to(torch.float32) / 255.0
 
     def _decode_cached(
         self, raw_ep: int, num_frames: int,

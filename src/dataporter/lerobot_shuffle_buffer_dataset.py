@@ -125,6 +125,7 @@ class LeRobotShuffleBufferDataset(Dataset):
         seed: int = 42,
         refresh_every_n_items: int | None = None,
         nominal_total_frames: int | None = None,
+        return_uint8: bool = False,
     ):
         self._buffer = buffer
         self._sources = sources
@@ -136,6 +137,7 @@ class LeRobotShuffleBufferDataset(Dataset):
         )
         self._default_min_new = int(default_min_new)
         self._image_keys = image_keys or ["observation.image"]
+        self._return_uint8 = return_uint8
         self._seed = seed
         self._rng = random.Random(seed)
         # Self-refresh knobs (see class docstring).  None preserves the
@@ -233,6 +235,7 @@ class LeRobotShuffleBufferDataset(Dataset):
                 src["shard_source"],
                 delta_timestamps=delta_timestamps,
                 image_keys=self._image_keys,
+                return_uint8=self._return_uint8,
             )
             for src in self._sources
         ]

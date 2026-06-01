@@ -316,6 +316,10 @@ class BlendedLeRobotDataModule(PrecisionCoordinationMixin, L.LightningDataModule
         # upcast (``on_after_batch_transfer`` provided by the mixin).
         # See docs/dtype-coordination.md for the contract.
         self._init_precision_coordination(dtype_conversions)
+        # A 'normalize' rule (uint8 wire) means datasets emit raw uint8 frames
+        # and the GPU-side coordinator does the /255 upcast.  Derived from the
+        # rules so there is no separate flag to desync from the coordinator.
+        self._return_uint8 = bool(self.dtype_coordinator.normalize_paths())
         self.train_split_ratio = train_split_ratio
         # Three knobs for the growing-set behaviour.
         # - prefetch_min_episodes: absolute floor for the setup-time gate.
@@ -789,6 +793,7 @@ class BlendedLeRobotDataModule(PrecisionCoordinationMixin, L.LightningDataModule
             image_keys=self.get_image_keys(),
             refresh_every_n_items=self.self_refresh_every_n_items,
             nominal_total_frames=self.nominal_total_frames,
+            return_uint8=self._return_uint8,
         )
         # When blending sources with heterogeneous schemas, restrict each
         # sample to the keys common across all sources so default_collate
@@ -879,6 +884,7 @@ class BlendedLeRobotDataModule(PrecisionCoordinationMixin, L.LightningDataModule
                     shard, train_pairs,
                     delta_timestamps=self.delta_timestamps,
                     image_keys=image_keys,
+                    return_uint8=self._return_uint8,
                 )
 
                 # Per-source transform
@@ -927,6 +933,7 @@ class BlendedLeRobotDataModule(PrecisionCoordinationMixin, L.LightningDataModule
                 shard, val_pairs,
                 delta_timestamps=val_ts,
                 image_keys=image_keys,
+                return_uint8=self._return_uint8,
             )
             # Stamp source_tag matching the streaming-train path's
             # in-line ``item["source_tag"] = source["name"]`` injection

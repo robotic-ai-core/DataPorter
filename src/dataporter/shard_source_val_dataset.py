@@ -64,12 +64,14 @@ class ShardSourceValDataset(Dataset):
         delta_timestamps: dict[str, list[float]] | None = None,
         image_keys: list[str] | None = None,
         decode_cache_maxsize: int = 4,
+        return_uint8: bool = False,
     ) -> None:
         self._reader = SampleReader(
             shard_source,
             delta_timestamps=delta_timestamps,
             image_keys=image_keys,
             decode_cache_maxsize=decode_cache_maxsize,
+            return_uint8=return_uint8,
         )
         # Normalize input to a list of (int, int) tuples so downstream
         # indexing is cheap and unambiguous.  A numpy / torch / pandas

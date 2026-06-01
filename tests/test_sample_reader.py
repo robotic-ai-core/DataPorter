@@ -251,3 +251,64 @@ class TestEdgeCases:
         # Second call: same tensor object (ID check — no re-decode).
         reader.read(raw_ep=0, frame_in_ep=5)
         assert reader._decode_cache[0] is cached_tensor
+
+
+# ---------------------------------------------------------------------------
+# uint8 wire (return_uint8): raw frames out, /255 deferred to the GPU
+# ---------------------------------------------------------------------------
+
+
+class TestReturnUint8:
+    """``return_uint8=True`` emits the raw uint8 ``[0, 255]`` window instead
+    of float32 ``[0, 1]`` — the dataset half of the uint8-wire optimization.
+    The GPU-side DtypeCoordinator (normalize rule) does the ``/255`` upcast,
+    so the model still sees identical floats at 1/4 the wire bytes.
+    """
+
+    def test_return_uint8_emits_raw_frames_bit_exact_to_float_path(self, tmp_path):
+        root = tmp_path / "ds"
+        _make_dataset(root, ready_eps=[0], total_episodes=1, fps=30,
+                      n_frames_per_ep=15)
+        src = LeRobotShardSource(root)
+        deltas = [-1.0 / 30.0, 0.0, 1.0 / 30.0]
+        frames = torch.randint(0, 256, (15, 3, 32, 32), dtype=torch.uint8)
+
+        r_uint8 = SampleReader(
+            src, delta_timestamps={"observation.image": deltas},
+            return_uint8=True,
+        )
+        r_float = SampleReader(
+            src, delta_timestamps={"observation.image": deltas},
+            return_uint8=False,
+        )
+        u = r_uint8.read(0, 5, frames_uint8=frames)
+        f = r_float.read(0, 5, frames_uint8=frames)
+
+        # uint8 path keeps the raw dtype...
+        assert u["observation.image"].dtype == torch.uint8
+        # ...and the default float path is the historical float32 [0, 1].
+        assert f["observation.image"].dtype == torch.float32
+        # The coordinator's GPU-side /255 reproduces the float path EXACTLY.
+        assert torch.equal(
+            u["observation.image"].to(torch.float32) / 255.0,
+            f["observation.image"],
+        )
+        # Non-video fields are unaffected by the wire format.
+        assert torch.equal(
+            u["observation.image_is_pad"], f["observation.image_is_pad"],
+        )
+
+    def test_return_uint8_single_frame_path(self, tmp_path):
+        """The no-delta single-frame branch also honors return_uint8."""
+        root = tmp_path / "ds"
+        _make_dataset(root, ready_eps=[0], total_episodes=1, n_frames_per_ep=10)
+        src = LeRobotShardSource(root)
+        frames = torch.randint(0, 256, (10, 3, 32, 32), dtype=torch.uint8)
+
+        reader = SampleReader(src, return_uint8=True)
+        item = reader.read(raw_ep=0, frame_in_ep=3, frames_uint8=frames)
+        img = item["observation.image"]
+        assert img.dtype == torch.uint8
+        assert img.shape == (1, 3, 32, 32)
+        # Single-frame path selects frame_in_ep exactly.
+        assert torch.equal(img[0], frames[3])
